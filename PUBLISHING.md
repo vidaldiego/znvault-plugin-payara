@@ -25,7 +25,7 @@ npm publish --access public
 5. Fill in:
    - **Organization/User**: `vidaldiego`
    - **Repository**: `znvault-plugin-payara`
-   - **Workflow filename**: `release.yml`
+   - **Workflow filename**: `publish.yml`
    - **Environment**: `npm-publish`
 6. Click **Set up connection**
 
