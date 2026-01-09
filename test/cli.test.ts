@@ -28,7 +28,7 @@ describe('createPayaraCLIPlugin', () => {
     const plugin = createPayaraCLIPlugin();
 
     expect(plugin.name).toBe('payara');
-    expect(plugin.version).toBe('1.0.0');
+    expect(plugin.version).toBe('1.1.0');
     expect(plugin.description).toContain('Payara');
   });
 
