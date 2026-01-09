@@ -28,6 +28,28 @@ export interface PayaraPluginConfig {
   /** Restart Payara when certificates change */
   restartOnCertChange?: boolean;
 
+  /** Restart Payara when managed API key is rotated (default: true) */
+  restartOnKeyRotation?: boolean;
+
+  /**
+   * Path where the API key should be written as a file.
+   * When set, the API key is written to this file instead of being embedded
+   * in setenv.conf. Payara reads it via ZINC_CONFIG_VAULT_API_KEY_FILE env var.
+   * The file is automatically updated when the key rotates.
+   *
+   * Example: "/var/lib/zn-vault-agent/api-key.txt"
+   */
+  apiKeyFilePath?: string;
+
+  /**
+   * Secret aliases to watch for changes.
+   * When any of these secrets change, Payara will be restarted.
+   * Useful for application configuration secrets.
+   *
+   * Example: ["api/staging/config"]
+   */
+  watchSecrets?: string[];
+
   /** Timeout for health check in milliseconds (default: 30000) */
   healthCheckTimeout?: number;
 
@@ -39,6 +61,23 @@ export interface PayaraPluginConfig {
 
   /** Enable verbose logging */
   verbose?: boolean;
+
+  /**
+   * Secrets to inject as environment variables when starting Payara.
+   * Keys are env var names, values are vault references:
+   * - "alias:path/to/secret" - fetch secret by alias
+   * - "alias:path/to/secret.field" - fetch specific field from JSON secret
+   * - "api-key:keyname" - fetch API key value
+   * - "literal:value" - use literal value (not recommended for secrets)
+   *
+   * Example:
+   * {
+   *   "ZINC_CONFIG_VAULT_API_KEY": "api-key:zincapi-staging",
+   *   "AWS_ACCESS_KEY_ID": "alias:api/staging/s3.accessKeyId",
+   *   "DATABASE_PASSWORD": "alias:db/prod.password"
+   * }
+   */
+  secrets?: Record<string, string>;
 }
 
 /**
@@ -52,6 +91,8 @@ export interface PayaraManagerOptions {
   healthCheckTimeout?: number;
   operationTimeout?: number;
   logger: Logger;
+  /** Environment variables to pass to Payara processes */
+  environment?: Record<string, string>;
 }
 
 /**

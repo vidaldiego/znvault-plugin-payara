@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import AdmZip from 'adm-zip';
 import type { WarFileHashes } from './types.js';
 
@@ -55,6 +55,10 @@ interface DeployConfig {
 
 interface DeployConfigStore {
   configs: Record<string, DeployConfig>;
+  /** If true, configs are synced from vault */
+  vaultEnabled?: boolean;
+  /** Vault secret alias for config storage */
+  vaultAlias?: string;
 }
 
 // Config file path
@@ -535,6 +539,148 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             ctx.output.info(`Config '${name}' now has ${config.hosts.length} host(s)`);
           } catch (err) {
             ctx.output.error(`Failed to remove host: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
+        });
+
+      // deploy config push - Push configs to vault
+      configCmd
+        .command('push')
+        .description('Push deployment configs to vault for sharing/backup')
+        .option('-a, --alias <alias>', 'Vault secret alias (default: deploy/configs)')
+        .action(async (options: { alias?: string }) => {
+          try {
+            const alias = options.alias ?? 'deploy/configs';
+            const store = await loadDeployConfigs();
+
+            if (Object.keys(store.configs).length === 0) {
+              ctx.output.error('No configs to push');
+              process.exit(1);
+            }
+
+            ctx.output.info(`Pushing ${Object.keys(store.configs).length} config(s) to vault...`);
+
+            // Create/update secret in vault
+            const secretData = {
+              configs: store.configs,
+              pushedAt: new Date().toISOString(),
+              pushedFrom: hostname(),
+            };
+
+            try {
+              // Try to update existing secret
+              await ctx.client.post(`/v1/secrets/by-alias/${encodeURIComponent(alias)}`, {
+                value: JSON.stringify(secretData, null, 2),
+              });
+            } catch {
+              // Create new secret
+              await ctx.client.post('/v1/secrets', {
+                alias,
+                name: 'Deployment Configurations',
+                description: 'Shared deployment configs for znvault deploy command',
+                value: JSON.stringify(secretData, null, 2),
+                type: 'generic',
+              });
+            }
+
+            // Update local store with vault info
+            store.vaultEnabled = true;
+            store.vaultAlias = alias;
+            await saveDeployConfigs(store);
+
+            ctx.output.success(`Pushed to vault: ${alias}`);
+            ctx.output.info('Other users can pull with: znvault deploy config pull');
+          } catch (err) {
+            ctx.output.error(`Failed to push: ${err instanceof Error ? err.message : String(err)}`);
+            process.exit(1);
+          }
+        });
+
+      // deploy config pull - Pull configs from vault
+      configCmd
+        .command('pull')
+        .description('Pull deployment configs from vault')
+        .option('-a, --alias <alias>', 'Vault secret alias (default: deploy/configs)')
+        .option('--merge', 'Merge with local configs instead of replacing')
+        .action(async (options: { alias?: string; merge?: boolean }) => {
+          try {
+            const localStore = await loadDeployConfigs();
+            const alias = options.alias ?? localStore.vaultAlias ?? 'deploy/configs';
+
+            ctx.output.info(`Pulling configs from vault: ${alias}...`);
+
+            const response = await ctx.client.get<{ value: string }>(
+              `/v1/secrets/by-alias/${encodeURIComponent(alias)}/value`
+            );
+
+            const vaultData = JSON.parse(response.value) as {
+              configs: Record<string, DeployConfig>;
+              pushedAt: string;
+              pushedFrom: string;
+            };
+
+            const vaultConfigs = vaultData.configs;
+            const configCount = Object.keys(vaultConfigs).length;
+
+            if (options.merge) {
+              // Merge: vault configs override local on conflict
+              const newStore: DeployConfigStore = {
+                configs: { ...localStore.configs, ...vaultConfigs },
+                vaultEnabled: true,
+                vaultAlias: alias,
+              };
+              await saveDeployConfigs(newStore);
+
+              const merged = Object.keys(newStore.configs).length;
+              ctx.output.success(`Merged ${configCount} config(s) from vault (${merged} total)`);
+            } else {
+              // Replace local configs
+              const newStore: DeployConfigStore = {
+                configs: vaultConfigs,
+                vaultEnabled: true,
+                vaultAlias: alias,
+              };
+              await saveDeployConfigs(newStore);
+
+              ctx.output.success(`Pulled ${configCount} config(s) from vault`);
+            }
+
+            ctx.output.info(`Last pushed: ${vaultData.pushedAt} from ${vaultData.pushedFrom}`);
+          } catch (err) {
+            if (String(err).includes('404') || String(err).includes('not found')) {
+              ctx.output.error('No configs found in vault');
+              ctx.output.info('Push configs first with: znvault deploy config push');
+            } else {
+              ctx.output.error(`Failed to pull: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            process.exit(1);
+          }
+        });
+
+      // deploy config sync - Show sync status
+      configCmd
+        .command('sync')
+        .description('Show vault sync status')
+        .action(async () => {
+          try {
+            const store = await loadDeployConfigs();
+
+            console.log('\nVault Sync Status:\n');
+
+            if (!store.vaultEnabled) {
+              console.log('  Status: Local only (not synced to vault)');
+              console.log('  Configs: ' + Object.keys(store.configs).length);
+              console.log('\n  To enable vault sync: znvault deploy config push');
+            } else {
+              console.log('  Status: Vault sync enabled');
+              console.log('  Alias:  ' + (store.vaultAlias ?? 'deploy/configs'));
+              console.log('  Configs: ' + Object.keys(store.configs).length);
+              console.log('\n  Push changes: znvault deploy config push');
+              console.log('  Pull updates: znvault deploy config pull');
+            }
+            console.log();
+          } catch (err) {
+            ctx.output.error(`Failed to get sync status: ${err instanceof Error ? err.message : String(err)}`);
             process.exit(1);
           }
         });
