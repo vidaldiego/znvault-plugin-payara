@@ -3,60 +3,24 @@
 
 import type { FastifyInstance } from 'fastify';
 import type { Logger } from 'pino';
+import type {
+  AgentPlugin,
+  PluginContext,
+  CertificateDeployedEvent,
+  PluginHealthStatus,
+} from '@zincapp/zn-vault-agent/plugins';
 import { PayaraManager } from './payara-manager.js';
 import { WarDeployer } from './war-deployer.js';
 import { registerRoutes } from './routes.js';
 import type { PayaraPluginConfig } from './types.js';
 
-/**
- * Agent plugin interface
- * Matches the AgentPlugin interface from zn-vault-agent
- */
-export interface AgentPlugin {
-  name: string;
-  version: string;
-  description?: string;
-  onInit?(ctx: PluginContext): Promise<void>;
-  onStart?(ctx: PluginContext): Promise<void>;
-  onStop?(ctx: PluginContext): Promise<void>;
-  routes?(fastify: FastifyInstance, ctx: PluginContext): Promise<void>;
-  onCertificateDeployed?(event: CertificateDeployedEvent, ctx: PluginContext): Promise<void>;
-  healthCheck?(ctx: PluginContext): Promise<PluginHealthStatus>;
-}
-
-/**
- * Plugin context provided by the agent
- */
-export interface PluginContext {
-  logger: Logger;
-  config: unknown;
-  vaultUrl: string;
-  tenantId: string;
-  getSecret(aliasOrId: string): Promise<string>;
-  restartChild(reason: string): Promise<void>;
-  emit(event: string, data: unknown): void;
-  on(event: string, handler: (data: unknown) => void): void;
-}
-
-/**
- * Certificate deployed event
- */
-export interface CertificateDeployedEvent {
-  certId: string;
-  name: string;
-  paths: { cert?: string; key?: string; combined?: string };
-  expiresAt: string;
-}
-
-/**
- * Plugin health status
- */
-export interface PluginHealthStatus {
-  name: string;
-  status: 'healthy' | 'degraded' | 'unhealthy';
-  message?: string;
-  details?: Record<string, unknown>;
-}
+// Re-export types from agent for consumers that don't have agent installed
+export type {
+  AgentPlugin,
+  PluginContext,
+  CertificateDeployedEvent,
+  PluginHealthStatus,
+} from '@zincapp/zn-vault-agent/plugins';
 
 /**
  * Create Payara agent plugin
