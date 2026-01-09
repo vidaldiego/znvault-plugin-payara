@@ -359,7 +359,7 @@ describe('E2E: Plugin Factory', () => {
     });
 
     expect(plugin.name).toBe('payara');
-    expect(plugin.version).toBe('1.0.0');
+    expect(plugin.version).toBe('1.3.0');
     expect(plugin.onInit).toBeDefined();
     expect(plugin.routes).toBeDefined();
     expect(plugin.healthCheck).toBeDefined();

@@ -41,7 +41,7 @@ describe('createPayaraPlugin', () => {
     const plugin = createPayaraPlugin(validConfig);
 
     expect(plugin.name).toBe('payara');
-    expect(plugin.version).toBe('1.0.0');
+    expect(plugin.version).toBe('1.3.0');
     expect(plugin.description).toContain('Payara');
   });
 
