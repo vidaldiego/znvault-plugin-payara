@@ -1,0 +1,89 @@
+{
+  "name": "@zincapp/znvault-plugin-payara",
+  "version": "1.0.0",
+  "description": "Payara application server plugin for zn-vault-agent with WAR diff deployment",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./cli": {
+      "import": "./dist/cli.js",
+      "types": "./dist/cli.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:prod": "tsc --sourceMap false",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "eslint src test --ext .ts",
+    "lint:fix": "eslint src test --ext .ts --fix",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build:prod"
+  },
+  "keywords": [
+    "znvault",
+    "payara",
+    "glassfish",
+    "war",
+    "deployment",
+    "plugin",
+    "secrets",
+    "vault"
+  ],
+  "author": "ZincApp",
+  "license": "MIT",
+  "homepage": "https://github.com/vidaldiego/znvault-plugin-payara#readme",
+  "bugs": {
+    "url": "https://github.com/vidaldiego/znvault-plugin-payara/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vidaldiego/znvault-plugin-payara.git"
+  },
+  "peerDependencies": {
+    "@zincapp/zn-vault-agent": ">=1.6.0",
+    "@zincapp/znvault-cli": ">=2.11.0"
+  },
+  "peerDependenciesMeta": {
+    "@zincapp/zn-vault-agent": {
+      "optional": true
+    },
+    "@zincapp/znvault-cli": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "pino": "^9.6.0"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/node": "^22.10.2",
+    "@typescript-eslint/eslint-plugin": "^8.52.0",
+    "@typescript-eslint/parser": "^8.52.0",
+    "@vitest/coverage-v8": "^2.1.8",
+    "commander": "^12.1.0",
+    "eslint": "^8.57.1",
+    "fastify": "^5.2.1",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
