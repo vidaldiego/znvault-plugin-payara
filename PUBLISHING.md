@@ -18,16 +18,29 @@ npm publish --access public
 
 ### 2. Configure Trusted Publisher on npm
 
+⚠️ **IMPORTANT**: These values MUST match EXACTLY (case-sensitive):
+
 1. Go to [npmjs.com](https://www.npmjs.com) and log in
 2. Navigate to your package: `@zincapp/znvault-plugin-payara`
-3. Go to **Settings** → **Trusted Publishers**
-4. Click **Add Trusted Publisher** → **GitHub Actions**
-5. Fill in:
-   - **Organization/User**: `vidaldiego`
-   - **Repository**: `znvault-plugin-payara`
-   - **Workflow filename**: `publish.yml`
-   - **Environment**: `npm-publish`
-6. Click **Set up connection**
+3. Go to **Settings** → **Publishing access**
+4. Under **Trusted Publishers**, click **Add new publisher** or **Add trusted publisher**
+5. Select **GitHub Actions**
+6. Fill in **EXACTLY** as shown:
+
+   | Field | Value |
+   |-------|-------|
+   | **Owner** | `vidaldiego` |
+   | **Repository** | `znvault-plugin-payara` |
+   | **Workflow** | `publish.yml` |
+   | **Environment** | `npm-publish` |
+
+7. Click **Add**
+
+**Troubleshooting 404 Errors:**
+- Verify the workflow filename is `publish.yml` (not `release.yml`)
+- Verify the environment is `npm-publish` (or remove from both workflow and npm settings)
+- The GitHub owner (`vidaldiego`) must match exactly, not the npm scope (`@zincapp`)
+- For scoped packages like `@zincapp/*`, you may need org-level permissions on npm
 
 ### 3. Create GitHub Environment
 
