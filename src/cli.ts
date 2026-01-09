@@ -453,15 +453,16 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             }
 
             if (!options.yes) {
-              const { confirm } = await import('inquirer').then(m =>
-                m.default.prompt<{ confirm: boolean }>([{
-                  type: 'confirm',
-                  name: 'confirm',
-                  message: `Delete deployment config '${name}'?`,
-                  default: false,
-                }])
-              );
-              if (!confirm) {
+              // Dynamic import of inquirer (available from znvault-cli context)
+              const inquirerModule = await import('inquirer');
+              const inquirer = inquirerModule.default;
+              const answers = await inquirer.prompt([{
+                type: 'confirm',
+                name: 'confirm',
+                message: `Delete deployment config '${name}'?`,
+                default: false,
+              }]) as { confirm: boolean };
+              if (!answers.confirm) {
                 ctx.output.info('Cancelled');
                 return;
               }
