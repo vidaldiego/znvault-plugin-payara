@@ -91,11 +91,15 @@ const ANSI = {
 /**
  * Direct HTTP client for agent communication
  * Uses raw fetch() instead of ctx.client to avoid vault authentication interference
+ * Includes 60s timeout to handle large responses (e.g., WAR file hashes)
  */
+const AGENT_TIMEOUT_MS = 60000;
+
 async function agentGet<T>(url: string): Promise<T> {
   const response = await fetch(url, {
     method: 'GET',
     headers: { 'Accept': 'application/json' },
+    signal: AbortSignal.timeout(AGENT_TIMEOUT_MS),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -112,6 +116,7 @@ async function agentPost<T>(url: string, body: unknown): Promise<T> {
       'Accept': 'application/json',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(AGENT_TIMEOUT_MS),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -621,7 +626,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.1',
+    version: '1.7.2',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
