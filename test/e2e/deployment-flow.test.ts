@@ -398,8 +398,12 @@ describe('E2E: Plugin Factory', () => {
     const health = await plugin.healthCheck?.(mockContext as any);
 
     expect(health?.name).toBe('payara');
-    expect(health?.status).toBe('healthy');
+    // Status is "degraded" because domain is running but app is not deployed
+    // Healthy requires: running + app deployed + health endpoint responding
+    expect(health?.status).toBe('degraded');
     expect(health?.details?.domain).toBe(mockPayara.domain);
+    expect(health?.details?.running).toBe(true);
+    expect(health?.details?.appDeployed).toBe(false);
   });
 
   it('E2E-17: should register routes on Fastify', async () => {
