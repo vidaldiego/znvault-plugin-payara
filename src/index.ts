@@ -218,7 +218,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.6.1',
+    version: '1.7.3',
     description: 'Payara application server management with WAR diff deployment, secret injection, and aggressive mode',
 
     async onInit(ctx: PluginContext): Promise<void> {
@@ -306,10 +306,11 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       }
 
       // Refresh secrets before starting (in case they changed)
+      // Always write to setenv.conf, even if we skip restarting Payara
       if (config.secrets && Object.keys(config.secrets).length > 0) {
         pluginLogger.debug('Refreshing secrets before Payara start');
         secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath, config.user);
-        payara.setEnvironment(secretsEnv);
+        await payara.updateEnvironment(secretsEnv);
       }
 
       if (!manageLifecycle) {
@@ -425,11 +426,11 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         nextRotationAt: event.nextRotationAt,
       }, 'Managed API key rotated, updating key file');
 
-      // Refresh secrets to update the API key file
+      // Refresh secrets to update the API key file and setenv.conf
       // When apiKeyFilePath is set, the key is written to file and the app
       // reads it on each request - NO restart needed
       secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user);
-      payara.setEnvironment(secretsEnv);
+      await payara.updateEnvironment(secretsEnv);
 
       if (config.apiKeyFilePath) {
         // File-based mode: NO restart needed, app reads key from file dynamically
@@ -482,7 +483,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       // Refresh secrets to pick up new values (updates files and setenv.conf)
       if (config.secrets && Object.keys(config.secrets).length > 0) {
         secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath, config.user);
-        payara.setEnvironment(secretsEnv);
+        await payara.updateEnvironment(secretsEnv);
       }
 
       // NOTE: We do NOT restart Payara on secret changes by default

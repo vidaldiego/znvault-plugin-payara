@@ -62,6 +62,17 @@ export class PayaraManager {
   }
 
   /**
+   * Update environment and write to setenv.conf
+   * Use this when secrets have been refreshed and need to be persisted
+   * even if Payara isn't being restarted
+   */
+  async updateEnvironment(env: Record<string, string>): Promise<void> {
+    this.environment = env;
+    this.logger.debug({ count: Object.keys(env).length }, 'Environment updated');
+    await this.writeSetenvConf();
+  }
+
+  /**
    * Build environment string for command execution.
    *
    * SECURITY: This method ONLY includes non-sensitive env vars (JAVA_HOME).

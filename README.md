@@ -379,6 +379,9 @@ See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Pyt
 
 ## Changelog
 
+### v1.7.3
+- Fix: Always write setenv.conf on agent start (even when skipping Payara restart in aggressive mode)
+
 ### v1.7.2
 - Fix: Add 60s timeout for agent HTTP requests (fixes diff deployment with large WARs)
 
