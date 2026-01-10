@@ -218,7 +218,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.6.0',
+    version: '1.6.1',
     description: 'Payara application server management with WAR diff deployment, secret injection, and aggressive mode',
 
     async onInit(ctx: PluginContext): Promise<void> {
@@ -343,18 +343,29 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
           await deployer.deploy();
         }
       } else if (config.aggressiveMode) {
-        // AGGRESSIVE MODE: Always ensure clean slate on startup
-        pluginLogger.info('Aggressive mode: ensuring clean state before starting Payara');
+        // AGGRESSIVE MODE: Ensure clean slate, but skip restart if already healthy
+        // This allows agent restarts (e.g., plugin updates) without disrupting Payara
+        if (await payara.isHealthy()) {
+          pluginLogger.info('Aggressive mode: Payara already running and healthy, skipping restart');
 
-        // Kill any existing Java processes (clean slate)
-        await payara.ensureNoJavaRunning(true);
+          // Just ensure app is deployed
+          if (await deployer.warExists() && !(await deployer.isAppDeployed())) {
+            pluginLogger.info('WAR exists but app not deployed, deploying...');
+            await deployer.deploy();
+          }
+        } else {
+          pluginLogger.info('Aggressive mode: Payara not healthy, ensuring clean state');
 
-        // Start Payara fresh
-        await payara.safeStart();
+          // Kill any existing Java processes (clean slate)
+          await payara.ensureNoJavaRunning(true);
 
-        // Deploy WAR if it exists
-        if (await deployer.warExists()) {
-          await deployer.deploy();
+          // Start Payara fresh
+          await payara.safeStart();
+
+          // Deploy WAR if it exists
+          if (await deployer.warExists()) {
+            await deployer.deploy();
+          }
         }
       } else {
         // NORMAL MODE: Start only if not already running
