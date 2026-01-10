@@ -1,14 +1,14 @@
 // Path: src/cli.ts
-// CLI commands for Payara plugin
+// CLI commands for Payara plugin with visual progress
 
 import type { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, basename } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import AdmZip from 'adm-zip';
-import type { WarFileHashes, ChunkedDeployResponse } from './types.js';
+import type { WarFileHashes, ChunkedDeployResponse, DeployResult } from './types.js';
 
 /**
  * Chunk size for batched deployments (number of files per chunk)
@@ -71,6 +71,186 @@ interface DeployConfigStore {
 const CONFIG_DIR = join(homedir(), '.znvault');
 const CONFIG_FILE = join(CONFIG_DIR, 'deploy-configs.json');
 
+// ANSI escape codes for colors and cursor control
+const ANSI = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  cyan: '\x1b[36m',
+  red: '\x1b[31m',
+  gray: '\x1b[90m',
+  clearLine: '\x1b[2K',
+  cursorUp: '\x1b[1A',
+  cursorHide: '\x1b[?25l',
+  cursorShow: '\x1b[?25h',
+};
+
+/**
+ * Format file size to human readable
+ */
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/**
+ * Format duration in ms to human readable
+ */
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+}
+
+/**
+ * Create a progress bar string
+ */
+function progressBar(current: number, total: number, width = 30): string {
+  const percent = Math.round((current / total) * 100);
+  const filled = Math.round((current / total) * width);
+  const empty = width - filled;
+  const bar = '█'.repeat(filled) + '░'.repeat(empty);
+  return `${ANSI.cyan}${bar}${ANSI.reset} ${percent}%`;
+}
+
+/**
+ * Progress reporter for visual feedback
+ */
+class ProgressReporter {
+  private isPlain: boolean;
+  private currentHost = '';
+  private lastFiles: string[] = [];
+  private maxFileDisplay = 5;
+
+  constructor(isPlain: boolean) {
+    this.isPlain = isPlain;
+  }
+
+  setHost(host: string): void {
+    this.currentHost = host;
+    if (!this.isPlain) {
+      console.log(`\n${ANSI.bold}${ANSI.blue}▶ Deploying to ${host}${ANSI.reset}`);
+    }
+  }
+
+  analyzing(warPath: string): void {
+    const name = basename(warPath);
+    if (this.isPlain) {
+      console.log(`Analyzing ${name}...`);
+    } else {
+      console.log(`${ANSI.dim}  Analyzing ${name}...${ANSI.reset}`);
+    }
+  }
+
+  foundFiles(count: number, warSize: number): void {
+    if (this.isPlain) {
+      console.log(`Found ${count} files (${formatSize(warSize)})`);
+    } else {
+      console.log(`${ANSI.dim}  Found ${ANSI.bold}${count}${ANSI.reset}${ANSI.dim} files (${formatSize(warSize)})${ANSI.reset}`);
+    }
+  }
+
+  diff(changed: number, deleted: number): void {
+    if (this.isPlain) {
+      console.log(`Diff: ${changed} changed, ${deleted} deleted`);
+    } else {
+      const changeStr = changed > 0 ? `${ANSI.green}+${changed}${ANSI.reset}` : `${ANSI.dim}+0${ANSI.reset}`;
+      const deleteStr = deleted > 0 ? `${ANSI.red}-${deleted}${ANSI.reset}` : `${ANSI.dim}-0${ANSI.reset}`;
+      console.log(`  ${ANSI.dim}Diff:${ANSI.reset} ${changeStr} ${deleteStr}`);
+    }
+  }
+
+  uploadingFullWar(): void {
+    if (this.isPlain) {
+      console.log('Uploading full WAR file...');
+    } else {
+      console.log(`  ${ANSI.yellow}⬆ Uploading full WAR file...${ANSI.reset}`);
+    }
+  }
+
+  uploadProgress(sent: number, total: number, currentFiles?: string[]): void {
+    if (this.isPlain) {
+      console.log(`  Sent ${sent}/${total} files`);
+      return;
+    }
+
+    // Store last files for display
+    if (currentFiles) {
+      this.lastFiles = currentFiles.slice(-this.maxFileDisplay);
+    }
+
+    // Clear previous lines and redraw
+    const lines = this.maxFileDisplay + 2; // progress bar + files
+    process.stdout.write(`${ANSI.cursorUp.repeat(lines)}${ANSI.clearLine}`);
+
+    // Progress bar
+    console.log(`  ${progressBar(sent, total)} ${sent}/${total} files`);
+
+    // File list
+    console.log(`${ANSI.dim}  Recent files:${ANSI.reset}`);
+    for (const file of this.lastFiles) {
+      const shortFile = file.length > 60 ? '...' + file.slice(-57) : file;
+      console.log(`${ANSI.dim}    ${shortFile}${ANSI.reset}`);
+    }
+    // Pad empty lines
+    for (let i = this.lastFiles.length; i < this.maxFileDisplay; i++) {
+      console.log('');
+    }
+  }
+
+  deploying(): void {
+    if (this.isPlain) {
+      console.log('Deploying via asadmin...');
+    } else {
+      console.log(`  ${ANSI.yellow}⏳ Deploying via asadmin...${ANSI.reset}`);
+    }
+  }
+
+  deployed(result: DeployResult): void {
+    if (this.isPlain) {
+      console.log(`Deployed: ${result.filesChanged} changed, ${result.filesDeleted} deleted (${formatDuration(result.deploymentTime)})`);
+    } else {
+      console.log(`  ${ANSI.green}✓ Deployed${ANSI.reset} ${result.filesChanged} changed, ${result.filesDeleted} deleted ${ANSI.dim}(${formatDuration(result.deploymentTime)})${ANSI.reset}`);
+      if (result.applications && result.applications.length > 0) {
+        console.log(`  ${ANSI.dim}  Applications: ${result.applications.join(', ')}${ANSI.reset}`);
+      }
+    }
+  }
+
+  noChanges(): void {
+    if (this.isPlain) {
+      console.log('No changes to deploy');
+    } else {
+      console.log(`  ${ANSI.green}✓ No changes${ANSI.reset}`);
+    }
+  }
+
+  failed(error: string): void {
+    if (this.isPlain) {
+      console.log(`Failed: ${error}`);
+    } else {
+      console.log(`  ${ANSI.red}✗ Failed: ${error}${ANSI.reset}`);
+    }
+  }
+
+  summary(successful: number, total: number, failed: number): void {
+    console.log('');
+    if (this.isPlain) {
+      console.log(`Deployment complete: ${successful}/${total} hosts successful${failed > 0 ? `, ${failed} failed` : ''}`);
+    } else {
+      if (failed === 0) {
+        console.log(`${ANSI.bold}${ANSI.green}✓ Deployment complete${ANSI.reset}: ${successful}/${total} hosts successful`);
+      } else {
+        console.log(`${ANSI.bold}${ANSI.yellow}⚠ Deployment complete${ANSI.reset}: ${successful}/${total} hosts successful, ${ANSI.red}${failed} failed${ANSI.reset}`);
+      }
+    }
+  }
+}
+
 /**
  * Load deployment configs
  */
@@ -102,14 +282,16 @@ async function saveDeployConfigs(store: DeployConfigStore): Promise<void> {
 async function uploadFullWar(
   ctx: CLIPluginContext,
   pluginUrl: string,
-  warPath: string
-): Promise<{ success: boolean; error?: string }> {
+  warPath: string,
+  progress: ProgressReporter
+): Promise<{ success: boolean; error?: string; result?: DeployResult }> {
   try {
+    progress.uploadingFullWar();
+
     // Read WAR file
     const warBuffer = await readFile(warPath);
 
     // Upload using raw POST
-    // Note: ctx.client might not support raw binary upload, so we use fetch directly
     const response = await fetch(`${pluginUrl}/deploy/upload`, {
       method: 'POST',
       headers: {
@@ -119,19 +301,41 @@ async function uploadFullWar(
       body: warBuffer,
     });
 
+    const data = await response.json() as {
+      status?: string;
+      error?: string;
+      message?: string;
+      deployed?: boolean;
+      deploymentTime?: number;
+      applications?: string[];
+      appName?: string;
+      size?: number;
+    };
+
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ message: response.statusText }));
-      return { success: false, error: (error as { message?: string }).message ?? 'Upload failed' };
+      return { success: false, error: data.message ?? data.error ?? 'Upload failed' };
     }
 
-    return { success: true };
+    return {
+      success: true,
+      result: {
+        success: true,
+        filesChanged: Object.keys(await calculateWarHashes(warPath)).length,
+        filesDeleted: 0,
+        message: data.message ?? 'Deployment successful',
+        deploymentTime: data.deploymentTime ?? 0,
+        appName: data.appName ?? '',
+        deployed: data.deployed,
+        applications: data.applications,
+      },
+    };
   } catch (err) {
     return { success: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
 /**
- * Deploy files using chunked upload
+ * Deploy files using chunked upload with progress
  */
 async function deployChunked(
   ctx: CLIPluginContext,
@@ -139,11 +343,21 @@ async function deployChunked(
   zip: AdmZip,
   changed: string[],
   deleted: string[],
-  onProgress?: (sent: number, total: number) => void
-): Promise<{ success: boolean; error?: string; filesChanged?: number; filesDeleted?: number }> {
+  progress: ProgressReporter
+): Promise<{ success: boolean; error?: string; result?: DeployResult }> {
   try {
     let sessionId: string | undefined;
     const totalFiles = changed.length;
+
+    // Initialize progress display
+    if (!ctx.isPlainMode()) {
+      // Print placeholder lines for progress display
+      console.log(`  ${progressBar(0, totalFiles)} 0/${totalFiles} files`);
+      console.log(`${ANSI.dim}  Recent files:${ANSI.reset}`);
+      for (let i = 0; i < 5; i++) {
+        console.log('');
+      }
+    }
 
     // Send files in chunks
     for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
@@ -191,16 +405,13 @@ async function deployChunked(
       sessionId = response.sessionId;
 
       // Report progress
-      if (onProgress) {
-        onProgress(response.filesReceived, totalFiles);
-      }
+      progress.uploadProgress(response.filesReceived, totalFiles, chunkPaths);
 
       // Check if committed (final chunk)
       if (response.committed && response.result) {
         return {
-          success: true,
-          filesChanged: response.result.filesChanged,
-          filesDeleted: response.result.filesDeleted,
+          success: response.result.success,
+          result: response.result,
         };
       }
     }
@@ -213,7 +424,7 @@ async function deployChunked(
 }
 
 /**
- * Deploy to a single host
+ * Deploy to a single host with progress reporting
  */
 async function deployToHost(
   ctx: CLIPluginContext,
@@ -222,8 +433,8 @@ async function deployToHost(
   warPath: string,
   localHashes: WarFileHashes,
   force: boolean,
-  onProgress?: (message: string) => void
-): Promise<{ success: boolean; error?: string; filesChanged?: number; filesDeleted?: number }> {
+  progress: ProgressReporter
+): Promise<{ success: boolean; error?: string; result?: DeployResult }> {
   try {
     const baseUrl = host.replace(/\/$/, '');
     // Add protocol if missing (default to HTTP for local agent communication)
@@ -252,33 +463,33 @@ async function deployToHost(
 
     // If remote has no WAR, upload the full WAR file
     if (remoteIsEmpty) {
-      if (onProgress) onProgress('Uploading full WAR file...');
-      const uploadResult = await uploadFullWar(ctx, pluginUrl, warPath);
-      if (uploadResult.success) {
-        return {
-          success: true,
-          filesChanged: Object.keys(localHashes).length,
-          filesDeleted: 0,
-        };
-      }
-      return uploadResult;
+      return uploadFullWar(ctx, pluginUrl, warPath, progress);
     }
 
     // Calculate diff
     const { changed, deleted } = calculateDiff(localHashes, remoteHashes);
+    progress.diff(changed.length, deleted.length);
 
     if (changed.length === 0 && deleted.length === 0) {
-      return { success: true, filesChanged: 0, filesDeleted: 0 };
+      progress.noChanges();
+      return {
+        success: true,
+        result: {
+          success: true,
+          filesChanged: 0,
+          filesDeleted: 0,
+          message: 'No changes',
+          deploymentTime: 0,
+          appName: '',
+        },
+      };
     }
 
     const zip = new AdmZip(warPath);
 
     // Use chunked deployment if there are many files
     if (changed.length > CHUNK_SIZE) {
-      if (onProgress) onProgress(`Deploying ${changed.length} files in chunks...`);
-      return deployChunked(ctx, pluginUrl, zip, changed, deleted, (sent, total) => {
-        if (onProgress) onProgress(`Sent ${sent}/${total} files`);
-      });
+      return deployChunked(ctx, pluginUrl, zip, changed, deleted, progress);
     }
 
     // Small deployment - use single request
@@ -293,12 +504,18 @@ async function deployToHost(
       };
     });
 
+    progress.deploying();
+
     // Deploy
     const deployResponse = await ctx.client.post<{
       status: string;
       filesChanged: number;
       filesDeleted: number;
       message?: string;
+      deploymentTime?: number;
+      deployed?: boolean;
+      applications?: string[];
+      appName?: string;
     }>(`${pluginUrl}/deploy`, {
       files,
       deletions: deleted,
@@ -307,8 +524,16 @@ async function deployToHost(
     if (deployResponse.status === 'deployed') {
       return {
         success: true,
-        filesChanged: deployResponse.filesChanged,
-        filesDeleted: deployResponse.filesDeleted,
+        result: {
+          success: true,
+          filesChanged: deployResponse.filesChanged,
+          filesDeleted: deployResponse.filesDeleted,
+          message: deployResponse.message ?? 'Deployment successful',
+          deploymentTime: deployResponse.deploymentTime ?? 0,
+          appName: deployResponse.appName ?? '',
+          deployed: deployResponse.deployed,
+          applications: deployResponse.applications,
+        },
       };
     } else {
       return { success: false, error: deployResponse.message };
@@ -329,8 +554,8 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.4.3',
-    description: 'Payara WAR deployment commands',
+    version: '1.5.0',
+    description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
       // Create deploy command group
@@ -353,6 +578,8 @@ export function createPayaraCLIPlugin(): CLIPlugin {
           dryRun?: boolean;
           sequential?: boolean;
         }) => {
+          const progress = new ProgressReporter(ctx.isPlainMode());
+
           try {
             const store = await loadDeployConfigs();
             const config = store.configs[configName];
@@ -371,24 +598,31 @@ export function createPayaraCLIPlugin(): CLIPlugin {
 
             // Resolve WAR path
             const warPath = resolve(config.warPath);
+            let warStats;
             try {
-              await stat(warPath);
+              warStats = await stat(warPath);
             } catch {
               ctx.output.error(`WAR file not found: ${warPath}`);
               process.exit(1);
             }
 
-            ctx.output.info(`Deploying ${configName}`);
-            ctx.output.info(`  WAR: ${warPath}`);
-            ctx.output.info(`  Hosts: ${config.hosts.length}`);
-            ctx.output.info(`  Mode: ${options.sequential || !config.parallel ? 'sequential' : 'parallel'}`);
-            console.log();
+            // Header
+            if (!ctx.isPlainMode()) {
+              console.log(`\n${ANSI.bold}Deploying ${ANSI.cyan}${configName}${ANSI.reset}`);
+              console.log(`${ANSI.dim}  WAR: ${basename(warPath)}${ANSI.reset}`);
+              console.log(`${ANSI.dim}  Hosts: ${config.hosts.length}${ANSI.reset}`);
+              console.log(`${ANSI.dim}  Mode: ${options.sequential || !config.parallel ? 'sequential' : 'parallel'}${ANSI.reset}`);
+            } else {
+              ctx.output.info(`Deploying ${configName}`);
+              ctx.output.info(`  WAR: ${warPath}`);
+              ctx.output.info(`  Hosts: ${config.hosts.length}`);
+              ctx.output.info(`  Mode: ${options.sequential || !config.parallel ? 'sequential' : 'parallel'}`);
+            }
 
             // Calculate local hashes once
-            ctx.output.info('Analyzing WAR file...');
+            progress.analyzing(warPath);
             const localHashes = await calculateWarHashes(warPath);
-            ctx.output.info(`Found ${Object.keys(localHashes).length} files`);
-            console.log();
+            progress.foundFiles(Object.keys(localHashes).length, warStats.size);
 
             if (options.dryRun) {
               ctx.output.info('Dry run - checking each host:');
@@ -398,10 +632,15 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               return;
             }
 
-            const results: Array<{ host: string; success: boolean; error?: string; changed?: number; deleted?: number }> = [];
+            const results: Array<{
+              host: string;
+              success: boolean;
+              error?: string;
+              result?: DeployResult;
+            }> = [];
 
             const deployToHostWrapper = async (host: string) => {
-              ctx.output.info(`Deploying to ${host}...`);
+              progress.setHost(host);
               const result = await deployToHost(
                 ctx,
                 host,
@@ -409,19 +648,18 @@ export function createPayaraCLIPlugin(): CLIPlugin {
                 warPath,
                 localHashes,
                 options.force ?? false,
-                (message) => ctx.output.info(`  ${host}: ${message}`)
+                progress
               );
               results.push({
                 host,
                 success: result.success,
                 error: result.error,
-                changed: result.filesChanged,
-                deleted: result.filesDeleted,
+                result: result.result,
               });
-              if (result.success) {
-                ctx.output.success(`  ✓ ${host}: ${result.filesChanged} changed, ${result.filesDeleted} deleted`);
+              if (result.success && result.result) {
+                progress.deployed(result.result);
               } else {
-                ctx.output.error(`  ✗ ${host}: ${result.error}`);
+                progress.failed(result.error ?? 'Unknown error');
               }
             };
 
@@ -435,14 +673,11 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               await Promise.all(config.hosts.map(deployToHostWrapper));
             }
 
-            console.log();
             const successful = results.filter(r => r.success).length;
             const failed = results.filter(r => !r.success).length;
+            progress.summary(successful, config.hosts.length, failed);
 
-            if (failed === 0) {
-              ctx.output.success(`Deployment complete: ${successful}/${config.hosts.length} hosts successful`);
-            } else {
-              ctx.output.warn(`Deployment complete: ${successful}/${config.hosts.length} hosts successful, ${failed} failed`);
+            if (failed > 0) {
               process.exit(1);
             }
           } catch (err) {
@@ -536,14 +771,14 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               return;
             }
 
-            console.log('Deployment Configurations:\n');
+            console.log('\nDeployment Configurations:\n');
             for (const config of configs) {
-              console.log(`  ${config.name}`);
+              console.log(`  ${ANSI.bold}${config.name}${ANSI.reset}`);
               if (config.description) {
-                console.log(`    ${config.description}`);
+                console.log(`    ${ANSI.dim}${config.description}${ANSI.reset}`);
               }
-              console.log(`    Hosts: ${config.hosts.length > 0 ? config.hosts.join(', ') : '(none)'}`);
-              console.log(`    WAR:   ${config.warPath || '(not set)'}`);
+              console.log(`    Hosts: ${config.hosts.length > 0 ? config.hosts.join(', ') : ANSI.dim + '(none)' + ANSI.reset}`);
+              console.log(`    WAR:   ${config.warPath || ANSI.dim + '(not set)' + ANSI.reset}`);
               console.log(`    Mode:  ${config.parallel ? 'parallel' : 'sequential'}`);
               console.log();
             }
@@ -573,16 +808,16 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               return;
             }
 
-            console.log(`\nDeployment Config: ${config.name}\n`);
+            console.log(`\n${ANSI.bold}Deployment Config: ${config.name}${ANSI.reset}\n`);
             if (config.description) {
               console.log(`  Description: ${config.description}`);
             }
-            console.log(`  WAR Path:    ${config.warPath || '(not set)'}`);
+            console.log(`  WAR Path:    ${config.warPath || ANSI.dim + '(not set)' + ANSI.reset}`);
             console.log(`  Port:        ${config.port}`);
             console.log(`  Mode:        ${config.parallel ? 'parallel' : 'sequential'}`);
             console.log(`\n  Hosts (${config.hosts.length}):`);
             if (config.hosts.length === 0) {
-              console.log('    (none)');
+              console.log(`    ${ANSI.dim}(none)${ANSI.reset}`);
             } else {
               for (const host of config.hosts) {
                 console.log(`    - ${host}`);
@@ -697,148 +932,6 @@ export function createPayaraCLIPlugin(): CLIPlugin {
           }
         });
 
-      // deploy config push - Push configs to vault
-      configCmd
-        .command('push')
-        .description('Push deployment configs to vault for sharing/backup')
-        .option('-a, --alias <alias>', 'Vault secret alias (default: deploy/configs)')
-        .action(async (options: { alias?: string }) => {
-          try {
-            const alias = options.alias ?? 'deploy/configs';
-            const store = await loadDeployConfigs();
-
-            if (Object.keys(store.configs).length === 0) {
-              ctx.output.error('No configs to push');
-              process.exit(1);
-            }
-
-            ctx.output.info(`Pushing ${Object.keys(store.configs).length} config(s) to vault...`);
-
-            // Create/update secret in vault
-            const secretData = {
-              configs: store.configs,
-              pushedAt: new Date().toISOString(),
-              pushedFrom: hostname(),
-            };
-
-            try {
-              // Try to update existing secret
-              await ctx.client.post(`/v1/secrets/by-alias/${encodeURIComponent(alias)}`, {
-                value: JSON.stringify(secretData, null, 2),
-              });
-            } catch {
-              // Create new secret
-              await ctx.client.post('/v1/secrets', {
-                alias,
-                name: 'Deployment Configurations',
-                description: 'Shared deployment configs for znvault deploy command',
-                value: JSON.stringify(secretData, null, 2),
-                type: 'generic',
-              });
-            }
-
-            // Update local store with vault info
-            store.vaultEnabled = true;
-            store.vaultAlias = alias;
-            await saveDeployConfigs(store);
-
-            ctx.output.success(`Pushed to vault: ${alias}`);
-            ctx.output.info('Other users can pull with: znvault deploy config pull');
-          } catch (err) {
-            ctx.output.error(`Failed to push: ${err instanceof Error ? err.message : String(err)}`);
-            process.exit(1);
-          }
-        });
-
-      // deploy config pull - Pull configs from vault
-      configCmd
-        .command('pull')
-        .description('Pull deployment configs from vault')
-        .option('-a, --alias <alias>', 'Vault secret alias (default: deploy/configs)')
-        .option('--merge', 'Merge with local configs instead of replacing')
-        .action(async (options: { alias?: string; merge?: boolean }) => {
-          try {
-            const localStore = await loadDeployConfigs();
-            const alias = options.alias ?? localStore.vaultAlias ?? 'deploy/configs';
-
-            ctx.output.info(`Pulling configs from vault: ${alias}...`);
-
-            const response = await ctx.client.get<{ value: string }>(
-              `/v1/secrets/by-alias/${encodeURIComponent(alias)}/value`
-            );
-
-            const vaultData = JSON.parse(response.value) as {
-              configs: Record<string, DeployConfig>;
-              pushedAt: string;
-              pushedFrom: string;
-            };
-
-            const vaultConfigs = vaultData.configs;
-            const configCount = Object.keys(vaultConfigs).length;
-
-            if (options.merge) {
-              // Merge: vault configs override local on conflict
-              const newStore: DeployConfigStore = {
-                configs: { ...localStore.configs, ...vaultConfigs },
-                vaultEnabled: true,
-                vaultAlias: alias,
-              };
-              await saveDeployConfigs(newStore);
-
-              const merged = Object.keys(newStore.configs).length;
-              ctx.output.success(`Merged ${configCount} config(s) from vault (${merged} total)`);
-            } else {
-              // Replace local configs
-              const newStore: DeployConfigStore = {
-                configs: vaultConfigs,
-                vaultEnabled: true,
-                vaultAlias: alias,
-              };
-              await saveDeployConfigs(newStore);
-
-              ctx.output.success(`Pulled ${configCount} config(s) from vault`);
-            }
-
-            ctx.output.info(`Last pushed: ${vaultData.pushedAt} from ${vaultData.pushedFrom}`);
-          } catch (err) {
-            if (String(err).includes('404') || String(err).includes('not found')) {
-              ctx.output.error('No configs found in vault');
-              ctx.output.info('Push configs first with: znvault deploy config push');
-            } else {
-              ctx.output.error(`Failed to pull: ${err instanceof Error ? err.message : String(err)}`);
-            }
-            process.exit(1);
-          }
-        });
-
-      // deploy config sync - Show sync status
-      configCmd
-        .command('sync')
-        .description('Show vault sync status')
-        .action(async () => {
-          try {
-            const store = await loadDeployConfigs();
-
-            console.log('\nVault Sync Status:\n');
-
-            if (!store.vaultEnabled) {
-              console.log('  Status: Local only (not synced to vault)');
-              console.log('  Configs: ' + Object.keys(store.configs).length);
-              console.log('\n  To enable vault sync: znvault deploy config push');
-            } else {
-              console.log('  Status: Vault sync enabled');
-              console.log('  Alias:  ' + (store.vaultAlias ?? 'deploy/configs'));
-              console.log('  Configs: ' + Object.keys(store.configs).length);
-              console.log('\n  Push changes: znvault deploy config push');
-              console.log('  Pull updates: znvault deploy config pull');
-            }
-            console.log();
-          } catch (err) {
-            ctx.output.error(`Failed to get sync status: ${err instanceof Error ? err.message : String(err)}`);
-            process.exit(1);
-          }
-        });
-
       // deploy config set <name> <key> <value>
       configCmd
         .command('set <name> <key> <value>')
@@ -902,21 +995,23 @@ export function createPayaraCLIPlugin(): CLIPlugin {
           force?: boolean;
           dryRun?: boolean;
         }) => {
+          const progress = new ProgressReporter(ctx.isPlainMode());
+
           try {
             // Verify WAR file exists
+            let warStats;
             try {
-              await stat(warFile);
+              warStats = await stat(warFile);
             } catch {
               ctx.output.error(`WAR file not found: ${warFile}`);
               process.exit(1);
             }
 
-            ctx.output.info(`Analyzing WAR file: ${warFile}`);
+            progress.analyzing(warFile);
 
             // Calculate local hashes
             const localHashes = await calculateWarHashes(warFile);
-            const fileCount = Object.keys(localHashes).length;
-            ctx.output.info(`Found ${fileCount} files in WAR`);
+            progress.foundFiles(Object.keys(localHashes).length, warStats.size);
 
             // Build target URL
             const target = options.target ?? ctx.getConfig().url;
@@ -949,43 +1044,44 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             if (remoteIsEmpty) {
               ctx.output.info('Remote has no WAR, will upload full WAR file');
             } else {
-              ctx.output.info(`Diff: ${changed.length} changed, ${deleted.length} deleted`);
+              progress.diff(changed.length, deleted.length);
             }
 
             // Dry run - just show what would be deployed
             if (options.dryRun) {
               if (remoteIsEmpty) {
-                ctx.output.info(`Would upload full WAR (${fileCount} files)`);
+                ctx.output.info(`Would upload full WAR (${Object.keys(localHashes).length} files)`);
                 return;
               }
 
               if (changed.length > 0) {
                 ctx.output.info('\nFiles to update:');
                 for (const file of changed.slice(0, 20)) {
-                  console.log(`  + ${file}`);
+                  console.log(`  ${ANSI.green}+${ANSI.reset} ${file}`);
                 }
                 if (changed.length > 20) {
-                  console.log(`  ... and ${changed.length - 20} more`);
+                  console.log(`  ${ANSI.dim}... and ${changed.length - 20} more${ANSI.reset}`);
                 }
               }
 
               if (deleted.length > 0) {
                 ctx.output.info('\nFiles to delete:');
                 for (const file of deleted.slice(0, 20)) {
-                  console.log(`  - ${file}`);
+                  console.log(`  ${ANSI.red}-${ANSI.reset} ${file}`);
                 }
                 if (deleted.length > 20) {
-                  console.log(`  ... and ${deleted.length - 20} more`);
+                  console.log(`  ${ANSI.dim}... and ${deleted.length - 20} more${ANSI.reset}`);
                 }
               }
 
               if (changed.length === 0 && deleted.length === 0) {
-                ctx.output.success('No changes to deploy');
+                progress.noChanges();
               }
               return;
             }
 
-            // Deploy using deployToHost (handles full upload, chunking, etc.)
+            // Deploy using deployToHost
+            progress.setHost(target);
             const result = await deployToHost(
               ctx,
               target,
@@ -993,15 +1089,13 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               warFile,
               localHashes,
               options.force ?? false,
-              (message) => ctx.output.info(message)
+              progress
             );
 
-            if (result.success) {
-              ctx.output.success(
-                `Deployed: ${result.filesChanged} files changed, ${result.filesDeleted} deleted`
-              );
+            if (result.success && result.result) {
+              progress.deployed(result.result);
             } else {
-              ctx.output.error(`Deployment failed: ${result.error}`);
+              progress.failed(result.error ?? 'Unknown error');
               process.exit(1);
             }
           } catch (err) {
@@ -1033,20 +1127,21 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               ctx.output.info(`Restarting Payara on ${config.hosts.length} host(s)...`);
 
               for (const host of config.hosts) {
-                const baseUrl = host.startsWith('http') ? host : `https://${host}`;
+                const baseUrl = host.startsWith('http') ? host : `http://${host}`;
                 const pluginUrl = `${baseUrl}:${config.port}/plugins/payara`;
                 try {
                   await ctx.client.post(`${pluginUrl}/restart`, {});
-                  ctx.output.success(`  ✓ ${host} restarted`);
+                  console.log(`  ${ANSI.green}✓${ANSI.reset} ${host} restarted`);
                 } catch (err) {
-                  ctx.output.error(`  ✗ ${host}: ${err instanceof Error ? err.message : String(err)}`);
+                  console.log(`  ${ANSI.red}✗${ANSI.reset} ${host}: ${err instanceof Error ? err.message : String(err)}`);
                 }
               }
             } else {
               // Single host restart
               const target = options.target ?? ctx.getConfig().url;
               const baseUrl = target.replace(/\/$/, '');
-              const pluginUrl = `${baseUrl}:${options.port}/plugins/payara`;
+              const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
+              const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
 
               ctx.output.info('Restarting Payara...');
               await ctx.client.post(`${pluginUrl}/restart`, {});
@@ -1078,22 +1173,25 @@ export function createPayaraCLIPlugin(): CLIPlugin {
                 process.exit(1);
               }
 
-              console.log(`\nStatus for ${configName}:\n`);
+              console.log(`\n${ANSI.bold}Status for ${configName}:${ANSI.reset}\n`);
 
               for (const host of config.hosts) {
-                const baseUrl = host.startsWith('http') ? host : `https://${host}`;
+                const baseUrl = host.startsWith('http') ? host : `http://${host}`;
                 const pluginUrl = `${baseUrl}:${config.port}/plugins/payara`;
                 try {
                   const status = await ctx.client.get<{
                     healthy: boolean;
                     running: boolean;
                     domain: string;
+                    appDeployed?: boolean;
+                    appName?: string;
                   }>(`${pluginUrl}/status`);
-                  const icon = status.healthy ? '✓' : status.running ? '!' : '✗';
-                  const state = status.healthy ? 'healthy' : status.running ? 'degraded' : 'down';
-                  console.log(`  ${icon} ${host}: ${state} (${status.domain})`);
-                } catch (err) {
-                  console.log(`  ✗ ${host}: unreachable`);
+                  const icon = status.healthy && status.appDeployed ? ANSI.green + '✓' : status.running ? ANSI.yellow + '!' : ANSI.red + '✗';
+                  const state = status.healthy && status.appDeployed ? 'healthy' : status.running ? 'degraded' : 'down';
+                  const appInfo = status.appDeployed ? `${status.appName || 'app'} deployed` : 'no app';
+                  console.log(`  ${icon}${ANSI.reset} ${host}: ${state} (${status.domain}, ${appInfo})`);
+                } catch {
+                  console.log(`  ${ANSI.red}✗${ANSI.reset} ${host}: unreachable`);
                 }
               }
               console.log();
@@ -1101,12 +1199,16 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               // Single host status
               const target = options.target ?? ctx.getConfig().url;
               const baseUrl = target.replace(/\/$/, '');
-              const pluginUrl = `${baseUrl}:${options.port}/plugins/payara`;
+              const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
+              const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
 
               const status = await ctx.client.get<{
                 healthy: boolean;
                 running: boolean;
                 domain: string;
+                appDeployed?: boolean;
+                appName?: string;
+                warPath?: string;
                 pid?: number;
               }>(`${pluginUrl}/status`);
 
@@ -1114,6 +1216,9 @@ export function createPayaraCLIPlugin(): CLIPlugin {
                 'Domain': status.domain,
                 'Running': status.running,
                 'Healthy': status.healthy,
+                'App Deployed': status.appDeployed ?? false,
+                'App Name': status.appName ?? 'N/A',
+                'WAR Path': status.warPath ?? 'N/A',
                 'PID': status.pid ?? 'N/A',
               });
             }
@@ -1136,7 +1241,8 @@ export function createPayaraCLIPlugin(): CLIPlugin {
           try {
             const target = options.target ?? ctx.getConfig().url;
             const baseUrl = target.replace(/\/$/, '');
-            const pluginUrl = `${baseUrl}:${options.port}/plugins/payara`;
+            const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
+            const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
 
             const response = await ctx.client.get<{ applications: string[] }>(
               `${pluginUrl}/applications`

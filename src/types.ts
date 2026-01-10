@@ -140,6 +140,28 @@ export interface DeployResponse {
 }
 
 /**
+ * Deploy result with full details
+ */
+export interface DeployResult {
+  /** Whether deployment succeeded */
+  success: boolean;
+  /** Number of files changed */
+  filesChanged: number;
+  /** Number of files deleted */
+  filesDeleted: number;
+  /** Result message */
+  message: string;
+  /** Deployment time in milliseconds */
+  deploymentTime: number;
+  /** Application name */
+  appName: string;
+  /** Whether app is now deployed */
+  deployed?: boolean;
+  /** List of all deployed applications */
+  applications?: string[];
+}
+
+/**
  * Chunked deploy session - tracks state across multiple chunk uploads
  */
 export interface ChunkedDeploySession {
@@ -182,11 +204,7 @@ export interface ChunkedDeployResponse {
   /** Whether deployment was committed */
   committed: boolean;
   /** Deployment result (only if committed) */
-  result?: {
-    filesChanged: number;
-    filesDeleted: number;
-    message: string;
-  };
+  result?: DeployResult;
 }
 
 /**
@@ -206,6 +224,8 @@ export interface PayaraStatus {
   domain: string;
   pid?: number;
   uptime?: number;
+  appDeployed?: boolean;
+  appName?: string;
 }
 
 // Import type for PayaraManager reference in WarDeployerOptions

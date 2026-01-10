@@ -1,5 +1,5 @@
 // Path: src/war-deployer.ts
-// WAR file deployer with diff-based updates
+// WAR file deployer with diff-based updates - uses asadmin deploy commands only
 
 import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, rm, stat, readdir } from 'node:fs/promises';
@@ -7,15 +7,19 @@ import { join, dirname } from 'node:path';
 import AdmZip from 'adm-zip';
 import type { Logger } from 'pino';
 import type { PayaraManager } from './payara-manager.js';
-import type { WarDeployerOptions, WarFileHashes, FileChange } from './types.js';
+import type { WarDeployerOptions, WarFileHashes, FileChange, DeployResult } from './types.js';
 
 /**
  * WAR file deployer with diff-based updates
  *
+ * IMPORTANT: This deployer uses asadmin deploy commands ONLY.
+ * It does NOT use the autodeploy directory.
+ *
  * Supports:
- * - Full WAR deployment
+ * - Full WAR deployment via asadmin deploy --force
  * - Diff-based updates (only changed files)
  * - Hash calculation for change detection
+ * - Proper deployment status reporting
  */
 export class WarDeployer {
   private readonly warPath: string;
@@ -76,24 +80,27 @@ export class WarDeployer {
   }
 
   /**
-   * Apply file changes to WAR and deploy
+   * Apply file changes to WAR and deploy using asadmin
    *
    * This method:
    * 1. Extracts the current WAR to a temp directory
    * 2. Applies file changes and deletions
    * 3. Repackages the WAR
-   * 4. Deploys to Payara
+   * 4. Deploys to Payara using asadmin deploy --force
+   *
+   * @returns Deploy result with status and details
    */
   async applyChanges(
     changedFiles: FileChange[],
     deletedFiles: string[]
-  ): Promise<void> {
+  ): Promise<DeployResult> {
     if (this.deployLock) {
       throw new Error('Deployment already in progress');
     }
 
     this.deployLock = true;
     const tempDir = `/tmp/war-deploy-${Date.now()}`;
+    const startTime = Date.now();
 
     try {
       this.logger.info({
@@ -147,8 +154,33 @@ export class WarDeployer {
 
       this.logger.info({ warPath: this.warPath }, 'WAR file updated');
 
-      // Deploy to Payara
-      await this.deploy();
+      // Deploy to Payara using asadmin deploy
+      const deployResult = await this.deploy();
+
+      const duration = Date.now() - startTime;
+
+      return {
+        success: true,
+        filesChanged: changedFiles.length,
+        filesDeleted: deletedFiles.length,
+        message: 'Deployment successful',
+        deploymentTime: duration,
+        appName: this.appName,
+        ...deployResult,
+      };
+
+    } catch (err) {
+      const duration = Date.now() - startTime;
+      this.logger.error({ err, duration }, 'Deployment failed');
+
+      return {
+        success: false,
+        filesChanged: changedFiles.length,
+        filesDeleted: deletedFiles.length,
+        message: err instanceof Error ? err.message : String(err),
+        deploymentTime: duration,
+        appName: this.appName,
+      };
 
     } finally {
       // Cleanup temp directory
@@ -222,18 +254,20 @@ export class WarDeployer {
   }
 
   /**
-   * Deploy WAR to Payara (full deployment)
-   * Uses hot deployment (--force) if Payara is running
+   * Deploy WAR to Payara using asadmin deploy command
+   * Uses --force flag for hot deployment/redeploy
+   *
+   * IMPORTANT: This does NOT use autodeploy. It uses explicit asadmin commands.
    */
-  async deploy(): Promise<void> {
+  async deploy(): Promise<{ deployed: boolean; applications: string[] }> {
     if (!(await this.warExists())) {
       this.logger.info({ warPath: this.warPath }, 'No WAR file to deploy');
-      return;
+      return { deployed: false, applications: [] };
     }
 
-    this.logger.info({ warPath: this.warPath, appName: this.appName }, 'Deploying WAR');
+    this.logger.info({ warPath: this.warPath, appName: this.appName }, 'Deploying WAR via asadmin');
 
-    // Ensure Payara is running (hot deployment requires running domain)
+    // Ensure Payara is running
     const isRunning = await this.payara.isRunning();
 
     if (!isRunning) {
@@ -244,7 +278,17 @@ export class WarDeployer {
     // Deploy WAR with --force flag (hot deployment/redeploy)
     await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
 
-    this.logger.info({ appName: this.appName }, 'WAR deployed successfully');
+    // Verify deployment
+    const applications = await this.payara.listApplications();
+    const isDeployed = applications.includes(this.appName);
+
+    if (isDeployed) {
+      this.logger.info({ appName: this.appName, applications }, 'WAR deployed successfully');
+    } else {
+      this.logger.warn({ appName: this.appName, applications }, 'WAR deployment may have failed - app not in list');
+    }
+
+    return { deployed: isDeployed, applications };
   }
 
   /**
@@ -252,8 +296,8 @@ export class WarDeployer {
    */
   async deployIfExists(): Promise<boolean> {
     if (await this.warExists()) {
-      await this.deploy();
-      return true;
+      const result = await this.deploy();
+      return result.deployed;
     }
     return false;
   }
@@ -270,6 +314,13 @@ export class WarDeployer {
    */
   getWarPath(): string {
     return this.warPath;
+  }
+
+  /**
+   * Get application name
+   */
+  getAppName(): string {
+    return this.appName;
   }
 
   /**
@@ -293,6 +344,21 @@ export class WarDeployer {
       this.logger.error({ err, path }, 'Failed to read file from WAR');
       return null;
     }
+  }
+
+  /**
+   * Check if application is currently deployed
+   */
+  async isAppDeployed(): Promise<boolean> {
+    const applications = await this.payara.listApplications();
+    return applications.includes(this.appName);
+  }
+
+  /**
+   * Undeploy the application
+   */
+  async undeploy(): Promise<void> {
+    await this.payara.undeploy(this.appName);
   }
 
   /**

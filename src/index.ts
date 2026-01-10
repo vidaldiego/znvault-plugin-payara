@@ -400,14 +400,28 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
     async healthCheck(_ctx: PluginContext): Promise<PluginHealthStatus> {
       try {
         const status = await payara.getStatus();
+        const appDeployed = await deployer.isAppDeployed();
+
+        // Healthy = domain running + app deployed + health endpoint responding (if configured)
+        // Degraded = domain running but app not deployed or health check failing
+        // Unhealthy = domain not running
+        let healthStatus: 'healthy' | 'degraded' | 'unhealthy';
+        if (status.running && appDeployed && status.healthy) {
+          healthStatus = 'healthy';
+        } else if (status.running) {
+          healthStatus = 'degraded';
+        } else {
+          healthStatus = 'unhealthy';
+        }
 
         return {
           name: 'payara',
-          status: status.healthy ? 'healthy' : status.running ? 'degraded' : 'unhealthy',
+          status: healthStatus,
           details: {
             domain: config.domain,
             running: status.running,
             healthy: status.healthy,
+            appDeployed,
             warPath: config.warPath,
             appName: config.appName,
           },
@@ -440,5 +454,9 @@ export type {
   FileChange,
   DeployRequest,
   DeployResponse,
+  DeployResult,
   PayaraStatus,
+  ChunkedDeployRequest,
+  ChunkedDeployResponse,
+  ChunkedDeploySession,
 } from './types.js';

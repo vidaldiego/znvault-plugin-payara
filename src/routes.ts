@@ -1,11 +1,17 @@
 // Path: src/routes.ts
-// HTTP routes for Payara plugin
+// HTTP routes for Payara plugin - uses asadmin deploy commands only
 
 import type { FastifyInstance } from 'fastify';
 import type { Logger } from 'pino';
 import type { PayaraManager } from './payara-manager.js';
 import type { WarDeployer } from './war-deployer.js';
-import type { DeployRequest, ChunkedDeployRequest, ChunkedDeploySession, ChunkedDeployResponse } from './types.js';
+import type {
+  DeployRequest,
+  ChunkedDeployRequest,
+  ChunkedDeploySession,
+  ChunkedDeployResponse,
+  DeployResult,
+} from './types.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -33,6 +39,9 @@ function cleanupExpiredSessions(): void {
  * Register Payara plugin HTTP routes
  *
  * Routes are registered under /plugins/payara/ prefix by the agent
+ *
+ * IMPORTANT: All deployment uses asadmin deploy commands.
+ * The autodeploy directory is NOT used.
  */
 export async function registerRoutes(
   fastify: FastifyInstance,
@@ -70,8 +79,10 @@ export async function registerRoutes(
 
   /**
    * POST /deploy
-   * Applies file changes and deploys WAR
+   * Applies file changes and deploys WAR using asadmin deploy
    * Receives base64-encoded file contents for changed files
+   *
+   * Returns full deployment result with status
    */
   fastify.post<{ Body: DeployRequest }>('/deploy', async (request, reply) => {
     const { files, deletions } = request.body;
@@ -109,16 +120,23 @@ export async function registerRoutes(
       logger.info({
         filesChanged: changedFiles.length,
         filesDeleted: deletions.length,
-      }, 'Starting deployment');
+      }, 'Starting deployment via asadmin');
 
-      await deployer.applyChanges(changedFiles, deletions);
+      // Deploy using asadmin deploy command
+      const result = await deployer.applyChanges(changedFiles, deletions);
 
-      return {
-        status: 'deployed',
-        filesChanged: changedFiles.length,
-        filesDeleted: deletions.length,
-        message: 'Deployment successful',
-      };
+      if (result.success) {
+        return {
+          status: 'deployed',
+          ...result,
+        };
+      } else {
+        return reply.code(500).send({
+          status: 'failed',
+          error: 'Deployment failed',
+          ...result,
+        });
+      }
     } catch (err) {
       logger.error({ err }, 'Deployment failed');
       return reply.code(500).send({
@@ -130,7 +148,7 @@ export async function registerRoutes(
 
   /**
    * POST /deploy/full
-   * Triggers a full WAR deployment (no diff)
+   * Triggers a full WAR deployment using asadmin deploy (no diff)
    */
   fastify.post('/deploy/full', async (request, reply) => {
     if (deployer.isDeploying()) {
@@ -141,10 +159,19 @@ export async function registerRoutes(
     }
 
     try {
-      await deployer.deploy();
+      logger.info('Starting full deployment via asadmin');
+
+      const startTime = Date.now();
+      const deployResult = await deployer.deploy();
+      const duration = Date.now() - startTime;
+
       return {
-        status: 'deployed',
-        message: 'Full deployment successful',
+        status: deployResult.deployed ? 'deployed' : 'failed',
+        message: deployResult.deployed ? 'Full deployment successful' : 'Deployment failed',
+        deploymentTime: duration,
+        deployed: deployResult.deployed,
+        applications: deployResult.applications,
+        appName: deployer.getAppName(),
       };
     } catch (err) {
       logger.error({ err }, 'Full deployment failed');
@@ -157,11 +184,13 @@ export async function registerRoutes(
 
   /**
    * POST /deploy/upload
-   * Upload a complete WAR file for initial deployment
+   * Upload a complete WAR file for deployment
    * Used when server has no existing WAR to diff against
    *
    * Expects raw binary WAR file in request body
    * Content-Type: application/octet-stream
+   *
+   * Deployment uses asadmin deploy command, NOT autodeploy
    */
   fastify.post<{ Body: Buffer }>('/deploy/upload', async (request, reply) => {
     if (deployer.isDeploying()) {
@@ -191,16 +220,34 @@ export async function registerRoutes(
       // Write buffer to WAR path
       await writeFile(warPath, warBuffer);
 
-      logger.info({ warPath, size: warBuffer.length }, 'WAR file uploaded, deploying...');
+      logger.info({ warPath, size: warBuffer.length }, 'WAR file uploaded, deploying via asadmin...');
 
-      // Deploy the WAR
-      await deployer.deploy();
+      // Deploy the WAR using asadmin deploy
+      const startTime = Date.now();
+      const deployResult = await deployer.deploy();
+      const duration = Date.now() - startTime;
 
-      return {
-        status: 'deployed',
-        message: 'WAR uploaded and deployed successfully',
-        size: warBuffer.length,
-      };
+      if (deployResult.deployed) {
+        return {
+          status: 'deployed',
+          message: 'WAR uploaded and deployed successfully via asadmin',
+          size: warBuffer.length,
+          deploymentTime: duration,
+          deployed: true,
+          applications: deployResult.applications,
+          appName: deployer.getAppName(),
+        };
+      } else {
+        return reply.code(500).send({
+          status: 'failed',
+          error: 'Deployment failed',
+          message: 'WAR uploaded but deployment via asadmin failed',
+          size: warBuffer.length,
+          deploymentTime: duration,
+          deployed: false,
+          applications: deployResult.applications,
+        });
+      }
     } catch (err) {
       logger.error({ err }, 'WAR upload failed');
       return reply.code(500).send({
@@ -217,6 +264,8 @@ export async function registerRoutes(
    * For first chunk: omit sessionId, include deletions
    * For subsequent chunks: include sessionId from previous response
    * For final chunk: set commit: true to apply all changes
+   *
+   * Final deployment uses asadmin deploy command
    */
   fastify.post<{ Body: ChunkedDeployRequest }>('/deploy/chunk', async (request, reply) => {
     const { sessionId, files, deletions, expectedFiles, commit } = request.body;
@@ -267,7 +316,7 @@ export async function registerRoutes(
       committed: false,
     };
 
-    // If commit requested, apply all changes
+    // If commit requested, apply all changes using asadmin deploy
     if (commit) {
       // Check if deployment is already in progress
       if (deployer.isDeploying()) {
@@ -288,19 +337,16 @@ export async function registerRoutes(
           sessionId: session.id,
           filesChanged: changedFiles.length,
           filesDeleted: session.deletions.length,
-        }, 'Committing chunked deployment');
+        }, 'Committing chunked deployment via asadmin');
 
-        await deployer.applyChanges(changedFiles, session.deletions);
+        // Deploy using asadmin deploy command
+        const result = await deployer.applyChanges(changedFiles, session.deletions);
 
         // Clean up session
         chunkSessions.delete(session.id);
 
         response.committed = true;
-        response.result = {
-          filesChanged: changedFiles.length,
-          filesDeleted: session.deletions.length,
-          message: 'Deployment successful',
-        };
+        response.result = result;
       } catch (err) {
         // Clean up session on error
         chunkSessions.delete(session.id);
@@ -400,12 +446,21 @@ export async function registerRoutes(
 
   /**
    * GET /status
-   * Get current Payara status
+   * Get current Payara status including deployment status
    */
   fastify.get('/status', async (request, reply) => {
     try {
       const status = await payara.getStatus();
-      return status;
+
+      // Also check if app is deployed
+      const appDeployed = await deployer.isAppDeployed();
+
+      return {
+        ...status,
+        appDeployed,
+        appName: deployer.getAppName(),
+        warPath: deployer.getWarPath(),
+      };
     } catch (err) {
       logger.error({ err }, 'Failed to get status');
       return reply.code(500).send({
@@ -427,6 +482,28 @@ export async function registerRoutes(
       logger.error({ err }, 'Failed to list applications');
       return reply.code(500).send({
         error: 'Failed to list applications',
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  /**
+   * POST /undeploy
+   * Undeploy the application
+   */
+  fastify.post('/undeploy', async (request, reply) => {
+    try {
+      logger.info({ appName: deployer.getAppName() }, 'Undeploying application');
+      await deployer.undeploy();
+      return {
+        status: 'undeployed',
+        message: 'Application undeployed successfully',
+        appName: deployer.getAppName(),
+      };
+    } catch (err) {
+      logger.error({ err }, 'Undeploy failed');
+      return reply.code(500).send({
+        error: 'Undeploy failed',
         message: err instanceof Error ? err.message : String(err),
       });
     }
