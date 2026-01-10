@@ -10,7 +10,6 @@ import type {
   ChunkedDeployRequest,
   ChunkedDeploySession,
   ChunkedDeployResponse,
-  DeployResult,
 } from './types.js';
 import { writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';

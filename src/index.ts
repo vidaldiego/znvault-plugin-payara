@@ -218,8 +218,8 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.4.3',
-    description: 'Payara application server management with WAR diff deployment and secret injection',
+    version: '1.6.0',
+    description: 'Payara application server management with WAR diff deployment, secret injection, and aggressive mode',
 
     async onInit(ctx: PluginContext): Promise<void> {
       pluginLogger = ctx.logger.child({ plugin: 'payara' });
@@ -270,6 +270,12 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         environment: secretsEnv,
       });
 
+      // Validate asadmin binary exists (early failure detection)
+      // Skip in test environments or when explicitly disabled
+      if (process.env.NODE_ENV !== 'test' && config.validateAsadmin !== false) {
+        await payara.validateAsadmin();
+      }
+
       // Create WAR deployer
       deployer = new WarDeployer({
         warPath: config.warPath,
@@ -277,13 +283,27 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         contextRoot: config.contextRoot,
         payara,
         logger: pluginLogger,
+        aggressiveMode: config.aggressiveMode ?? false,
       });
 
       pluginLogger.info('Payara plugin initialized');
     },
 
     async onStart(ctx: PluginContext): Promise<void> {
-      pluginLogger.info('Starting Payara plugin');
+      const manageLifecycle = config.manageLifecycle !== false; // default: true
+
+      pluginLogger.info({
+        aggressiveMode: config.aggressiveMode ?? false,
+        manageLifecycle,
+      }, 'Starting Payara plugin');
+
+      // Warn about conflicting config options
+      if (config.aggressiveMode && !manageLifecycle) {
+        pluginLogger.warn(
+          'aggressiveMode is enabled but manageLifecycle is false - ' +
+          'aggressive mode features will be ignored since lifecycle is managed externally'
+        );
+      }
 
       // Refresh secrets before starting (in case they changed)
       if (config.secrets && Object.keys(config.secrets).length > 0) {
@@ -292,16 +312,62 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         payara.setEnvironment(secretsEnv);
       }
 
-      // Check if Payara is already healthy
-      if (await payara.isHealthy()) {
-        pluginLogger.info('Payara already running and healthy');
-      } else {
-        pluginLogger.info('Starting Payara...');
-        await payara.start();
+      if (!manageLifecycle) {
+        // EXEC MODE: Don't start Payara, wait for it to be ready (started by exec)
+        pluginLogger.info('Lifecycle managed externally (exec mode), waiting for Payara to be ready...');
+
+        // Wait for Payara to become healthy (started by exec command)
+        const maxWait = 120000; // 2 minutes
+        const startTime = Date.now();
+        let payaraReady = false;
+
+        while (Date.now() - startTime < maxWait) {
+          if (await payara.isRunning()) {
+            pluginLogger.info('Payara is running');
+            payaraReady = true;
+            break;
+          }
+          await new Promise(r => setTimeout(r, 2000));
+        }
+
+        if (!payaraReady) {
+          pluginLogger.warn(
+            `Timeout waiting for Payara to start (${maxWait / 1000}s). ` +
+            'Plugin will continue but Payara may not be available. ' +
+            'Check exec command configuration.'
+          );
+        }
+
+        // Deploy WAR if it exists and Payara is running
+        if (payaraReady && await deployer.warExists()) {
+          await deployer.deploy();
+        }
+      } else if (config.aggressiveMode) {
+        // AGGRESSIVE MODE: Always ensure clean slate on startup
+        pluginLogger.info('Aggressive mode: ensuring clean state before starting Payara');
+
+        // Kill any existing Java processes (clean slate)
+        await payara.ensureNoJavaRunning(true);
+
+        // Start Payara fresh
+        await payara.safeStart();
 
         // Deploy WAR if it exists
         if (await deployer.warExists()) {
           await deployer.deploy();
+        }
+      } else {
+        // NORMAL MODE: Start only if not already running
+        if (await payara.isHealthy()) {
+          pluginLogger.info('Payara already running and healthy');
+        } else {
+          pluginLogger.info('Starting Payara...');
+          await payara.start();
+
+          // Deploy WAR if it exists
+          if (await deployer.warExists()) {
+            await deployer.deploy();
+          }
         }
       }
 
@@ -319,9 +385,17 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
     },
 
     async onCertificateDeployed(event: CertificateDeployedEvent, _ctx: PluginContext): Promise<void> {
-      if (config.restartOnCertChange) {
+      const manageLifecycle = config.manageLifecycle !== false;
+
+      if (config.restartOnCertChange && manageLifecycle) {
         pluginLogger.info({ certId: event.certId, name: event.name }, 'Certificate changed, restarting Payara');
-        await payara.restart();
+        if (config.aggressiveMode) {
+          await payara.aggressiveRestart();
+        } else {
+          await payara.restart();
+        }
+      } else {
+        pluginLogger.debug({ certId: event.certId }, 'Certificate changed (no restart configured)');
       }
     },
 
@@ -342,22 +416,30 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
       // Refresh secrets to update the API key file
       // When apiKeyFilePath is set, the key is written to file and the app
-      // reads it on each request - no restart needed
+      // reads it on each request - NO restart needed
       secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user);
       payara.setEnvironment(secretsEnv);
 
       if (config.apiKeyFilePath) {
-        // File-based mode: no restart needed, app reads key from file
+        // File-based mode: NO restart needed, app reads key from file dynamically
         pluginLogger.info({ filePath: config.apiKeyFilePath }, 'API key file updated, app will pick up new key automatically');
+        // Note: No restart - the app reads from file on each request
       } else {
-        // Legacy inline mode: may need restart to pick up new env vars
-        const shouldRestart = config.restartOnKeyRotation !== false;
+        // Legacy inline mode: env vars in setenv.conf won't be picked up without restart
+        // But if manageLifecycle is false, we can't restart
+        const manageLifecycle = config.manageLifecycle !== false;
+        const shouldRestart = config.restartOnKeyRotation !== false && manageLifecycle;
+
         if (shouldRestart) {
           pluginLogger.info('Restarting Payara with new API key (inline mode)...');
-          await payara.restart();
+          if (config.aggressiveMode) {
+            await payara.aggressiveRestart();
+          } else {
+            await payara.restart();
+          }
           pluginLogger.info('Payara restarted successfully with rotated API key');
         } else {
-          pluginLogger.info('API key updated in setenv.conf, Payara restart disabled');
+          pluginLogger.warn('API key updated in setenv.conf but restart disabled - app may use stale key until manual restart');
         }
       }
     },
@@ -384,17 +466,21 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         alias: event.alias,
         secretId: event.secretId,
         version: event.version,
-      }, 'Watched secret changed, refreshing and restarting Payara');
+      }, 'Watched secret changed, refreshing secrets');
 
-      // Refresh secrets to pick up new values
+      // Refresh secrets to pick up new values (updates files and setenv.conf)
       if (config.secrets && Object.keys(config.secrets).length > 0) {
         secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath, config.user);
         payara.setEnvironment(secretsEnv);
       }
 
-      // Restart Payara to apply new config
-      await payara.restart();
-      pluginLogger.info({ alias: event.alias }, 'Payara restarted successfully after config secret change');
+      // NOTE: We do NOT restart Payara on secret changes by default
+      // - File-based secrets: App reads from file dynamically
+      // - setenv.conf secrets: Would need restart, but that's disruptive
+      //
+      // If restart is needed, user should configure restartOnSecretChange: true
+      // or trigger a deployment which does a full restart in aggressive mode
+      pluginLogger.info({ alias: event.alias }, 'Secrets refreshed (no restart - app reads from files dynamically)');
     },
 
     async healthCheck(_ctx: PluginContext): Promise<PluginHealthStatus> {
@@ -455,6 +541,7 @@ export type {
   DeployRequest,
   DeployResponse,
   DeployResult,
+  FullDeployResult,
   PayaraStatus,
   ChunkedDeployRequest,
   ChunkedDeployResponse,

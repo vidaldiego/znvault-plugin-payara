@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, resolve, basename } from 'node:path';
-import { homedir, hostname } from 'node:os';
+import { homedir } from 'node:os';
 import AdmZip from 'adm-zip';
 import type { WarFileHashes, ChunkedDeployResponse, DeployResult } from './types.js';
 
@@ -554,7 +554,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.5.1',
+    version: '1.6.0',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {

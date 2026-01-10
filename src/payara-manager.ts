@@ -4,7 +4,7 @@
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
-import { writeFile } from 'node:fs/promises';
+import { writeFile, access, constants } from 'node:fs/promises';
 import type { Logger } from 'pino';
 import type { PayaraManagerOptions, PayaraStatus } from './types.js';
 
@@ -36,6 +36,21 @@ export class PayaraManager {
 
     // Path to asadmin command
     this.asadmin = join(this.payaraHome, 'bin', 'asadmin');
+  }
+
+  /**
+   * Validate that asadmin binary exists and is accessible.
+   * Call this during plugin initialization for early failure detection.
+   */
+  async validateAsadmin(): Promise<void> {
+    try {
+      await access(this.asadmin, constants.X_OK);
+    } catch {
+      throw new Error(
+        `asadmin not found or not executable at ${this.asadmin}. ` +
+        `Check payaraHome configuration (current: ${this.payaraHome})`
+      );
+    }
   }
 
   /**
@@ -119,7 +134,11 @@ export class PayaraManager {
       const output = await this.asadminCommand(['list-domains'], 10000);
       // Output format: "domain1 running" or "domain1 not running"
       const domainLine = output.split('\n').find(line => line.startsWith(this.domain));
-      return domainLine?.includes('running') && !domainLine?.includes('not running') || false;
+      if (!domainLine) {
+        return false;
+      }
+      // Must contain "running" but NOT "not running"
+      return domainLine.includes('running') && !domainLine.includes('not running');
     } catch {
       return false;
     }
@@ -265,6 +284,16 @@ export class PayaraManager {
   async deploy(warPath: string, appName: string, contextRoot?: string): Promise<void> {
     this.logger.info({ warPath, appName, contextRoot }, 'Deploying application');
 
+    // Validate contextRoot if provided
+    if (contextRoot) {
+      if (!contextRoot.startsWith('/')) {
+        throw new Error(`contextRoot must start with '/': ${contextRoot}`);
+      }
+      if (contextRoot.includes(' ')) {
+        throw new Error(`contextRoot cannot contain spaces: ${contextRoot}`);
+      }
+    }
+
     const args = ['deploy', '--force=true', `--name=${appName}`];
     if (contextRoot) {
       args.push(`--contextroot=${contextRoot}`);
@@ -357,5 +386,164 @@ export class PayaraManager {
    */
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  // ============================================================================
+  // AGGRESSIVE MODE: Ensures only ONE Java process runs at a time
+  // ============================================================================
+
+  /**
+   * Kill ALL Java processes for the configured user.
+   * This is the "aggressive mode" that ensures a clean slate.
+   *
+   * WARNING: This kills ALL Java processes for the user, not just Payara.
+   */
+  async killAllJavaProcesses(): Promise<void> {
+    this.logger.warn({ user: this.user }, 'Killing ALL Java processes (aggressive mode)');
+
+    // First try graceful SIGTERM
+    // Note: `|| true` ensures command succeeds even if no processes found
+    await this.execCommand(`pkill -u ${this.user} java || true`, 5000);
+    await this.sleep(2000);
+
+    // Check if any Java processes remain
+    const stillRunning = await this.hasJavaProcesses();
+
+    if (stillRunning) {
+      // Force kill with SIGKILL
+      this.logger.warn('Java processes still running, using SIGKILL');
+      await this.execCommand(`pkill -9 -u ${this.user} java || true`, 5000);
+      await this.sleep(2000);
+    }
+
+    // Verify all processes are dead
+    const remaining = await this.getJavaProcessPids();
+    if (remaining.length > 0) {
+      this.logger.error({ pids: remaining }, 'Failed to kill all Java processes');
+      throw new Error(`Failed to kill all Java processes for user ${this.user}: PIDs ${remaining.join(', ')} still running`);
+    }
+
+    this.logger.info({ user: this.user }, 'All Java processes killed');
+  }
+
+  /**
+   * Check if any Java processes are running for the configured user
+   */
+  async hasJavaProcesses(): Promise<boolean> {
+    try {
+      const result = await this.execCommand(`pgrep -u ${this.user} java`, 3000);
+      return result.stdout.trim().length > 0;
+    } catch {
+      // pgrep returns exit code 1 when no processes found
+      return false;
+    }
+  }
+
+  /**
+   * Get list of Java process PIDs for the configured user
+   */
+  async getJavaProcessPids(): Promise<number[]> {
+    try {
+      const result = await this.execCommand(`pgrep -u ${this.user} java`, 3000);
+      return result.stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(pid => parseInt(pid, 10));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Ensure NO Java processes are running before starting Payara.
+   * Returns true if safe to start, throws if processes couldn't be killed.
+   */
+  async ensureNoJavaRunning(killIfRunning = true): Promise<boolean> {
+    const pids = await this.getJavaProcessPids();
+
+    if (pids.length === 0) {
+      this.logger.debug('No Java processes running - safe to start');
+      return true;
+    }
+
+    if (!killIfRunning) {
+      throw new Error(`Java processes already running: ${pids.join(', ')}. Cannot start Payara safely.`);
+    }
+
+    this.logger.warn({ pids }, 'Found existing Java processes, killing them');
+    await this.killAllJavaProcesses();
+
+    return true;
+  }
+
+  /**
+   * Aggressive stop: stop domain + kill all Java processes + verify
+   *
+   * Use this instead of stop() when you need to guarantee no Java processes remain.
+   */
+  async aggressiveStop(): Promise<void> {
+    this.logger.info({ domain: this.domain }, 'Aggressive stop: stopping domain and killing all Java');
+
+    // Step 1: Try graceful stop
+    if (await this.isRunning()) {
+      try {
+        await this.asadminCommand(['stop-domain', this.domain], 30000);
+        await this.sleep(2000);
+      } catch (err) {
+        this.logger.warn({ err }, 'Error during graceful stop (continuing with kill)');
+      }
+    }
+
+    // Step 2: Kill all remaining Java processes
+    await this.killAllJavaProcesses();
+
+    // Step 3: Verify
+    const hasProcesses = await this.hasJavaProcesses();
+    if (hasProcesses) {
+      throw new Error('Failed to stop all Java processes');
+    }
+
+    this.logger.info({ domain: this.domain }, 'Aggressive stop completed - no Java processes running');
+  }
+
+  /**
+   * Safe start: ensures no Java processes are running before starting Payara.
+   *
+   * This is the recommended way to start Payara in aggressive mode.
+   */
+  async safeStart(): Promise<void> {
+    this.logger.info({ domain: this.domain }, 'Safe start: verifying clean state before starting');
+
+    // Ensure no Java processes running
+    await this.ensureNoJavaRunning(true);
+
+    // Write environment to setenv.conf
+    await this.writeSetenvConf();
+
+    // Start domain
+    this.logger.info({ domain: this.domain }, 'Starting Payara domain (aggressive mode)');
+    await this.asadminCommand(['start-domain', this.domain]);
+
+    // Wait for domain to be ready
+    await this.waitForHealthy(60000);
+
+    this.logger.info({ domain: this.domain }, 'Payara domain started successfully');
+  }
+
+  /**
+   * Full restart with aggressive cleanup:
+   * 1. Stop domain gracefully
+   * 2. Kill ALL Java processes
+   * 3. Verify no Java running
+   * 4. Start fresh
+   */
+  async aggressiveRestart(): Promise<void> {
+    this.logger.info({ domain: this.domain }, 'Aggressive restart: full stop → kill → start cycle');
+
+    await this.aggressiveStop();
+    await this.safeStart();
+
+    this.logger.info({ domain: this.domain }, 'Aggressive restart completed');
   }
 }

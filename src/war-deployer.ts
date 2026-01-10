@@ -1,13 +1,13 @@
 // Path: src/war-deployer.ts
 // WAR file deployer with diff-based updates - uses asadmin deploy commands only
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { readFile, writeFile, mkdir, rm, stat, readdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import AdmZip from 'adm-zip';
 import type { Logger } from 'pino';
 import type { PayaraManager } from './payara-manager.js';
-import type { WarDeployerOptions, WarFileHashes, FileChange, DeployResult } from './types.js';
+import type { WarDeployerOptions, WarFileHashes, FileChange, DeployResult, FullDeployResult } from './types.js';
 
 /**
  * WAR file deployer with diff-based updates
@@ -27,6 +27,7 @@ export class WarDeployer {
   private readonly contextRoot?: string;
   private readonly payara: PayaraManager;
   private readonly logger: Logger;
+  private readonly aggressiveMode: boolean;
 
   // Lock to prevent concurrent deployments
   private deployLock = false;
@@ -37,6 +38,7 @@ export class WarDeployer {
     this.contextRoot = options.contextRoot;
     this.payara = options.payara;
     this.logger = options.logger;
+    this.aggressiveMode = options.aggressiveMode ?? false;
   }
 
   /**
@@ -99,7 +101,7 @@ export class WarDeployer {
     }
 
     this.deployLock = true;
-    const tempDir = `/tmp/war-deploy-${Date.now()}`;
+    const tempDir = `/tmp/war-deploy-${Date.now()}-${randomBytes(4).toString('hex')}`;
     const startTime = Date.now();
 
     try {
@@ -202,7 +204,7 @@ export class WarDeployer {
     changedFiles: FileChange[],
     deletedFiles: string[]
   ): Promise<void> {
-    const tempDir = `/tmp/war-update-${Date.now()}`;
+    const tempDir = `/tmp/war-update-${Date.now()}-${randomBytes(4).toString('hex')}`;
 
     try {
       this.logger.debug({
@@ -359,6 +361,162 @@ export class WarDeployer {
    */
   async undeploy(): Promise<void> {
     await this.payara.undeploy(this.appName);
+  }
+
+  // ============================================================================
+  // FULL DEPLOYMENT WITH RESTART (Aggressive Mode)
+  // User-requested flow: undeploy → stop → kill → start → deploy
+  // ============================================================================
+
+  /**
+   * Full deployment with complete Payara restart (aggressive mode).
+   *
+   * This method follows the exact sequence requested:
+   * 1. Apply changes to WAR file (while Payara still running)
+   * 2. Undeploy current application
+   * 3. Stop Payara domain gracefully
+   * 4. Kill ALL Java processes (aggressive cleanup)
+   * 5. Start Payara fresh
+   * 6. Deploy WAR file
+   *
+   * This ensures:
+   * - Only ONE Java process runs at a time
+   * - Clean deployment without conflicts
+   * - No orphan processes
+   *
+   * @param changedFiles - Files to add/update in WAR
+   * @param deletedFiles - Files to remove from WAR
+   * @returns Full deployment result with timing details
+   */
+  async deployWithFullRestart(
+    changedFiles: FileChange[],
+    deletedFiles: string[]
+  ): Promise<FullDeployResult> {
+    if (this.deployLock) {
+      throw new Error('Deployment already in progress');
+    }
+
+    this.deployLock = true;
+    const startTime = Date.now();
+    const timings: FullDeployResult['timings'] = {};
+
+    try {
+      this.logger.info({
+        changed: changedFiles.length,
+        deleted: deletedFiles.length,
+        aggressiveMode: true,
+      }, 'Starting full deployment with restart');
+
+      // ======================================================================
+      // STEP 1: Apply changes to WAR file (while Payara still running)
+      // ======================================================================
+      const warUpdateStart = Date.now();
+      await this.applyChangesWithoutDeploy(changedFiles, deletedFiles);
+      timings.warUpdate = Date.now() - warUpdateStart;
+      this.logger.info({ duration: timings.warUpdate }, 'WAR file updated');
+
+      // ======================================================================
+      // STEP 2: Undeploy current application (if deployed)
+      // ======================================================================
+      const undeployStart = Date.now();
+      try {
+        const isDeployed = await this.isAppDeployed();
+        if (isDeployed) {
+          await this.payara.undeploy(this.appName);
+          this.logger.info({ appName: this.appName }, 'Application undeployed');
+        } else {
+          this.logger.debug({ appName: this.appName }, 'Application not deployed, skipping undeploy');
+        }
+      } catch (err) {
+        this.logger.warn({ err }, 'Undeploy failed (continuing with restart)');
+      }
+      timings.undeploy = Date.now() - undeployStart;
+
+      // ======================================================================
+      // STEP 3 & 4: Stop Payara + Kill ALL Java (aggressive cleanup)
+      // ======================================================================
+      const stopStart = Date.now();
+      await this.payara.aggressiveStop();
+      timings.stop = Date.now() - stopStart;
+      this.logger.info({ duration: timings.stop }, 'Payara stopped and all Java processes killed');
+
+      // ======================================================================
+      // STEP 5: Start Payara fresh (verifies no Java running first)
+      // ======================================================================
+      const startPayaraStart = Date.now();
+      await this.payara.safeStart();
+      timings.start = Date.now() - startPayaraStart;
+      this.logger.info({ duration: timings.start }, 'Payara started fresh');
+
+      // ======================================================================
+      // STEP 6: Deploy WAR file
+      // ======================================================================
+      const deployStart = Date.now();
+      await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
+      timings.deploy = Date.now() - deployStart;
+
+      // Verify deployment
+      const applications = await this.payara.listApplications();
+      const isDeployed = applications.includes(this.appName);
+
+      if (!isDeployed) {
+        throw new Error(`Deployment verification failed: ${this.appName} not in application list`);
+      }
+
+      const totalDuration = Date.now() - startTime;
+
+      this.logger.info({
+        appName: this.appName,
+        deployed: true,
+        duration: totalDuration,
+        timings,
+      }, 'Full deployment with restart completed successfully');
+
+      return {
+        success: true,
+        filesChanged: changedFiles.length,
+        filesDeleted: deletedFiles.length,
+        message: 'Deployment with full restart completed successfully',
+        deploymentTime: totalDuration,
+        appName: this.appName,
+        deployed: true,
+        applications,
+        timings,
+        aggressiveMode: true,
+      };
+
+    } catch (err) {
+      const totalDuration = Date.now() - startTime;
+      this.logger.error({ err, duration: totalDuration, timings }, 'Full deployment failed');
+
+      return {
+        success: false,
+        filesChanged: changedFiles.length,
+        filesDeleted: deletedFiles.length,
+        message: err instanceof Error ? err.message : String(err),
+        deploymentTime: totalDuration,
+        appName: this.appName,
+        deployed: false,
+        timings,
+        aggressiveMode: true,
+      };
+
+    } finally {
+      this.deployLock = false;
+    }
+  }
+
+  /**
+   * Apply changes and deploy - uses aggressive mode if configured
+   */
+  async applyChangesAuto(
+    changedFiles: FileChange[],
+    deletedFiles: string[]
+  ): Promise<DeployResult | FullDeployResult> {
+    if (this.aggressiveMode) {
+      return this.deployWithFullRestart(changedFiles, deletedFiles);
+    }
+    return this.applyChanges(changedFiles, deletedFiles);
   }
 
   /**

@@ -63,6 +63,45 @@ export interface PayaraPluginConfig {
   verbose?: boolean;
 
   /**
+   * Validate asadmin binary exists on startup.
+   * Default: true (validates unless NODE_ENV=test)
+   * Set to false to skip validation (useful for testing or deferred setup)
+   */
+  validateAsadmin?: boolean;
+
+  /**
+   * Enable aggressive mode for stable deployments.
+   *
+   * When true, the plugin will:
+   * 1. Kill ALL Java processes before starting Payara (ensures clean slate)
+   * 2. Use full restart sequence for deployments: undeploy → stop → kill → start → deploy
+   * 3. Verify no Java processes running before each start
+   *
+   * This prevents:
+   * - Port conflicts from orphan Java processes
+   * - Memory issues from accumulated JVMs
+   * - Deployment failures from stale state
+   *
+   * Recommended: true for production
+   * Default: false (backwards compatibility)
+   */
+  aggressiveMode?: boolean;
+
+  /**
+   * Whether the plugin should manage Payara lifecycle (start/stop/restart).
+   *
+   * When true (default): Plugin handles starting/stopping Payara
+   * When false: Plugin only handles WAR deployment, health checks, and secrets
+   *
+   * Set to false when using agent exec mode to start Payara, e.g.:
+   *   zn-vault-agent start --exec "asadmin start-domain domain1"
+   *
+   * In this case, the agent's exec mode manages Payara lifecycle,
+   * and the plugin should not interfere.
+   */
+  manageLifecycle?: boolean;
+
+  /**
    * Secrets to inject as environment variables when starting Payara.
    * Keys are env var names, values are vault references:
    * - "alias:path/to/secret" - fetch secret by alias
@@ -104,6 +143,15 @@ export interface WarDeployerOptions {
   contextRoot?: string;
   payara: PayaraManager;
   logger: Logger;
+  /**
+   * Enable aggressive mode for deployments.
+   * When true, deployments will use the full restart sequence:
+   * undeploy → stop → kill all Java → start → deploy
+   *
+   * This ensures only ONE Java process runs at a time.
+   * Recommended for production stability.
+   */
+  aggressiveMode?: boolean;
 }
 
 /**
@@ -159,6 +207,27 @@ export interface DeployResult {
   deployed?: boolean;
   /** List of all deployed applications */
   applications?: string[];
+}
+
+/**
+ * Full deployment result with timing breakdown (aggressive mode)
+ */
+export interface FullDeployResult extends DeployResult {
+  /** Whether aggressive mode was used */
+  aggressiveMode: true;
+  /** Timing breakdown for each phase */
+  timings: {
+    /** Time to update WAR file (ms) */
+    warUpdate?: number;
+    /** Time to undeploy app (ms) */
+    undeploy?: number;
+    /** Time to stop Payara + kill Java (ms) */
+    stop?: number;
+    /** Time to start Payara (ms) */
+    start?: number;
+    /** Time to deploy WAR (ms) */
+    deploy?: number;
+  };
 }
 
 /**
