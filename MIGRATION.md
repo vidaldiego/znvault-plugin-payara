@@ -121,7 +121,7 @@ Create `/etc/systemd/system/zn-vault-agent.service`:
 
 ```ini
 [Unit]
-Description=ZN-Vault Agent with Payara Plugin
+Description=ZnVault Agent with Payara Plugin
 After=network.target
 
 [Service]
@@ -310,5 +310,5 @@ Ensure the agent has permission to:
 ## Support
 
 For issues or questions:
-- GitHub Issues: https://github.com/zincware/znvault-plugin-payara/issues
+- GitHub Issues: https://github.com/vidaldiego/znvault-plugin-payara/issues
 - Documentation: https://docs.zincapp.dev/vault/plugins/payara

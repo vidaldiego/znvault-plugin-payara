@@ -1,6 +1,6 @@
 # @zincapp/znvault-plugin-payara
 
-Payara application server management plugin for ZN-Vault Agent and CLI. Enables incremental WAR deployment with diff-based file transfer.
+Payara application server management plugin for ZnVault Agent and CLI. Enables incremental WAR deployment with diff-based file transfer.
 
 ## Features
 

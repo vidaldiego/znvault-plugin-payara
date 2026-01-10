@@ -86,17 +86,35 @@ function extractSecretValue(
 
 /**
  * Write API key to a file (for file-based API key mode)
+ * File is owned by root but readable by the payara group
  */
 async function writeApiKeyToFile(
   filePath: string,
   apiKey: string,
-  logger: Logger
+  logger: Logger,
+  payaraUser?: string
 ): Promise<void> {
   try {
-    // Ensure directory exists
-    await mkdir(dirname(filePath), { recursive: true, mode: 0o700 });
-    // Write key with restrictive permissions
-    await writeFile(filePath, apiKey, { mode: 0o600 });
+    // Ensure directory exists with group-accessible permissions
+    await mkdir(dirname(filePath), { recursive: true, mode: 0o750 });
+    // Write key with group-readable permissions (root:payara 640)
+    await writeFile(filePath, apiKey, { mode: 0o640 });
+
+    // Change ownership so payara group can read the file
+    if (process.getuid?.() === 0 && payaraUser) {
+      const { exec } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const execAsync = promisify(exec);
+      try {
+        // Set group ownership to payara user's group
+        await execAsync(`chown root:${payaraUser} "${dirname(filePath)}"`);
+        await execAsync(`chown root:${payaraUser} "${filePath}"`);
+        logger.debug({ path: filePath, group: payaraUser }, 'Set file group ownership');
+      } catch (chownErr) {
+        logger.warn({ path: filePath, err: chownErr }, 'Failed to chown API key file');
+      }
+    }
+
     logger.info({ path: filePath }, 'API key written to file');
   } catch (err) {
     logger.error({ path: filePath, err }, 'Failed to write API key to file');
@@ -113,7 +131,8 @@ async function fetchSecrets(
   ctx: PluginContext,
   secretsConfig: Record<string, string>,
   logger: Logger,
-  apiKeyFilePath?: string
+  apiKeyFilePath?: string,
+  payaraUser?: string
 ): Promise<Record<string, string>> {
   const env: Record<string, string> = {};
 
@@ -140,7 +159,7 @@ async function fetchSecrets(
 
           // If file-based API key is enabled, write to file instead of env var
           if (apiKeyFilePath) {
-            await writeApiKeyToFile(apiKeyFilePath, value, logger);
+            await writeApiKeyToFile(apiKeyFilePath, value, logger, payaraUser);
             // Don't add to env - Payara reads from the file via ZINC_CONFIG_VAULT_API_KEY_FILE
             logger.debug({ envVar, filePath: apiKeyFilePath }, 'API key written to file instead of env var');
             continue; // Skip adding to env
@@ -195,7 +214,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.3.0',
+    version: '1.3.1',
     description: 'Payara application server management with WAR diff deployment and secret injection',
 
     async onInit(ctx: PluginContext): Promise<void> {
@@ -231,7 +250,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
           count: Object.keys(config.secrets).length,
           apiKeyFilePath: config.apiKeyFilePath,
         }, 'Fetching secrets for Payara environment');
-        secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath);
+        secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath, config.user);
         pluginLogger.info({ count: Object.keys(secretsEnv).length }, 'Secrets loaded successfully');
       }
 
@@ -265,7 +284,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       // Refresh secrets before starting (in case they changed)
       if (config.secrets && Object.keys(config.secrets).length > 0) {
         pluginLogger.debug('Refreshing secrets before Payara start');
-        secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath);
+        secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath, config.user);
         payara.setEnvironment(secretsEnv);
       }
 
@@ -320,7 +339,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       // Refresh secrets to update the API key file
       // When apiKeyFilePath is set, the key is written to file and the app
       // reads it on each request - no restart needed
-      secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath);
+      secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user);
       payara.setEnvironment(secretsEnv);
 
       if (config.apiKeyFilePath) {
@@ -365,7 +384,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
       // Refresh secrets to pick up new values
       if (config.secrets && Object.keys(config.secrets).length > 0) {
-        secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath);
+        secretsEnv = await fetchSecrets(ctx, config.secrets, pluginLogger, config.apiKeyFilePath, config.user);
         payara.setEnvironment(secretsEnv);
       }
 
