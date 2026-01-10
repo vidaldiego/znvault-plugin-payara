@@ -89,6 +89,38 @@ const ANSI = {
 };
 
 /**
+ * Direct HTTP client for agent communication
+ * Uses raw fetch() instead of ctx.client to avoid vault authentication interference
+ */
+async function agentGet<T>(url: string): Promise<T> {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { 'Accept': 'application/json' },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Agent request failed: ${response.status} ${text}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+async function agentPost<T>(url: string, body: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Agent request failed: ${response.status} ${text}`);
+  }
+  return response.json() as Promise<T>;
+}
+
+/**
  * Format file size to human readable
  */
 function formatSize(bytes: number): string {
@@ -423,7 +455,7 @@ async function deployChunked(
       }
 
       // Send chunk
-      const response = await ctx.client.post<ChunkedDeployResponse>(
+      const response = await agentPost<ChunkedDeployResponse>(
         `${pluginUrl}/deploy/chunk`,
         chunkRequest
       );
@@ -475,7 +507,7 @@ async function deployToHost(
       const MAX_HASH_RETRIES = 2;
       for (let attempt = 1; attempt <= MAX_HASH_RETRIES; attempt++) {
         try {
-          const response = await ctx.client.get<{ hashes: WarFileHashes; status?: string }>(
+          const response = await agentGet<{ hashes: WarFileHashes; status?: string }>(
             `${pluginUrl}/hashes`
           );
           remoteHashes = response.hashes ?? {};
@@ -542,7 +574,7 @@ async function deployToHost(
     progress.deploying();
 
     // Deploy
-    const deployResponse = await ctx.client.post<{
+    const deployResponse = await agentPost<{
       status: string;
       filesChanged: number;
       filesDeleted: number;
@@ -589,7 +621,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.0',
+    version: '1.7.1',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
@@ -1059,7 +1091,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             let remoteIsEmpty = false;
             if (!options.force) {
               try {
-                const response = await ctx.client.get<{ hashes: WarFileHashes }>(
+                const response = await agentGet<{ hashes: WarFileHashes }>(
                   `${pluginUrl}/hashes`
                 );
                 remoteHashes = response.hashes ?? {};
@@ -1165,7 +1197,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
                 const baseUrl = host.startsWith('http') ? host : `http://${host}`;
                 const pluginUrl = `${baseUrl}:${config.port}/plugins/payara`;
                 try {
-                  await ctx.client.post(`${pluginUrl}/restart`, {});
+                  await agentPost(`${pluginUrl}/restart`, {});
                   console.log(`  ${ANSI.green}✓${ANSI.reset} ${host} restarted`);
                 } catch (err) {
                   console.log(`  ${ANSI.red}✗${ANSI.reset} ${host}: ${err instanceof Error ? err.message : String(err)}`);
@@ -1179,7 +1211,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
 
               ctx.output.info('Restarting Payara...');
-              await ctx.client.post(`${pluginUrl}/restart`, {});
+              await agentPost(`${pluginUrl}/restart`, {});
               ctx.output.success('Payara restarted');
             }
           } catch (err) {
@@ -1214,7 +1246,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
                 const baseUrl = host.startsWith('http') ? host : `http://${host}`;
                 const pluginUrl = `${baseUrl}:${config.port}/plugins/payara`;
                 try {
-                  const status = await ctx.client.get<{
+                  const status = await agentGet<{
                     healthy: boolean;
                     running: boolean;
                     domain: string;
@@ -1237,7 +1269,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
               const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
 
-              const status = await ctx.client.get<{
+              const status = await agentGet<{
                 healthy: boolean;
                 running: boolean;
                 domain: string;
@@ -1279,7 +1311,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
             const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
 
-            const response = await ctx.client.get<{ applications: string[] }>(
+            const response = await agentGet<{ applications: string[] }>(
               `${pluginUrl}/applications`
             );
 
