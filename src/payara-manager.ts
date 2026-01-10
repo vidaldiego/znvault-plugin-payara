@@ -62,24 +62,23 @@ export class PayaraManager {
   }
 
   /**
-   * Build environment string for command execution
-   * Returns "VAR1=value1 VAR2=value2 " prefix for the command
+   * Build environment string for command execution.
+   *
+   * SECURITY: This method ONLY includes non-sensitive env vars (JAVA_HOME).
+   * Secrets are written to setenv.conf file which Payara reads on JVM startup.
+   * This prevents secrets from appearing in `ps aux`, logs, and error messages.
    */
   private buildEnvPrefix(): string {
-    const envVars: string[] = [];
-
-    // Add JAVA_HOME
     const javaHome = process.env.JAVA_HOME ?? '/usr/lib/jvm/java-21-openjdk-amd64';
-    envVars.push(`JAVA_HOME="${javaHome}"`);
+    return `JAVA_HOME="${javaHome}" `;
+  }
 
-    // Add custom environment variables (secrets)
-    for (const [key, value] of Object.entries(this.environment)) {
-      // Escape single quotes in value
-      const escapedValue = value.replace(/'/g, "'\\''");
-      envVars.push(`${key}='${escapedValue}'`);
-    }
-
-    return envVars.length > 0 ? envVars.join(' ') + ' ' : '';
+  /**
+   * Sanitize a string for logging by redacting potential secret values.
+   * Redacts any quoted string longer than 8 characters.
+   */
+  private sanitizeForLogging(str: string): string {
+    return str.replace(/('|")[^'"]{8,}('|")/g, '"[REDACTED]"');
   }
 
   /**
@@ -107,10 +106,10 @@ export class PayaraManager {
       return result;
     } catch (err) {
       const error = err as Error & { stdout?: string; stderr?: string; code?: number };
+      // SECURITY: Don't log stdout/stderr as they may contain secrets
+      // Use sanitizeForLogging to redact potential secrets in command
       this.logger.error({
-        command: command,
-        stdout: error.stdout,
-        stderr: error.stderr,
+        command: this.sanitizeForLogging(command),
         code: error.code,
       }, 'Command failed');
       throw err;
@@ -279,7 +278,9 @@ export class PayaraManager {
   }
 
   /**
-   * Deploy a WAR file to Payara
+   * Deploy a WAR file to Payara.
+   *
+   * Handles "virtual server already has web module" errors by undeploying first.
    */
   async deploy(warPath: string, appName: string, contextRoot?: string): Promise<void> {
     this.logger.info({ warPath, appName, contextRoot }, 'Deploying application');
@@ -294,15 +295,46 @@ export class PayaraManager {
       }
     }
 
+    // Check if app is already deployed - undeploy first for clean state
+    // This prevents "virtual server already has web module" errors
+    const apps = await this.listApplications();
+    if (apps.includes(appName)) {
+      this.logger.info({ appName }, 'App already deployed, undeploying first');
+      try {
+        await this.undeploy(appName);
+      } catch (err) {
+        this.logger.warn({ err, appName }, 'Undeploy failed, continuing with force deploy');
+      }
+    }
+
     const args = ['deploy', '--force=true', `--name=${appName}`];
     if (contextRoot) {
       args.push(`--contextroot=${contextRoot}`);
     }
     args.push(warPath);
 
-    await this.asadminCommand(args);
-
-    this.logger.info({ appName }, 'Application deployed');
+    try {
+      await this.asadminCommand(args);
+      this.logger.info({ appName }, 'Application deployed');
+    } catch (err) {
+      const error = err as Error & { stderr?: string };
+      // Check for "already has web module" error
+      if (error.stderr?.includes('already has a web module') ||
+          error.message?.includes('already has a web module')) {
+        // Last resort: aggressive undeploy with cascade
+        this.logger.warn({ appName }, 'Deploy conflict detected, trying aggressive undeploy');
+        try {
+          await this.asadminCommand(['undeploy', '--cascade=true', appName], 30000);
+        } catch {
+          // Ignore undeploy errors
+        }
+        // Retry deploy
+        await this.asadminCommand(args);
+        this.logger.info({ appName }, 'Application deployed after aggressive cleanup');
+      } else {
+        throw err;
+      }
+    }
   }
 
   /**

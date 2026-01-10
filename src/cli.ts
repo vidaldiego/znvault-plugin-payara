@@ -172,6 +172,24 @@ class ProgressReporter {
     }
   }
 
+  uploadBytesProgress(uploaded: number, total: number): void {
+    if (this.isPlain) {
+      const pct = Math.round((uploaded / total) * 100);
+      console.log(`  Uploaded ${formatSize(uploaded)}/${formatSize(total)} (${pct}%)`);
+    } else {
+      const pct = Math.round((uploaded / total) * 100);
+      // Use carriage return to overwrite the line
+      process.stdout.write(`\r  ${ANSI.yellow}⬆${ANSI.reset} Uploading: ${formatSize(uploaded)}/${formatSize(total)} (${pct}%)    `);
+    }
+  }
+
+  uploadComplete(): void {
+    if (!this.isPlain) {
+      // Move to next line after progress
+      process.stdout.write('\n');
+    }
+  }
+
   uploadProgress(sent: number, total: number, currentFiles?: string[]): void {
     if (this.isPlain) {
       console.log(`  Sent ${sent}/${total} files`);
@@ -277,7 +295,7 @@ async function saveDeployConfigs(store: DeployConfigStore): Promise<void> {
 }
 
 /**
- * Upload full WAR file to server
+ * Upload full WAR file to server with progress tracking
  */
 async function uploadFullWar(
   ctx: CLIPluginContext,
@@ -290,16 +308,24 @@ async function uploadFullWar(
 
     // Read WAR file
     const warBuffer = await readFile(warPath);
+    const totalSize = warBuffer.length;
+
+    // Report initial progress
+    progress.uploadBytesProgress(0, totalSize);
 
     // Upload using raw POST
     const response = await fetch(`${pluginUrl}/deploy/upload`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/octet-stream',
-        'Content-Length': warBuffer.length.toString(),
+        'Content-Length': totalSize.toString(),
       },
       body: warBuffer,
     });
+
+    // Report completion
+    progress.uploadBytesProgress(totalSize, totalSize);
+    progress.uploadComplete();
 
     const data = await response.json() as {
       status?: string;
@@ -441,20 +467,29 @@ async function deployToHost(
     const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
     const pluginUrl = `${fullUrl}:${port}/plugins/payara`;
 
-    // Get remote hashes
+    // Get remote hashes with retry logic
     let remoteHashes: WarFileHashes = {};
     let remoteIsEmpty = false;
 
     if (!force) {
-      try {
-        const response = await ctx.client.get<{ hashes: WarFileHashes }>(
-          `${pluginUrl}/hashes`
-        );
-        remoteHashes = response.hashes;
-        remoteIsEmpty = Object.keys(remoteHashes).length === 0;
-      } catch {
-        // Could not get hashes - assume empty/needs full upload
-        remoteIsEmpty = true;
+      const MAX_HASH_RETRIES = 2;
+      for (let attempt = 1; attempt <= MAX_HASH_RETRIES; attempt++) {
+        try {
+          const response = await ctx.client.get<{ hashes: WarFileHashes; status?: string }>(
+            `${pluginUrl}/hashes`
+          );
+          remoteHashes = response.hashes ?? {};
+          remoteIsEmpty = Object.keys(remoteHashes).length === 0;
+          break; // Success - exit retry loop
+        } catch (err) {
+          if (attempt < MAX_HASH_RETRIES) {
+            // Wait before retry
+            await new Promise(r => setTimeout(r, 1000));
+            continue;
+          }
+          // All retries failed - assume empty/needs full upload
+          remoteIsEmpty = true;
+        }
       }
     } else {
       // Force mode - treat as if remote is empty to do full upload
@@ -554,7 +589,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.6.1',
+    version: '1.7.0',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {

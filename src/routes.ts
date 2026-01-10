@@ -62,16 +62,36 @@ export async function registerRoutes(
    * GET /hashes
    * Returns SHA-256 hashes of all files in the current WAR
    * Used by CLI to calculate diff for incremental deployment
+   *
+   * Response includes status field for better error handling:
+   * - status: 'ok' - WAR exists, hashes returned
+   * - status: 'no_war' - No WAR file deployed yet
+   * - status: 'error' - Failed to read hashes
    */
   fastify.get('/hashes', async (request, reply) => {
     try {
+      // Check if WAR exists first
+      if (!(await deployer.warExists())) {
+        return {
+          hashes: {},
+          status: 'no_war',
+          message: 'No WAR file deployed yet',
+        };
+      }
+
       const hashes = await deployer.getCurrentHashes();
-      return { hashes };
+
+      return {
+        hashes,
+        status: 'ok',
+        fileCount: Object.keys(hashes).length,
+      };
     } catch (err) {
       logger.error({ err }, 'Failed to get WAR hashes');
       return reply.code(500).send({
         error: 'Failed to get WAR hashes',
         message: err instanceof Error ? err.message : String(err),
+        status: 'error',
       });
     }
   });
