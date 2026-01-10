@@ -4,6 +4,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import { Command } from 'commander';
 import { createPayaraCLIPlugin } from '../src/cli.js';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+// Read version from package.json dynamically
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf-8')) as { version: string };
+const EXPECTED_VERSION = pkg.version;
 
 // Mock CLI context
 const mockContext = {
@@ -28,7 +36,7 @@ describe('createPayaraCLIPlugin', () => {
     const plugin = createPayaraCLIPlugin();
 
     expect(plugin.name).toBe('payara');
-    expect(plugin.version).toBe('1.1.0');
+    expect(plugin.version).toBe(EXPECTED_VERSION);
     expect(plugin.description).toContain('Payara');
   });
 
