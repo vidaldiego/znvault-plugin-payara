@@ -140,6 +140,64 @@ export interface DeployResponse {
 }
 
 /**
+ * Chunked deploy session - tracks state across multiple chunk uploads
+ */
+export interface ChunkedDeploySession {
+  /** Session ID */
+  id: string;
+  /** Timestamp when session was created */
+  createdAt: number;
+  /** Files accumulated so far */
+  files: Array<{ path: string; content: string }>;
+  /** Deletions to apply */
+  deletions: string[];
+  /** Expected total files (for progress) */
+  expectedFiles?: number;
+}
+
+/**
+ * Chunked deploy request - upload a batch of files
+ */
+export interface ChunkedDeployRequest {
+  /** Session ID (optional for first chunk - server generates one) */
+  sessionId?: string;
+  /** Files in this chunk */
+  files: Array<{ path: string; content: string }>;
+  /** Deletions (only needed in first chunk) */
+  deletions?: string[];
+  /** Expected total file count (for progress tracking) */
+  expectedFiles?: number;
+  /** If true, this is the last chunk - commit the deployment */
+  commit?: boolean;
+}
+
+/**
+ * Chunked deploy response
+ */
+export interface ChunkedDeployResponse {
+  /** Session ID for subsequent chunks */
+  sessionId: string;
+  /** Files received so far */
+  filesReceived: number;
+  /** Whether deployment was committed */
+  committed: boolean;
+  /** Deployment result (only if committed) */
+  result?: {
+    filesChanged: number;
+    filesDeleted: number;
+    message: string;
+  };
+}
+
+/**
+ * WAR upload request (multipart form data parsed)
+ */
+export interface WarUploadRequest {
+  /** The WAR file buffer */
+  warFile: Buffer;
+}
+
+/**
  * Payara status response
  */
 export interface PayaraStatus {

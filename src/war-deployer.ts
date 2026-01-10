@@ -223,6 +223,7 @@ export class WarDeployer {
 
   /**
    * Deploy WAR to Payara (full deployment)
+   * Uses hot deployment (--force) if Payara is running
    */
   async deploy(): Promise<void> {
     if (!(await this.warExists())) {
@@ -232,23 +233,16 @@ export class WarDeployer {
 
     this.logger.info({ warPath: this.warPath, appName: this.appName }, 'Deploying WAR');
 
-    // Check if Payara is running
-    const wasRunning = await this.payara.isRunning();
+    // Ensure Payara is running (hot deployment requires running domain)
+    const isRunning = await this.payara.isRunning();
 
-    if (wasRunning) {
-      // Stop Payara for deployment
-      await this.payara.stop();
+    if (!isRunning) {
+      this.logger.info('Starting Payara for deployment');
+      await this.payara.start();
     }
 
-    try {
-      // Deploy WAR
-      await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
-    } finally {
-      if (wasRunning) {
-        // Start Payara back up
-        await this.payara.start();
-      }
-    }
+    // Deploy WAR with --force flag (hot deployment/redeploy)
+    await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
 
     this.logger.info({ appName: this.appName }, 'WAR deployed successfully');
   }
@@ -269,6 +263,13 @@ export class WarDeployer {
    */
   isDeploying(): boolean {
     return this.deployLock;
+  }
+
+  /**
+   * Get the WAR file path
+   */
+  getWarPath(): string {
+    return this.warPath;
   }
 
   /**

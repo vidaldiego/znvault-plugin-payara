@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-payara",
-  "version": "1.3.2",
+  "version": "1.4.1",
   "description": "Payara application server plugin for zn-vault-agent with WAR diff deployment",
   "type": "module",
   "main": "dist/index.js",

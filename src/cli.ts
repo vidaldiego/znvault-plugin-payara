@@ -3,12 +3,18 @@
 
 import type { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { stat, readFile, writeFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { stat, readFile, writeFile, mkdir, open } from 'node:fs/promises';
+import { existsSync, createReadStream } from 'node:fs';
 import { join, dirname, resolve } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import AdmZip from 'adm-zip';
-import type { WarFileHashes } from './types.js';
+import type { WarFileHashes, ChunkedDeployResponse } from './types.js';
+
+/**
+ * Chunk size for batched deployments (number of files per chunk)
+ * Keeping chunks small to avoid body size limits
+ */
+const CHUNK_SIZE = 50;
 
 /**
  * CLI Plugin context interface
@@ -91,6 +97,122 @@ async function saveDeployConfigs(store: DeployConfigStore): Promise<void> {
 }
 
 /**
+ * Upload full WAR file to server
+ */
+async function uploadFullWar(
+  ctx: CLIPluginContext,
+  pluginUrl: string,
+  warPath: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    // Read WAR file
+    const warBuffer = await readFile(warPath);
+
+    // Upload using raw POST
+    // Note: ctx.client might not support raw binary upload, so we use fetch directly
+    const response = await fetch(`${pluginUrl}/deploy/upload`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': warBuffer.length.toString(),
+      },
+      body: warBuffer,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ message: response.statusText }));
+      return { success: false, error: (error as { message?: string }).message ?? 'Upload failed' };
+    }
+
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * Deploy files using chunked upload
+ */
+async function deployChunked(
+  ctx: CLIPluginContext,
+  pluginUrl: string,
+  zip: AdmZip,
+  changed: string[],
+  deleted: string[],
+  onProgress?: (sent: number, total: number) => void
+): Promise<{ success: boolean; error?: string; filesChanged?: number; filesDeleted?: number }> {
+  try {
+    let sessionId: string | undefined;
+    const totalFiles = changed.length;
+
+    // Send files in chunks
+    for (let i = 0; i < changed.length; i += CHUNK_SIZE) {
+      const chunkPaths = changed.slice(i, i + CHUNK_SIZE);
+      const isLastChunk = i + CHUNK_SIZE >= changed.length;
+
+      // Prepare chunk files
+      const files = chunkPaths.map(path => {
+        const entry = zip.getEntry(path);
+        if (!entry) {
+          throw new Error(`Entry not found in WAR: ${path}`);
+        }
+        return {
+          path,
+          content: entry.getData().toString('base64'),
+        };
+      });
+
+      // Build chunk request
+      const chunkRequest: {
+        sessionId?: string;
+        files: Array<{ path: string; content: string }>;
+        deletions?: string[];
+        expectedFiles?: number;
+        commit?: boolean;
+      } = {
+        files,
+        commit: isLastChunk,
+      };
+
+      if (sessionId) {
+        chunkRequest.sessionId = sessionId;
+      } else {
+        // First chunk - include deletions and expected file count
+        chunkRequest.deletions = deleted;
+        chunkRequest.expectedFiles = totalFiles;
+      }
+
+      // Send chunk
+      const response = await ctx.client.post<ChunkedDeployResponse>(
+        `${pluginUrl}/deploy/chunk`,
+        chunkRequest
+      );
+
+      sessionId = response.sessionId;
+
+      // Report progress
+      if (onProgress) {
+        onProgress(response.filesReceived, totalFiles);
+      }
+
+      // Check if committed (final chunk)
+      if (response.committed && response.result) {
+        return {
+          success: true,
+          filesChanged: response.result.filesChanged,
+          filesDeleted: response.result.filesDeleted,
+        };
+      }
+    }
+
+    // Should not reach here if commit was sent
+    return { success: false, error: 'Chunked deployment did not complete' };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
  * Deploy to a single host
  */
 async function deployToHost(
@@ -99,25 +221,47 @@ async function deployToHost(
   port: number,
   warPath: string,
   localHashes: WarFileHashes,
-  force: boolean
+  force: boolean,
+  onProgress?: (message: string) => void
 ): Promise<{ success: boolean; error?: string; filesChanged?: number; filesDeleted?: number }> {
   try {
     const baseUrl = host.replace(/\/$/, '');
-    // Add protocol if missing
-    const fullUrl = baseUrl.startsWith('http') ? baseUrl : `https://${baseUrl}`;
+    // Add protocol if missing (default to HTTP for local agent communication)
+    const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
     const pluginUrl = `${fullUrl}:${port}/plugins/payara`;
 
     // Get remote hashes
     let remoteHashes: WarFileHashes = {};
+    let remoteIsEmpty = false;
+
     if (!force) {
       try {
         const response = await ctx.client.get<{ hashes: WarFileHashes }>(
           `${pluginUrl}/hashes`
         );
         remoteHashes = response.hashes;
+        remoteIsEmpty = Object.keys(remoteHashes).length === 0;
       } catch {
-        // Full deployment if can't get hashes
+        // Could not get hashes - assume empty/needs full upload
+        remoteIsEmpty = true;
       }
+    } else {
+      // Force mode - treat as if remote is empty to do full upload
+      remoteIsEmpty = true;
+    }
+
+    // If remote has no WAR, upload the full WAR file
+    if (remoteIsEmpty) {
+      if (onProgress) onProgress('Uploading full WAR file...');
+      const uploadResult = await uploadFullWar(ctx, pluginUrl, warPath);
+      if (uploadResult.success) {
+        return {
+          success: true,
+          filesChanged: Object.keys(localHashes).length,
+          filesDeleted: 0,
+        };
+      }
+      return uploadResult;
     }
 
     // Calculate diff
@@ -127,8 +271,17 @@ async function deployToHost(
       return { success: true, filesChanged: 0, filesDeleted: 0 };
     }
 
-    // Prepare files for upload
     const zip = new AdmZip(warPath);
+
+    // Use chunked deployment if there are many files
+    if (changed.length > CHUNK_SIZE) {
+      if (onProgress) onProgress(`Deploying ${changed.length} files in chunks...`);
+      return deployChunked(ctx, pluginUrl, zip, changed, deleted, (sent, total) => {
+        if (onProgress) onProgress(`Sent ${sent}/${total} files`);
+      });
+    }
+
+    // Small deployment - use single request
     const files = changed.map(path => {
       const entry = zip.getEntry(path);
       if (!entry) {
@@ -176,7 +329,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.1.0',
+    version: '1.4.0',
     description: 'Payara WAR deployment commands',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
@@ -255,7 +408,8 @@ export function createPayaraCLIPlugin(): CLIPlugin {
                 config.port,
                 warPath,
                 localHashes,
-                options.force ?? false
+                options.force ?? false,
+                (message) => ctx.output.info(`  ${host}: ${message}`)
               );
               results.push({
                 host,
@@ -767,28 +921,44 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             // Build target URL
             const target = options.target ?? ctx.getConfig().url;
             const baseUrl = target.replace(/\/$/, '');
-            const pluginUrl = `${baseUrl}:${options.port}/plugins/payara`;
+            const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
+            const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
 
-            // Get remote hashes
+            // Get remote hashes (for dry-run we need to fetch them separately)
             let remoteHashes: WarFileHashes = {};
+            let remoteIsEmpty = false;
             if (!options.force) {
               try {
                 const response = await ctx.client.get<{ hashes: WarFileHashes }>(
                   `${pluginUrl}/hashes`
                 );
-                remoteHashes = response.hashes;
-              } catch {
-                ctx.output.warn('Could not fetch remote hashes, doing full deployment');
+                remoteHashes = response.hashes ?? {};
+                remoteIsEmpty = Object.keys(remoteHashes).length === 0;
+              } catch (err) {
+                ctx.output.warn(`Could not fetch remote hashes: ${err instanceof Error ? err.message : String(err)}`);
+                ctx.output.warn('Will do full deployment');
+                remoteIsEmpty = true;
               }
+            } else {
+              remoteIsEmpty = true;
             }
 
             // Calculate diff
             const { changed, deleted } = calculateDiff(localHashes, remoteHashes);
 
-            ctx.output.info(`Diff: ${changed.length} changed, ${deleted.length} deleted`);
+            if (remoteIsEmpty) {
+              ctx.output.info('Remote has no WAR, will upload full WAR file');
+            } else {
+              ctx.output.info(`Diff: ${changed.length} changed, ${deleted.length} deleted`);
+            }
 
-            // Dry run - just show diff
+            // Dry run - just show what would be deployed
             if (options.dryRun) {
+              if (remoteIsEmpty) {
+                ctx.output.info(`Would upload full WAR (${fileCount} files)`);
+                return;
+              }
+
               if (changed.length > 0) {
                 ctx.output.info('\nFiles to update:');
                 for (const file of changed.slice(0, 20)) {
@@ -815,44 +985,23 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               return;
             }
 
-            // No changes
-            if (changed.length === 0 && deleted.length === 0) {
-              ctx.output.success('No changes to deploy');
-              return;
-            }
+            // Deploy using deployToHost (handles full upload, chunking, etc.)
+            const result = await deployToHost(
+              ctx,
+              target,
+              parseInt(options.port, 10),
+              warFile,
+              localHashes,
+              options.force ?? false,
+              (message) => ctx.output.info(message)
+            );
 
-            // Prepare files for upload
-            ctx.output.info('Preparing files for deployment...');
-            const zip = new AdmZip(warFile);
-            const files = changed.map(path => {
-              const entry = zip.getEntry(path);
-              if (!entry) {
-                throw new Error(`Entry not found in WAR: ${path}`);
-              }
-              return {
-                path,
-                content: entry.getData().toString('base64'),
-              };
-            });
-
-            // Deploy
-            ctx.output.info('Deploying changes...');
-            const deployResponse = await ctx.client.post<{
-              status: string;
-              filesChanged: number;
-              filesDeleted: number;
-              message?: string;
-            }>(`${pluginUrl}/deploy`, {
-              files,
-              deletions: deleted,
-            });
-
-            if (deployResponse.status === 'deployed') {
+            if (result.success) {
               ctx.output.success(
-                `Deployed: ${deployResponse.filesChanged} files changed, ${deployResponse.filesDeleted} deleted`
+                `Deployed: ${result.filesChanged} files changed, ${result.filesDeleted} deleted`
               );
             } else {
-              ctx.output.error(`Deployment failed: ${deployResponse.message}`);
+              ctx.output.error(`Deployment failed: ${result.error}`);
               process.exit(1);
             }
           } catch (err) {
