@@ -4,8 +4,7 @@
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
-import { writeFile, readFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
 import type { Logger } from 'pino';
 import type { PayaraManagerOptions, PayaraStatus } from './types.js';
 

@@ -1,11 +1,11 @@
 // Path: test/integration/deploy-config.test.ts
 // Integration tests for deployment configuration commands
 
-import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import { spawn, ChildProcess, execSync } from 'node:child_process';
-import { writeFile, readFile, mkdir, rm, access } from 'node:fs/promises';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { spawn, ChildProcess } from 'node:child_process';
+import { writeFile, readFile, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import AdmZip from 'adm-zip';
 
 // Test configuration
@@ -16,9 +16,11 @@ const TEST_WAR_PATH = join(TEST_CONFIG_DIR, 'TestApp.war');
 const ZNVAULT_CONFIG_DIR = join(TEST_CONFIG_DIR, '.znvault');
 const DEPLOY_CONFIGS_PATH = join(ZNVAULT_CONFIG_DIR, 'deploy-configs.json');
 
-// Mock agent server for testing HTTP endpoints
-let mockServer: ChildProcess | null = null;
-const MOCK_SERVER_PORT = 19100;
+// Mock agent server for testing HTTP endpoints (reserved for future use)
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _mockServer: ChildProcess | null = null;
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+const _MOCK_SERVER_PORT = 19100;
 
 /**
  * Create a test WAR file
@@ -32,9 +34,10 @@ async function createTestWar(warPath: string, files: Record<string, string>): Pr
 }
 
 /**
- * Run CLI command and return output
+ * Run CLI command and return output (reserved for future CLI integration tests)
  */
-async function runCLI(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+async function _runCLI(args: string[]): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve) => {
     const fullArgs = [...args];
     const proc = spawn('node', [

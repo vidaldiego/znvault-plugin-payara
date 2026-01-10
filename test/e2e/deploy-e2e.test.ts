@@ -2,7 +2,7 @@
 // End-to-end tests for deployment using real agent with Payara plugin
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -335,9 +335,9 @@ describe('Deploy E2E Tests', () => {
         return;
       }
 
-      // Get current hashes first
+      // Get current hashes first (verify endpoint works)
       const hashResponse = await fetch(`${AGENT_URL}/plugins/payara/hashes`);
-      const { hashes: currentHashes } = await hashResponse.json();
+      await hashResponse.json(); // Just verify the response is valid JSON
 
       // Prepare a small update (just metadata to avoid actual restart)
       const response = await fetch(`${AGENT_URL}/plugins/payara/deploy`, {

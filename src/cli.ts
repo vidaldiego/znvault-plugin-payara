@@ -3,9 +3,9 @@
 
 import type { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { stat, readFile, writeFile, mkdir, open } from 'node:fs/promises';
-import { existsSync, createReadStream } from 'node:fs';
-import { join, dirname, resolve } from 'node:path';
+import { stat, readFile, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import AdmZip from 'adm-zip';
 import type { WarFileHashes, ChunkedDeployResponse } from './types.js';
@@ -329,7 +329,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.4.2',
+    version: '1.4.3',
     description: 'Payara WAR deployment commands',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {

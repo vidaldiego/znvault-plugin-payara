@@ -218,7 +218,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.4.2',
+    version: '1.4.3',
     description: 'Payara application server management with WAR diff deployment and secret injection',
 
     async onInit(ctx: PluginContext): Promise<void> {

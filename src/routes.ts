@@ -1,12 +1,12 @@
 // Path: src/routes.ts
 // HTTP routes for Payara plugin
 
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 import type { Logger } from 'pino';
 import type { PayaraManager } from './payara-manager.js';
 import type { WarDeployer } from './war-deployer.js';
 import type { DeployRequest, ChunkedDeployRequest, ChunkedDeploySession, ChunkedDeployResponse } from './types.js';
-import { writeFile, mkdir, rm } from 'node:fs/promises';
+import { writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
