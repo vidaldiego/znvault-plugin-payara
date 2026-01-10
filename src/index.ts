@@ -94,11 +94,15 @@ async function writeApiKeyToFile(
   logger: Logger,
   payaraUser?: string
 ): Promise<void> {
+  const { chmod } = await import('node:fs/promises');
+
   try {
     // Ensure directory exists with group-accessible permissions
     await mkdir(dirname(filePath), { recursive: true, mode: 0o750 });
-    // Write key with group-readable permissions (root:payara 640)
-    await writeFile(filePath, apiKey, { mode: 0o640 });
+    // Write key
+    await writeFile(filePath, apiKey);
+    // Explicitly set permissions (writeFile mode option is affected by umask)
+    await chmod(filePath, 0o640);
 
     // Change ownership so payara group can read the file
     if (process.getuid?.() === 0 && payaraUser) {
@@ -214,7 +218,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.3.1',
+    version: '1.3.2',
     description: 'Payara application server management with WAR diff deployment and secret injection',
 
     async onInit(ctx: PluginContext): Promise<void> {
