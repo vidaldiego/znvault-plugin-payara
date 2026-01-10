@@ -51,8 +51,36 @@ Add the plugin to your agent's `config.json`:
 | `user` | string | Yes | System user to run asadmin commands as |
 | `warPath` | string | Yes | Path to the WAR file |
 | `appName` | string | Yes | Application name in Payara |
+| `contextRoot` | string | No | Context root for deployment (default: `/${appName}`) |
 | `healthEndpoint` | string | No | HTTP endpoint to check application health |
 | `restartOnCertChange` | boolean | No | Restart Payara when certificates are deployed |
+| `restartOnKeyRotation` | boolean | No | Restart Payara when API key is rotated (default: false) |
+| `aggressiveMode` | boolean | No | Full restart cycle on deploy (undeploy→stop→kill→start→deploy) |
+| `apiKeyFilePath` | string | No | Path to write API key file (enables zero-downtime key rotation) |
+| `secrets` | object | No | Environment variables to write to `setenv.conf` |
+| `watchSecrets` | string[] | No | Secret aliases to watch for changes |
+
+### Secrets Configuration
+
+Secrets are written to Payara's `setenv.conf` file, NOT passed via command line (security improvement in v1.7.0):
+
+```json
+{
+  "secrets": {
+    "ZINC_CONFIG_USE_VAULT": "literal:true",
+    "ZINC_CONFIG_APPLICATION_FILE": "literal:api/staging/config",
+    "ZINC_CONFIG_VAULT_API_KEY": "api-key:my-managed-key",
+    "AWS_ACCESS_KEY_ID": "alias:api/staging/s3.accessKeyId",
+    "AWS_SECRET_ACCESS_KEY": "alias:api/staging/s3.secretAccessKey"
+  },
+  "watchSecrets": ["api/staging/config", "api/staging/s3"]
+}
+```
+
+Secret value prefixes:
+- `literal:` - Static value
+- `alias:` - Vault secret alias (with optional path)
+- `api-key:` - Managed API key value
 
 ## HTTP API
 
@@ -151,7 +179,43 @@ curl http://localhost:9100/plugins/payara/file/WEB-INF/web.xml
 
 The plugin adds commands to `znvault`:
 
-### Deploy WAR with diff
+### Multi-Host Deployment Configs
+
+Create and manage deployment configurations for multiple hosts:
+
+```bash
+# Create a new deployment config
+znvault deploy config create staging \
+  --war /path/to/app.war \
+  --host 172.16.220.55 \
+  --host 172.16.220.56 \
+  --host 172.16.220.57 \
+  --parallel
+
+# Deploy to all hosts in config (diff transfer)
+znvault deploy to staging
+
+# Or use 'run' alias
+znvault deploy run staging
+
+# Force full deployment
+znvault deploy to staging --force
+
+# Dry run
+znvault deploy to staging --dry-run
+
+# Sequential deployment (one host at a time)
+znvault deploy to staging --sequential
+
+# Manage configs
+znvault deploy config list
+znvault deploy config show staging
+znvault deploy config add-host staging 172.16.220.58
+znvault deploy config set staging war /new/path.war
+znvault deploy config delete staging
+```
+
+### Single-Host Deployment
 
 ```bash
 # Deploy changed files only
@@ -164,29 +228,31 @@ znvault deploy war ./target/MyApp.war --target server.example.com --force
 znvault deploy war ./target/MyApp.war --target server.example.com --dry-run
 ```
 
-### Restart Payara
+### Server Management
 
 ```bash
+# Restart Payara
 znvault deploy restart --target server.example.com
-```
+znvault deploy restart staging  # All hosts in config
 
-### Check Status
-
-```bash
+# Check status
 znvault deploy status --target server.example.com
-```
+znvault deploy status staging  # All hosts in config
 
-### List Applications
-
-```bash
+# List applications
 znvault deploy applications --target server.example.com
-# or
 znvault deploy apps --target server.example.com
 ```
 
-## CLI Configuration
+## CLI Installation
 
-Add the plugin to your CLI config (`~/.znvault/config.json`):
+Install the plugin in the CLI plugins directory:
+
+```bash
+znvault plugin install @zincapp/znvault-plugin-payara
+```
+
+Or add to your CLI config (`~/.znvault/config.json`):
 
 ```json
 {
@@ -310,6 +376,30 @@ npm run lint
 ## Migration from Python zinc_updater
 
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
+
+## Changelog
+
+### v1.7.2
+- Fix: Add 60s timeout for agent HTTP requests (fixes diff deployment with large WARs)
+
+### v1.7.1
+- Fix: Use direct fetch for agent communication instead of vault client
+
+### v1.7.0
+- **SECURITY**: Secrets no longer passed via command line (visible in `ps aux`/logs)
+- Secrets now written only to `setenv.conf` file
+- Added undeploy-before-deploy to prevent "virtual server already has web module" errors
+- Added upload progress indicator for full WAR uploads
+- Added retry logic for hash endpoint
+- Improved `/hashes` endpoint response with status field
+
+### v1.6.1
+- Skip Payara restart on agent restart if already healthy (zero-downtime updates)
+
+### v1.6.0
+- Added `aggressiveMode` for full restart cycle on deploy
+- Added `apiKeyFilePath` for file-based API key rotation
+- Zero-downtime key rotation support
 
 ## License
 
