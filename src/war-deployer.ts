@@ -8,6 +8,8 @@ import AdmZip from 'adm-zip';
 import type { Logger } from 'pino';
 import type { PayaraManager } from './payara-manager.js';
 import type { WarDeployerOptions, WarFileHashes, FileChange, DeployResult, FullDeployResult } from './types.js';
+import { DeploymentLock } from './deployment-lock.js';
+import { DeploymentJournal } from './deployment-journal.js';
 
 /**
  * WAR file deployer with diff-based updates
@@ -29,8 +31,14 @@ export class WarDeployer {
   private readonly logger: Logger;
   private readonly aggressiveMode: boolean;
 
-  // Lock to prevent concurrent deployments
+  // Lock to prevent concurrent deployments (in-memory)
   private deployLock = false;
+
+  // File-based deployment lock for SIGTERM deferral
+  private readonly fileLock: DeploymentLock;
+
+  // Deployment journal for crash recovery
+  private readonly journal: DeploymentJournal;
 
   constructor(options: WarDeployerOptions) {
     this.warPath = options.warPath;
@@ -39,6 +47,45 @@ export class WarDeployer {
     this.payara = options.payara;
     this.logger = options.logger;
     this.aggressiveMode = options.aggressiveMode ?? false;
+
+    // Initialize file-based lock and journal
+    this.fileLock = new DeploymentLock(options.logger);
+    this.journal = new DeploymentJournal(options.logger);
+  }
+
+  /**
+   * Check for incomplete deployment from a previous run.
+   * Call this during plugin initialization.
+   */
+  async checkIncompleteDeployment(): Promise<void> {
+    const incomplete = await this.journal.getIncomplete();
+    if (incomplete) {
+      this.logger.warn(
+        { checkpoint: incomplete },
+        this.journal.getDiagnostics(incomplete)
+      );
+
+      // For now, just log and clear - future enhancement: auto-resume
+      if (!this.journal.canResume(incomplete)) {
+        this.logger.warn('Cannot auto-resume - deployment may need manual intervention');
+      }
+      await this.journal.clear();
+    }
+
+    // Also check for stale lock files
+    const { locked, data, stale } = await this.fileLock.isLocked();
+    if (stale && data) {
+      this.logger.warn(
+        { oldDeploymentId: data.deploymentId, step: data.step },
+        'Found stale deployment lock - cleaning up'
+      );
+      await this.fileLock.forceRemove();
+    } else if (locked && data) {
+      this.logger.warn(
+        { deploymentId: data.deploymentId, step: data.step },
+        'Another deployment is in progress'
+      );
+    }
   }
 
   /**
@@ -375,7 +422,7 @@ export class WarDeployer {
    * 1. Apply changes to WAR file (while Payara still running)
    * 2. Undeploy current application
    * 3. Stop Payara domain gracefully
-   * 4. Kill ALL Java processes (aggressive cleanup)
+   * 4. Kill Payara Java processes (filtered by cmdline)
    * 5. Start Payara fresh
    * 6. Deploy WAR file
    *
@@ -383,6 +430,8 @@ export class WarDeployer {
    * - Only ONE Java process runs at a time
    * - Clean deployment without conflicts
    * - No orphan processes
+   * - SIGTERM is deferred during deployment
+   * - Deployment progress is journaled for crash recovery
    *
    * @param changedFiles - Files to add/update in WAR
    * @param deletedFiles - Files to remove from WAR
@@ -396,12 +445,36 @@ export class WarDeployer {
       throw new Error('Deployment already in progress');
     }
 
+    // Check for file-based lock (another process)
+    const { locked, data } = await this.fileLock.isLocked();
+    if (locked && data) {
+      throw new Error(
+        `Another deployment is in progress: ${data.deploymentId} ` +
+        `(started ${Math.round((Date.now() - data.started) / 1000)}s ago, step: ${data.step})`
+      );
+    }
+
     this.deployLock = true;
     const startTime = Date.now();
+    const deploymentId = `deploy-${Date.now()}-${randomBytes(4).toString('hex')}`;
     const timings: FullDeployResult['timings'] = {};
 
     try {
+      // Acquire file-based lock (defers SIGTERM)
+      await this.fileLock.acquire(deploymentId);
+
+      // Start deployment journal
+      await this.journal.start({
+        deploymentId,
+        warPath: this.warPath,
+        appName: this.appName,
+        contextRoot: this.contextRoot,
+        changedFiles: changedFiles.map(f => f.path),
+        deletedFiles,
+      });
+
       this.logger.info({
+        deploymentId,
         changed: changedFiles.length,
         deleted: deletedFiles.length,
         aggressiveMode: true,
@@ -410,6 +483,9 @@ export class WarDeployer {
       // ======================================================================
       // STEP 1: Apply changes to WAR file (while Payara still running)
       // ======================================================================
+      await this.fileLock.updateStep('war-update');
+      await this.journal.updateStep('war-update');
+
       const warUpdateStart = Date.now();
       await this.applyChangesWithoutDeploy(changedFiles, deletedFiles);
       timings.warUpdate = Date.now() - warUpdateStart;
@@ -418,6 +494,9 @@ export class WarDeployer {
       // ======================================================================
       // STEP 2: Undeploy current application (if deployed)
       // ======================================================================
+      await this.fileLock.updateStep('undeploy');
+      await this.journal.updateStep('undeploy');
+
       const undeployStart = Date.now();
       try {
         const isDeployed = await this.isAppDeployed();
@@ -433,16 +512,29 @@ export class WarDeployer {
       timings.undeploy = Date.now() - undeployStart;
 
       // ======================================================================
-      // STEP 3 & 4: Stop Payara + Kill ALL Java (aggressive cleanup)
+      // STEP 3: Stop Payara domain gracefully
       // ======================================================================
+      await this.fileLock.updateStep('stop');
+      await this.journal.updateStep('stop');
+
       const stopStart = Date.now();
+
+      // ======================================================================
+      // STEP 4: Kill Payara Java processes (filtered by cmdline)
+      // ======================================================================
+      await this.fileLock.updateStep('kill');
+      await this.journal.updateStep('kill');
+
       await this.payara.aggressiveStop();
       timings.stop = Date.now() - stopStart;
-      this.logger.info({ duration: timings.stop }, 'Payara stopped and all Java processes killed');
+      this.logger.info({ duration: timings.stop }, 'Payara stopped and Payara Java processes killed');
 
       // ======================================================================
       // STEP 5: Start Payara fresh (verifies no Java running first)
       // ======================================================================
+      await this.fileLock.updateStep('start');
+      await this.journal.updateStep('start');
+
       const startPayaraStart = Date.now();
       await this.payara.safeStart();
       timings.start = Date.now() - startPayaraStart;
@@ -451,11 +543,19 @@ export class WarDeployer {
       // ======================================================================
       // STEP 6: Deploy WAR file
       // ======================================================================
+      await this.fileLock.updateStep('deploy');
+      await this.journal.updateStep('deploy');
+
       const deployStart = Date.now();
       await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
       timings.deploy = Date.now() - deployStart;
 
-      // Verify deployment
+      // ======================================================================
+      // STEP 7: Verify deployment
+      // ======================================================================
+      await this.fileLock.updateStep('verify');
+      await this.journal.updateStep('verify');
+
       const applications = await this.payara.listApplications();
       const isDeployed = applications.includes(this.appName);
 
@@ -465,7 +565,11 @@ export class WarDeployer {
 
       const totalDuration = Date.now() - startTime;
 
+      // Mark as complete
+      await this.journal.complete();
+
       this.logger.info({
+        deploymentId,
         appName: this.appName,
         deployed: true,
         duration: totalDuration,
@@ -487,7 +591,9 @@ export class WarDeployer {
 
     } catch (err) {
       const totalDuration = Date.now() - startTime;
-      this.logger.error({ err, duration: totalDuration, timings }, 'Full deployment failed');
+      this.logger.error({ err, deploymentId, duration: totalDuration, timings }, 'Full deployment failed');
+
+      // Don't clear journal on failure - useful for debugging
 
       return {
         success: false,
@@ -503,6 +609,8 @@ export class WarDeployer {
 
     } finally {
       this.deployLock = false;
+      // Release file-based lock (may trigger deferred SIGTERM)
+      await this.fileLock.release();
     }
   }
 

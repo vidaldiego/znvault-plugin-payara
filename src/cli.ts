@@ -126,6 +126,31 @@ async function agentPost<T>(url: string, body: unknown): Promise<T> {
 }
 
 /**
+ * Build plugin URL from host and port, handling cases where:
+ * 1. Host already includes protocol and port (e.g., http://host:9100)
+ * 2. Host includes protocol but no port (e.g., http://host)
+ * 3. Host is just hostname/IP (e.g., 172.16.220.55)
+ */
+function buildPluginUrl(host: string, defaultPort: number): string {
+  const trimmed = host.replace(/\/$/, '');
+
+  // Parse the URL to check for existing port
+  try {
+    // Add protocol if missing for URL parsing
+    const urlString = trimmed.startsWith('http') ? trimmed : `http://${trimmed}`;
+    const url = new URL(urlString);
+
+    // If URL has a port explicitly set, use it; otherwise use defaultPort
+    const effectivePort = url.port || String(defaultPort);
+    return `${url.protocol}//${url.hostname}:${effectivePort}/plugins/payara`;
+  } catch {
+    // Fallback for invalid URLs - just append port
+    const withProtocol = trimmed.startsWith('http') ? trimmed : `http://${trimmed}`;
+    return `${withProtocol}:${defaultPort}/plugins/payara`;
+  }
+}
+
+/**
  * Format file size to human readable
  */
 function formatSize(bytes: number): string {
@@ -499,10 +524,7 @@ async function deployToHost(
   progress: ProgressReporter
 ): Promise<{ success: boolean; error?: string; result?: DeployResult }> {
   try {
-    const baseUrl = host.replace(/\/$/, '');
-    // Add protocol if missing (default to HTTP for local agent communication)
-    const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
-    const pluginUrl = `${fullUrl}:${port}/plugins/payara`;
+    const pluginUrl = buildPluginUrl(host, port);
 
     // Get remote hashes with retry logic
     let remoteHashes: WarFileHashes = {};
@@ -626,7 +648,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.3',
+    version: '1.7.4',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
@@ -1087,9 +1109,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
 
             // Build target URL
             const target = options.target ?? ctx.getConfig().url;
-            const baseUrl = target.replace(/\/$/, '');
-            const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
-            const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
+            const pluginUrl = buildPluginUrl(target, parseInt(options.port, 10));
 
             // Get remote hashes (for dry-run we need to fetch them separately)
             let remoteHashes: WarFileHashes = {};
@@ -1199,8 +1219,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               ctx.output.info(`Restarting Payara on ${config.hosts.length} host(s)...`);
 
               for (const host of config.hosts) {
-                const baseUrl = host.startsWith('http') ? host : `http://${host}`;
-                const pluginUrl = `${baseUrl}:${config.port}/plugins/payara`;
+                const pluginUrl = buildPluginUrl(host, config.port);
                 try {
                   await agentPost(`${pluginUrl}/restart`, {});
                   console.log(`  ${ANSI.green}✓${ANSI.reset} ${host} restarted`);
@@ -1211,9 +1230,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             } else {
               // Single host restart
               const target = options.target ?? ctx.getConfig().url;
-              const baseUrl = target.replace(/\/$/, '');
-              const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
-              const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
+              const pluginUrl = buildPluginUrl(target, parseInt(options.port, 10));
 
               ctx.output.info('Restarting Payara...');
               await agentPost(`${pluginUrl}/restart`, {});
@@ -1248,8 +1265,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               console.log(`\n${ANSI.bold}Status for ${configName}:${ANSI.reset}\n`);
 
               for (const host of config.hosts) {
-                const baseUrl = host.startsWith('http') ? host : `http://${host}`;
-                const pluginUrl = `${baseUrl}:${config.port}/plugins/payara`;
+                const pluginUrl = buildPluginUrl(host, config.port);
                 try {
                   const status = await agentGet<{
                     healthy: boolean;
@@ -1270,9 +1286,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             } else {
               // Single host status
               const target = options.target ?? ctx.getConfig().url;
-              const baseUrl = target.replace(/\/$/, '');
-              const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
-              const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
+              const pluginUrl = buildPluginUrl(target, parseInt(options.port, 10));
 
               const status = await agentGet<{
                 healthy: boolean;
@@ -1312,9 +1326,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
         .action(async (options: { target?: string; port: string }) => {
           try {
             const target = options.target ?? ctx.getConfig().url;
-            const baseUrl = target.replace(/\/$/, '');
-            const fullUrl = baseUrl.startsWith('http') ? baseUrl : `http://${baseUrl}`;
-            const pluginUrl = `${fullUrl}:${options.port}/plugins/payara`;
+            const pluginUrl = buildPluginUrl(target, parseInt(options.port, 10));
 
             const response = await agentGet<{ applications: string[] }>(
               `${pluginUrl}/applications`

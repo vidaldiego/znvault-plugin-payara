@@ -70,6 +70,15 @@ export interface PayaraPluginConfig {
   validateAsadmin?: boolean;
 
   /**
+   * Path to asadmin password file for Payara 7+ authentication.
+   * Required when domain was created with a master password.
+   * File should contain: AS_ADMIN_PASSWORD=<password>
+   *
+   * Example: "/opt/payara/glassfish/domains/zincapi/config/admin-keyfile"
+   */
+  passwordFile?: string;
+
+  /**
    * Enable aggressive mode for stable deployments.
    *
    * When true, the plugin will:
@@ -132,6 +141,8 @@ export interface PayaraManagerOptions {
   logger: Logger;
   /** Environment variables to pass to Payara processes */
   environment?: Record<string, string>;
+  /** Path to asadmin password file for Payara 7+ authentication */
+  passwordFile?: string;
 }
 
 /**

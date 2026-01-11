@@ -268,6 +268,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         operationTimeout: config.operationTimeout,
         logger: pluginLogger,
         environment: secretsEnv,
+        passwordFile: config.passwordFile,
       });
 
       // Validate asadmin binary exists (early failure detection)

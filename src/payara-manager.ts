@@ -23,6 +23,7 @@ export class PayaraManager {
   private readonly operationTimeout: number;
   private readonly logger: Logger;
   private environment: Record<string, string>;
+  private readonly passwordFile?: string;
 
   constructor(options: PayaraManagerOptions) {
     this.payaraHome = options.payaraHome;
@@ -33,6 +34,7 @@ export class PayaraManager {
     this.operationTimeout = options.operationTimeout ?? 120000;
     this.logger = options.logger;
     this.environment = options.environment ?? {};
+    this.passwordFile = options.passwordFile;
 
     // Path to asadmin command
     this.asadmin = join(this.payaraHome, 'bin', 'asadmin');
@@ -128,10 +130,15 @@ export class PayaraManager {
   }
 
   /**
-   * Run asadmin command
+   * Run asadmin command with optional authentication for Payara 7+
    */
   private async asadminCommand(args: string[], timeout?: number): Promise<string> {
-    const command = `${this.asadmin} ${args.join(' ')}`;
+    // Build auth arguments if password file is configured
+    const authArgs = this.passwordFile
+      ? ['--user', 'admin', '--passwordfile', this.passwordFile]
+      : [];
+
+    const command = `${this.asadmin} ${[...authArgs, ...args].join(' ')}`;
     const result = await this.execCommand(command, timeout);
     return result.stdout;
   }
@@ -436,13 +443,95 @@ export class PayaraManager {
   // ============================================================================
 
   /**
+   * Kill Payara-related Java processes only.
+   * Filters by cmdline containing 'payara', 'glassfish', or the domain name.
+   *
+   * This is safer than killAllJavaProcesses() as it won't kill unrelated Java apps.
+   */
+  async killPayaraProcesses(): Promise<void> {
+    this.logger.warn({ user: this.user, domain: this.domain }, 'Killing Payara Java processes');
+
+    // Get PIDs matching Payara cmdline patterns
+    const pids = await this.getPayaraProcessPids();
+
+    if (pids.length === 0) {
+      this.logger.debug('No Payara Java processes found');
+      return;
+    }
+
+    this.logger.info({ pids }, 'Found Payara processes to kill');
+
+    // First try graceful SIGTERM
+    await this.execCommand(`kill -TERM ${pids.join(' ')} || true`, 5000);
+    await this.sleep(2000);
+
+    // Check if any Payara processes remain
+    const remaining = await this.getPayaraProcessPids();
+    if (remaining.length > 0) {
+      // Force kill with SIGKILL
+      this.logger.warn({ pids: remaining }, 'Payara processes still running, using SIGKILL');
+      await this.execCommand(`kill -9 ${remaining.join(' ')} || true`, 5000);
+      await this.sleep(2000);
+    }
+
+    // Verify all Payara processes are dead
+    const finalCheck = await this.getPayaraProcessPids();
+    if (finalCheck.length > 0) {
+      this.logger.error({ pids: finalCheck }, 'Failed to kill Payara processes');
+      throw new Error(`Failed to kill Payara processes: PIDs ${finalCheck.join(', ')} still running`);
+    }
+
+    this.logger.info('Payara processes killed');
+  }
+
+  /**
+   * Get PIDs of Payara-related Java processes.
+   * Matches processes with cmdline containing payara, glassfish, or the domain name.
+   */
+  async getPayaraProcessPids(): Promise<number[]> {
+    // Patterns to match in Java process cmdline
+    const patterns = ['payara', 'glassfish', this.domain];
+    const patternRegex = patterns.join('|');
+
+    // Find Java PIDs for user that match our patterns
+    // This uses pgrep -f to match against full cmdline
+    const cmd = `pgrep -u ${this.user} -f "(${patternRegex})" 2>/dev/null | ` +
+                `xargs -r ps -p --no-headers -o pid,cmd 2>/dev/null | ` +
+                `grep -i java | awk '{print $1}'`;
+
+    try {
+      const { stdout } = await this.execCommand(cmd, 5000);
+      return stdout
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map(pid => parseInt(pid, 10))
+        .filter(pid => !isNaN(pid));
+    } catch {
+      // Command may fail if no processes found
+      return [];
+    }
+  }
+
+  /**
+   * Check if any Payara-related Java processes are running
+   */
+  async hasPayaraProcesses(): Promise<boolean> {
+    const pids = await this.getPayaraProcessPids();
+    return pids.length > 0;
+  }
+
+  /**
    * Kill ALL Java processes for the configured user.
-   * This is the "aggressive mode" that ensures a clean slate.
+   * This is the legacy "aggressive mode" that ensures a clean slate.
    *
    * WARNING: This kills ALL Java processes for the user, not just Payara.
+   * Prefer killPayaraProcesses() unless you specifically need to kill all Java.
+   *
+   * @deprecated Use killPayaraProcesses() instead for targeted cleanup
    */
   async killAllJavaProcesses(): Promise<void> {
-    this.logger.warn({ user: this.user }, 'Killing ALL Java processes (aggressive mode)');
+    this.logger.warn({ user: this.user }, 'Killing ALL Java processes (legacy mode)');
 
     // First try graceful SIGTERM
     // Note: `|| true` ensures command succeeds even if no processes found
@@ -499,34 +588,34 @@ export class PayaraManager {
   }
 
   /**
-   * Ensure NO Java processes are running before starting Payara.
+   * Ensure NO Payara Java processes are running before starting.
    * Returns true if safe to start, throws if processes couldn't be killed.
    */
   async ensureNoJavaRunning(killIfRunning = true): Promise<boolean> {
-    const pids = await this.getJavaProcessPids();
+    const pids = await this.getPayaraProcessPids();
 
     if (pids.length === 0) {
-      this.logger.debug('No Java processes running - safe to start');
+      this.logger.debug('No Payara Java processes running - safe to start');
       return true;
     }
 
     if (!killIfRunning) {
-      throw new Error(`Java processes already running: ${pids.join(', ')}. Cannot start Payara safely.`);
+      throw new Error(`Payara Java processes already running: ${pids.join(', ')}. Cannot start safely.`);
     }
 
-    this.logger.warn({ pids }, 'Found existing Java processes, killing them');
-    await this.killAllJavaProcesses();
+    this.logger.warn({ pids }, 'Found existing Payara processes, killing them');
+    await this.killPayaraProcesses();
 
     return true;
   }
 
   /**
-   * Aggressive stop: stop domain + kill all Java processes + verify
+   * Aggressive stop: stop domain + kill Payara Java processes + verify
    *
-   * Use this instead of stop() when you need to guarantee no Java processes remain.
+   * Use this instead of stop() when you need to guarantee no Payara processes remain.
    */
   async aggressiveStop(): Promise<void> {
-    this.logger.info({ domain: this.domain }, 'Aggressive stop: stopping domain and killing all Java');
+    this.logger.info({ domain: this.domain }, 'Aggressive stop: stopping domain and killing Payara Java');
 
     // Step 1: Try graceful stop
     if (await this.isRunning()) {
@@ -538,16 +627,16 @@ export class PayaraManager {
       }
     }
 
-    // Step 2: Kill all remaining Java processes
-    await this.killAllJavaProcesses();
+    // Step 2: Kill all remaining Payara Java processes (filtered by cmdline)
+    await this.killPayaraProcesses();
 
     // Step 3: Verify
-    const hasProcesses = await this.hasJavaProcesses();
+    const hasProcesses = await this.hasPayaraProcesses();
     if (hasProcesses) {
-      throw new Error('Failed to stop all Java processes');
+      throw new Error('Failed to stop all Payara processes');
     }
 
-    this.logger.info({ domain: this.domain }, 'Aggressive stop completed - no Java processes running');
+    this.logger.info({ domain: this.domain }, 'Aggressive stop completed - no Payara processes running');
   }
 
   /**
