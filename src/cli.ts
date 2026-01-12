@@ -17,6 +17,12 @@ import type { WarFileHashes, ChunkedDeployResponse, DeployResult } from './types
 const CHUNK_SIZE = 50;
 
 /**
+ * Retry configuration for transient failures
+ */
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 2000;
+
+/**
  * CLI Plugin context interface
  * Matches the CLIPluginContext from znvault-cli
  */
@@ -317,6 +323,14 @@ class ProgressReporter {
     }
   }
 
+  retrying(attempt: number, maxAttempts: number, lastError?: string): void {
+    if (this.isPlain) {
+      console.log(`Retry ${attempt}/${maxAttempts}${lastError ? `: ${lastError}` : ''}`);
+    } else {
+      console.log(`  ${ANSI.yellow}↻ Retry ${attempt}/${maxAttempts}${lastError ? ` (${lastError})` : ''}${ANSI.reset}`);
+    }
+  }
+
   summary(successful: number, total: number, failed: number): void {
     console.log('');
     if (this.isPlain) {
@@ -531,8 +545,7 @@ async function deployToHost(
     let remoteIsEmpty = false;
 
     if (!force) {
-      const MAX_HASH_RETRIES = 2;
-      for (let attempt = 1; attempt <= MAX_HASH_RETRIES; attempt++) {
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
           const response = await agentGet<{ hashes: WarFileHashes; status?: string }>(
             `${pluginUrl}/hashes`
@@ -541,12 +554,12 @@ async function deployToHost(
           remoteIsEmpty = Object.keys(remoteHashes).length === 0;
           break; // Success - exit retry loop
         } catch (err) {
-          if (attempt < MAX_HASH_RETRIES) {
-            // Wait before retry
-            await new Promise(r => setTimeout(r, 1000));
+          if (attempt < MAX_RETRIES) {
+            // Wait before retry with exponential backoff
+            await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
             continue;
           }
-          // All retries failed - assume empty/needs full upload
+          // All retries failed - will need full upload
           remoteIsEmpty = true;
         }
       }
@@ -555,9 +568,22 @@ async function deployToHost(
       remoteIsEmpty = true;
     }
 
-    // If remote has no WAR, upload the full WAR file
+    // If remote has no WAR or hash fetch failed, upload the full WAR file with retries
     if (remoteIsEmpty) {
-      return uploadFullWar(ctx, pluginUrl, warPath, progress);
+      let lastError: string | undefined;
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        const result = await uploadFullWar(ctx, pluginUrl, warPath, progress);
+        if (result.success) {
+          return result;
+        }
+        lastError = result.error;
+        if (attempt < MAX_RETRIES) {
+          // Wait before retry
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+          progress.retrying(attempt, MAX_RETRIES, lastError);
+        }
+      }
+      return { success: false, error: `Failed after ${MAX_RETRIES} attempts: ${lastError}` };
     }
 
     // Calculate diff
@@ -600,38 +626,55 @@ async function deployToHost(
 
     progress.deploying();
 
-    // Deploy
-    const deployResponse = await agentPost<{
-      status: string;
-      filesChanged: number;
-      filesDeleted: number;
-      message?: string;
-      deploymentTime?: number;
-      deployed?: boolean;
-      applications?: string[];
-      appName?: string;
-    }>(`${pluginUrl}/deploy`, {
-      files,
-      deletions: deleted,
-    });
+    // Deploy with retry logic
+    let lastError: string | undefined;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const deployResponse = await agentPost<{
+          status: string;
+          filesChanged: number;
+          filesDeleted: number;
+          message?: string;
+          deploymentTime?: number;
+          deployed?: boolean;
+          applications?: string[];
+          appName?: string;
+        }>(`${pluginUrl}/deploy`, {
+          files,
+          deletions: deleted,
+        });
 
-    if (deployResponse.status === 'deployed') {
-      return {
-        success: true,
-        result: {
-          success: true,
-          filesChanged: deployResponse.filesChanged,
-          filesDeleted: deployResponse.filesDeleted,
-          message: deployResponse.message ?? 'Deployment successful',
-          deploymentTime: deployResponse.deploymentTime ?? 0,
-          appName: deployResponse.appName ?? '',
-          deployed: deployResponse.deployed,
-          applications: deployResponse.applications,
-        },
-      };
-    } else {
-      return { success: false, error: deployResponse.message };
+        if (deployResponse.status === 'deployed') {
+          return {
+            success: true,
+            result: {
+              success: true,
+              filesChanged: deployResponse.filesChanged,
+              filesDeleted: deployResponse.filesDeleted,
+              message: deployResponse.message ?? 'Deployment successful',
+              deploymentTime: deployResponse.deploymentTime ?? 0,
+              appName: deployResponse.appName ?? '',
+              deployed: deployResponse.deployed,
+              applications: deployResponse.applications,
+            },
+          };
+        } else {
+          lastError = deployResponse.message;
+          // Non-transient error (e.g., deployment conflict), don't retry
+          if (deployResponse.status === 'conflict') {
+            break;
+          }
+        }
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        if (attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+          progress.retrying(attempt, MAX_RETRIES, lastError);
+          continue;
+        }
+      }
     }
+    return { success: false, error: lastError ?? 'Deployment failed' };
   } catch (err) {
     return {
       success: false,
@@ -648,7 +691,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.4',
+    version: '1.7.6',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
