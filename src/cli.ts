@@ -4,11 +4,26 @@
 import type { Command } from 'commander';
 import { createHash } from 'node:crypto';
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { join, resolve, basename } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve, basename, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import AdmZip from 'adm-zip';
 import type { WarFileHashes, ChunkedDeployResponse, DeployResult } from './types.js';
+
+// Read version from package.json at module load time
+let pluginVersion = '0.0.0';
+try {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  // Navigate up from dist/ to find package.json
+  const pkgPath = join(__dirname, '..', 'package.json');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+  pluginVersion = pkg.version || '0.0.0';
+} catch {
+  // Fallback - this shouldn't happen in normal operation
+  pluginVersion = '0.0.0';
+}
 
 /**
  * Chunk size for batched deployments (number of files per chunk)
@@ -1125,7 +1140,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.10',
+    version: pluginVersion,
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
