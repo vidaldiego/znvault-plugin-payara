@@ -762,6 +762,24 @@ class ProgressReporter {
     }
   }
 
+  hashFetchFailed(reason: string, retriesUsed: number): void {
+    if (this.isPlain) {
+      console.log(`WARNING: Hash fetch failed after ${retriesUsed} retries: ${reason}`);
+      console.log('Falling back to full WAR upload');
+    } else {
+      console.log(`  ${ANSI.yellow}⚠ Hash fetch failed after ${retriesUsed} retries: ${reason}${ANSI.reset}`);
+      console.log(`  ${ANSI.yellow}  Falling back to full WAR upload${ANSI.reset}`);
+    }
+  }
+
+  remoteHasNoWar(): void {
+    if (this.isPlain) {
+      console.log('Remote has no WAR file (first deployment)');
+    } else {
+      console.log(`  ${ANSI.dim}Remote has no WAR file (first deployment)${ANSI.reset}`);
+    }
+  }
+
   failed(error: string): void {
     if (this.isPlain) {
       console.log(`Failed: ${error}`);
@@ -993,6 +1011,8 @@ async function deployToHost(
     let remoteIsEmpty = false;
 
     if (!force) {
+      let lastError = '';
+      let hashFetchSucceeded = false;
       for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try {
           const response = await agentGet<{ hashes: WarFileHashes; status?: string }>(
@@ -1000,14 +1020,22 @@ async function deployToHost(
           );
           remoteHashes = response.hashes ?? {};
           remoteIsEmpty = Object.keys(remoteHashes).length === 0;
+          hashFetchSucceeded = true;
+
+          // Log if remote has no WAR (first deployment)
+          if (remoteIsEmpty && response.status === 'no_war') {
+            progress.remoteHasNoWar();
+          }
           break; // Success - exit retry loop
         } catch (err) {
+          lastError = err instanceof Error ? err.message : String(err);
           if (attempt < MAX_RETRIES) {
             // Wait before retry with exponential backoff
             await new Promise(r => setTimeout(r, getRetryDelay(attempt)));
             continue;
           }
-          // All retries failed - will need full upload
+          // All retries failed - log WHY we're doing full upload
+          progress.hashFetchFailed(lastError, MAX_RETRIES);
           remoteIsEmpty = true;
         }
       }
