@@ -1125,7 +1125,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.9',
+    version: '1.7.10',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
