@@ -15,7 +15,7 @@ import { PayaraManager } from './payara-manager.js';
 import { WarDeployer } from './war-deployer.js';
 import { registerRoutes } from './routes.js';
 import type { PayaraPluginConfig } from './types.js';
-import { writeFile, mkdir } from 'fs/promises';
+import { writeFile, readFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
 
 // Re-export types from agent for consumers that don't have agent installed
@@ -85,8 +85,39 @@ function extractSecretValue(
 }
 
 /**
+ * Verify the API key file contains the expected key.
+ * Returns true if file exists and matches, false otherwise.
+ */
+async function verifyApiKeyFile(
+  filePath: string,
+  expectedKey: string,
+  logger: Logger
+): Promise<{ valid: boolean; fileKey?: string; error?: string }> {
+  try {
+    const fileContent = await readFile(filePath, 'utf-8');
+    const fileKey = fileContent.trim();
+
+    if (fileKey === expectedKey) {
+      return { valid: true, fileKey };
+    } else {
+      logger.error({
+        path: filePath,
+        expectedPrefix: expectedKey.substring(0, 20),
+        filePrefix: fileKey.substring(0, 20),
+      }, 'CRITICAL: API key file MISMATCH - file contains different key than agent');
+      return { valid: false, fileKey, error: 'Key mismatch' };
+    }
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logger.error({ path: filePath, err }, 'Failed to read API key file for verification');
+    return { valid: false, error };
+  }
+}
+
+/**
  * Write API key to a file (for file-based API key mode)
- * File is owned by root but readable by the payara group
+ * File is owned by root but readable by the payara group.
+ * CRITICAL: Includes read-back verification to ensure write succeeded.
  */
 async function writeApiKeyToFile(
   filePath: string,
@@ -119,7 +150,13 @@ async function writeApiKeyToFile(
       }
     }
 
-    logger.info({ path: filePath }, 'API key written to file');
+    // CRITICAL: Verify the write succeeded by reading back
+    const verification = await verifyApiKeyFile(filePath, apiKey, logger);
+    if (!verification.valid) {
+      throw new Error(`Write verification failed: ${verification.error}`);
+    }
+
+    logger.info({ path: filePath }, 'API key written and verified');
   } catch (err) {
     logger.error({ path: filePath, err }, 'Failed to write API key to file');
     throw new Error(`Failed to write API key to ${filePath}: ${err instanceof Error ? err.message : String(err)}`);
@@ -297,6 +334,35 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         aggressiveMode: config.aggressiveMode ?? false,
         manageLifecycle,
       }, 'Starting Payara plugin');
+
+      // CRITICAL: Verify and auto-fix API key file on startup
+      // This catches any desync that occurred while agent was down
+      if (config.apiKeyFilePath && ctx.config.auth?.apiKey) {
+        pluginLogger.info({ filePath: config.apiKeyFilePath }, 'Verifying API key file sync on startup');
+        const keyVerification = await verifyApiKeyFile(
+          config.apiKeyFilePath,
+          ctx.config.auth.apiKey,
+          pluginLogger
+        );
+
+        if (!keyVerification.valid) {
+          pluginLogger.warn({
+            filePath: config.apiKeyFilePath,
+            error: keyVerification.error,
+          }, 'API key file out of sync on startup - AUTO-FIXING NOW');
+
+          // Auto-fix: write the correct key
+          await writeApiKeyToFile(
+            config.apiKeyFilePath,
+            ctx.config.auth.apiKey,
+            pluginLogger,
+            config.user
+          );
+          pluginLogger.info({ filePath: config.apiKeyFilePath }, 'API key file auto-fixed on startup');
+        } else {
+          pluginLogger.info({ filePath: config.apiKeyFilePath }, 'API key file verified - in sync');
+        }
+      }
 
       // Warn about conflicting config options
       if (config.aggressiveMode && !manageLifecycle) {
@@ -496,16 +562,38 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       pluginLogger.info({ alias: event.alias }, 'Secrets refreshed (no restart - app reads from files dynamically)');
     },
 
-    async healthCheck(_ctx: PluginContext): Promise<PluginHealthStatus> {
+    async healthCheck(ctx: PluginContext): Promise<PluginHealthStatus> {
       try {
         const status = await payara.getStatus();
         const appDeployed = await deployer.isAppDeployed();
 
-        // Healthy = domain running + app deployed + health endpoint responding (if configured)
+        // CRITICAL: Verify API key file is in sync with agent's bound key
+        let keySyncValid = true;
+        let keySyncError: string | undefined;
+        if (config.apiKeyFilePath && ctx.config.auth?.apiKey) {
+          const keyVerification = await verifyApiKeyFile(
+            config.apiKeyFilePath,
+            ctx.config.auth.apiKey,
+            pluginLogger
+          );
+          keySyncValid = keyVerification.valid;
+          if (!keySyncValid) {
+            keySyncError = keyVerification.error || 'API key file mismatch';
+            pluginLogger.error({
+              filePath: config.apiKeyFilePath,
+              error: keySyncError,
+            }, 'CRITICAL: API key file out of sync - app authentication will fail');
+          }
+        }
+
+        // Healthy = domain running + app deployed + health endpoint responding + key in sync
         // Degraded = domain running but app not deployed or health check failing
-        // Unhealthy = domain not running
+        // Unhealthy = domain not running OR key out of sync (critical failure)
         let healthStatus: 'healthy' | 'degraded' | 'unhealthy';
-        if (status.running && appDeployed && status.healthy) {
+        if (!keySyncValid) {
+          // Key desync is CRITICAL - mark as unhealthy
+          healthStatus = 'unhealthy';
+        } else if (status.running && appDeployed && status.healthy) {
           healthStatus = 'healthy';
         } else if (status.running) {
           healthStatus = 'degraded';
@@ -516,11 +604,13 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         return {
           name: 'payara',
           status: healthStatus,
+          message: keySyncError ? `CRITICAL: ${keySyncError}` : undefined,
           details: {
             domain: config.domain,
             running: status.running,
             healthy: status.healthy,
             appDeployed,
+            keySyncValid,
             warPath: config.warPath,
             appName: config.appName,
           },
