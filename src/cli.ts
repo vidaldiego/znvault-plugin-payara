@@ -268,41 +268,65 @@ interface PreflightResult {
 
 /**
  * Check if a host is reachable and get basic info
+ * Uses same retry logic as deployment for consistency
  */
-async function checkHostReachable(host: string, port: number): Promise<PreflightResult> {
+async function checkHostReachable(
+  host: string,
+  port: number,
+  onRetry?: (attempt: number, delay: number, error: string) => void
+): Promise<PreflightResult> {
   const pluginUrl = buildPluginUrl(host, port);
   const healthUrl = pluginUrl.replace('/plugins/payara', '/health');
 
-  try {
-    const response = await fetch(healthUrl, {
-      signal: AbortSignal.timeout(5000),
-    });
+  let lastError = '';
 
-    if (!response.ok) {
-      return { host, reachable: false, error: `HTTP ${response.status}` };
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      const response = await fetch(healthUrl, {
+        signal: AbortSignal.timeout(5000),
+      });
+
+      if (!response.ok) {
+        lastError = `HTTP ${response.status}`;
+        if (attempt < MAX_RETRIES) {
+          const delay = getRetryDelay(attempt);
+          onRetry?.(attempt, delay, lastError);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        return { host, reachable: false, error: lastError };
+      }
+
+      const health = await response.json() as {
+        version?: string;
+        plugins?: Array<{ name: string; version?: string; details?: { running?: boolean } }>;
+      };
+
+      const payaraPlugin = health.plugins?.find(p => p.name === 'payara');
+
+      return {
+        host,
+        reachable: true,
+        agentVersion: health.version,
+        pluginVersion: payaraPlugin?.version,
+        payaraRunning: payaraPlugin?.details?.running,
+      };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (attempt < MAX_RETRIES) {
+        const delay = getRetryDelay(attempt);
+        onRetry?.(attempt, delay, lastError);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
     }
-
-    const health = await response.json() as {
-      version?: string;
-      plugins?: Array<{ name: string; version?: string; details?: { running?: boolean } }>;
-    };
-
-    const payaraPlugin = health.plugins?.find(p => p.name === 'payara');
-
-    return {
-      host,
-      reachable: true,
-      agentVersion: health.version,
-      pluginVersion: payaraPlugin?.version,
-      payaraRunning: payaraPlugin?.details?.running,
-    };
-  } catch (err) {
-    return {
-      host,
-      reachable: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
   }
+
+  return {
+    host,
+    reachable: false,
+    error: lastError,
+  };
 }
 
 /**
@@ -358,6 +382,21 @@ class ProgressReporter {
     }
   }
 
+  showPreflightChecking(host: string): void {
+    if (!this.isPlain) {
+      process.stdout.write(`  ${ANSI.dim}◌ ${host}...${ANSI.reset}`);
+    }
+  }
+
+  showPreflightRetry(host: string, attempt: number, delay: number, error: string): void {
+    const delaySec = Math.round(delay / 1000);
+    if (this.isPlain) {
+      console.log(`  ${host}: retry ${attempt}/${MAX_RETRIES} in ${delaySec}s (${error})`);
+    } else {
+      process.stdout.write(`\r${ANSI.clearLine}  ${ANSI.yellow}↻ ${host} retry ${attempt}/${MAX_RETRIES} in ${delaySec}s${ANSI.reset}`);
+    }
+  }
+
   showPreflightResult(result: PreflightResult, index: number, total: number): void {
     const status = result.reachable
       ? `${ANSI.green}✓${ANSI.reset}`
@@ -369,6 +408,8 @@ class ProgressReporter {
         : result.error || 'unreachable';
       console.log(`  [${index + 1}/${total}] ${result.host}: ${result.reachable ? 'OK' : 'FAIL'} - ${info}`);
     } else {
+      // Clear the "checking" line and show result
+      process.stdout.write(`\r${ANSI.clearLine}`);
       if (result.reachable) {
         const payaraStatus = result.payaraRunning
           ? `${ANSI.green}running${ANSI.reset}`
@@ -894,7 +935,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.7',
+    version: '1.7.8',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
@@ -972,7 +1013,10 @@ export function createPayaraCLIPlugin(): CLIPlugin {
 
               const preflightResults: PreflightResult[] = [];
               for (const [i, host] of config.hosts.entries()) {
-                const result = await checkHostReachable(host, config.port);
+                progress.showPreflightChecking(host);
+                const result = await checkHostReachable(host, config.port, (attempt, delay, error) => {
+                  progress.showPreflightRetry(host, attempt, delay, error);
+                });
                 preflightResults.push(result);
                 progress.showPreflightResult(result, i, config.hosts.length);
               }
