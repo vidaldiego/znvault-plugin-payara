@@ -267,6 +267,93 @@ interface PreflightResult {
 }
 
 /**
+ * Plugin version info from agent endpoint
+ */
+interface PluginVersionInfo {
+  package: string;
+  current: string;
+  latest: string;
+  updateAvailable: boolean;
+}
+
+/**
+ * Plugin versions response from agent
+ */
+interface PluginVersionsResponse {
+  hasUpdates: boolean;
+  versions: PluginVersionInfo[];
+  timestamp: string;
+}
+
+/**
+ * Plugin update result
+ */
+interface PluginUpdateResult {
+  package: string;
+  previousVersion: string;
+  newVersion: string;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Plugin update response from agent
+ */
+interface PluginUpdateResponse {
+  updated: number;
+  results: PluginUpdateResult[];
+  willRestart: boolean;
+  message: string;
+  timestamp: string;
+}
+
+/**
+ * Check plugin versions on a host
+ */
+async function checkPluginVersions(host: string, port: number): Promise<PluginVersionsResponse | null> {
+  const pluginUrl = buildPluginUrl(host, port);
+  const versionsUrl = pluginUrl.replace('/plugins/payara', '/plugins/versions');
+
+  try {
+    const response = await fetch(versionsUrl, {
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return await response.json() as PluginVersionsResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Trigger plugin update on a host
+ */
+async function triggerPluginUpdate(host: string, port: number): Promise<PluginUpdateResponse | null> {
+  const pluginUrl = buildPluginUrl(host, port);
+  const updateUrl = pluginUrl.replace('/plugins/payara', '/plugins/update');
+
+  try {
+    const response = await fetch(updateUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: AbortSignal.timeout(180000), // 3 minute timeout for npm install
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return await response.json() as PluginUpdateResponse;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Check if a host is reachable and get basic info
  * Uses same retry logic as deployment for consistency
  */
@@ -438,6 +525,109 @@ class ProgressReporter {
       console.log(`\n  ${ANSI.yellow}⚠ ${unreachable.length} host(s) unreachable${ANSI.reset}`);
     }
     return false;
+  }
+
+  showVersionCheckHeader(): void {
+    if (this.isPlain) {
+      console.log('\nChecking plugin versions...');
+    } else {
+      console.log(`\n${ANSI.dim}  Checking plugin versions...${ANSI.reset}`);
+    }
+  }
+
+  showVersionCheckResult(host: string, response: PluginVersionsResponse | null): void {
+    if (this.isPlain) {
+      if (!response) {
+        console.log(`  ${host}: version check unavailable`);
+      } else if (response.hasUpdates) {
+        const updates = response.versions.filter(v => v.updateAvailable);
+        for (const u of updates) {
+          console.log(`  ${host}: ${u.package} ${u.current} -> ${u.latest}`);
+        }
+      } else {
+        console.log(`  ${host}: up to date`);
+      }
+    } else {
+      if (!response) {
+        console.log(`  ${ANSI.dim}◌ ${host}: version check unavailable${ANSI.reset}`);
+      } else if (response.hasUpdates) {
+        const updates = response.versions.filter(v => v.updateAvailable);
+        for (const u of updates) {
+          console.log(`  ${ANSI.yellow}↑ ${host}: ${u.package} ${u.current} → ${u.latest}${ANSI.reset}`);
+        }
+      } else {
+        console.log(`  ${ANSI.green}✓ ${host}: plugins up to date${ANSI.reset}`);
+      }
+    }
+  }
+
+  showVersionUpdateHeader(host: string): void {
+    if (this.isPlain) {
+      console.log(`Updating plugins on ${host}...`);
+    } else {
+      process.stdout.write(`  ${ANSI.cyan}⟳ Updating plugins on ${host}...${ANSI.reset}`);
+    }
+  }
+
+  showVersionUpdateResult(host: string, response: PluginUpdateResponse | null): void {
+    if (this.isPlain) {
+      if (!response) {
+        console.log(`  ${host}: update failed`);
+      } else if (response.updated > 0) {
+        console.log(`  ${host}: ${response.updated} plugin(s) updated`);
+        if (response.willRestart) {
+          console.log(`  ${host}: agent will restart`);
+        }
+      } else {
+        console.log(`  ${host}: no updates applied`);
+      }
+    } else {
+      // Clear the "Updating..." line
+      process.stdout.write(`${ANSI.clearLine}\r`);
+      if (!response) {
+        console.log(`  ${ANSI.red}✗ ${host}: update failed${ANSI.reset}`);
+      } else if (response.updated > 0) {
+        console.log(`  ${ANSI.green}✓ ${host}: ${response.updated} plugin(s) updated${ANSI.reset}`);
+        if (response.willRestart) {
+          console.log(`    ${ANSI.dim}Agent will restart in 2s${ANSI.reset}`);
+        }
+      } else {
+        console.log(`  ${ANSI.dim}◌ ${host}: no updates applied${ANSI.reset}`);
+      }
+    }
+  }
+
+  showVersionSummary(hostsWithUpdates: number, totalHosts: number): boolean {
+    if (hostsWithUpdates === 0) {
+      if (!this.isPlain) {
+        console.log(`${ANSI.dim}  All plugins up to date${ANSI.reset}`);
+      }
+      return false;
+    }
+
+    if (this.isPlain) {
+      console.log(`${hostsWithUpdates}/${totalHosts} hosts have plugin updates available`);
+    } else {
+      console.log(`  ${ANSI.yellow}↑ ${hostsWithUpdates}/${totalHosts} hosts have plugin updates available${ANSI.reset}`);
+    }
+    return true;
+  }
+
+  showAgentRestartWaiting(seconds: number): void {
+    if (this.isPlain) {
+      console.log(`Waiting ${seconds}s for agents to restart...`);
+    } else {
+      process.stdout.write(`  ${ANSI.dim}Waiting for agents to restart... ${seconds}s${ANSI.reset}\r`);
+    }
+  }
+
+  showAgentRestartComplete(): void {
+    if (!this.isPlain) {
+      process.stdout.write(`${ANSI.clearLine}\r`);
+      console.log(`  ${ANSI.green}✓ Agents restarted${ANSI.reset}`);
+    } else {
+      console.log('Agents restarted');
+    }
   }
 
   setHost(host: string): void {
@@ -935,7 +1125,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.8',
+    version: '1.7.9',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
@@ -955,12 +1145,16 @@ export function createPayaraCLIPlugin(): CLIPlugin {
         .option('--dry-run', 'Show what would be deployed without deploying')
         .option('--sequential', 'Deploy to hosts one at a time (override parallel setting)')
         .option('--skip-preflight', 'Skip pre-flight checks')
+        .option('--skip-version-check', 'Skip plugin version check')
+        .option('--update-plugins', 'Update plugins if updates are available')
         .option('-y, --yes', 'Skip confirmation prompts')
         .action(async (configName: string, options: {
           force?: boolean;
           dryRun?: boolean;
           sequential?: boolean;
           skipPreflight?: boolean;
+          skipVersionCheck?: boolean;
+          updatePlugins?: boolean;
           yes?: boolean;
         }) => {
           const progress = new ProgressReporter(ctx.isPlainMode());
@@ -1048,6 +1242,91 @@ export function createPayaraCLIPlugin(): CLIPlugin {
                 config.hosts = config.hosts.filter(h =>
                   preflightResults.find(r => r.host === h)?.reachable
                 );
+              }
+            }
+
+            // Plugin version check (after preflight so we know hosts are reachable)
+            if (!options.skipVersionCheck && !options.skipPreflight) {
+              progress.showVersionCheckHeader();
+
+              const versionResults: Array<{ host: string; response: PluginVersionsResponse | null }> = [];
+              for (const host of config.hosts) {
+                const response = await checkPluginVersions(host, config.port);
+                versionResults.push({ host, response });
+                progress.showVersionCheckResult(host, response);
+              }
+
+              const hostsWithUpdates = versionResults.filter(r => r.response?.hasUpdates).length;
+              const hasUpdates = progress.showVersionSummary(hostsWithUpdates, config.hosts.length);
+
+              if (hasUpdates) {
+                if (options.updatePlugins) {
+                  // Auto-update plugins
+                  console.log('');
+                  let hostsRestarting = 0;
+
+                  for (const { host, response } of versionResults) {
+                    if (!response?.hasUpdates) continue;
+
+                    progress.showVersionUpdateHeader(host);
+                    const updateResponse = await triggerPluginUpdate(host, config.port);
+                    progress.showVersionUpdateResult(host, updateResponse);
+
+                    if (updateResponse?.willRestart) {
+                      hostsRestarting++;
+                    }
+                  }
+
+                  // If any agents are restarting, wait for them
+                  if (hostsRestarting > 0) {
+                    console.log('');
+                    // Wait 25 seconds total for agents to restart (2s delay + 15s restart + buffer)
+                    const RESTART_WAIT_TIME = 25;
+                    for (let i = RESTART_WAIT_TIME; i > 0; i--) {
+                      progress.showAgentRestartWaiting(i);
+                      await new Promise(r => setTimeout(r, 1000));
+                    }
+                    progress.showAgentRestartComplete();
+                  }
+                } else if (!options.yes) {
+                  // Ask user if they want to update
+                  console.log('');
+                  const inquirerModule = await import('inquirer');
+                  const inquirer = inquirerModule.default;
+                  const answers = await inquirer.prompt([{
+                    type: 'confirm',
+                    name: 'update',
+                    message: 'Update plugins before deploying?',
+                    default: false,
+                  }]) as { update: boolean };
+
+                  if (answers.update) {
+                    let hostsRestarting = 0;
+
+                    for (const { host, response } of versionResults) {
+                      if (!response?.hasUpdates) continue;
+
+                      progress.showVersionUpdateHeader(host);
+                      const updateResponse = await triggerPluginUpdate(host, config.port);
+                      progress.showVersionUpdateResult(host, updateResponse);
+
+                      if (updateResponse?.willRestart) {
+                        hostsRestarting++;
+                      }
+                    }
+
+                    // If any agents are restarting, wait for them
+                    if (hostsRestarting > 0) {
+                      console.log('');
+                      const RESTART_WAIT_TIME = 25;
+                      for (let i = RESTART_WAIT_TIME; i > 0; i--) {
+                        progress.showAgentRestartWaiting(i);
+                        await new Promise(r => setTimeout(r, 1000));
+                      }
+                      progress.showAgentRestartComplete();
+                    }
+                  }
+                }
               }
             }
 
