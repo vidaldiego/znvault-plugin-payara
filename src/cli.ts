@@ -18,9 +18,16 @@ const CHUNK_SIZE = 50;
 
 /**
  * Retry configuration for transient failures
+ * Uses exponential backoff: 3s, 6s, 12s (~21s total)
+ * This covers typical agent restart time (~10-15s)
  */
 const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 2000;
+const RETRY_BASE_DELAY_MS = 3000;
+
+function getRetryDelay(attempt: number): number {
+  // Exponential backoff: 3s, 6s, 12s
+  return RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1);
+}
 
 /**
  * CLI Plugin context interface
@@ -175,6 +182,130 @@ function formatDuration(ms: number): string {
 }
 
 /**
+ * Format date to relative time or absolute
+ */
+function formatDate(date: Date): string {
+  const now = Date.now();
+  const diff = now - date.getTime();
+
+  if (diff < 60000) return 'just now';
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
+
+  return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+/**
+ * WAR file information
+ */
+interface WarInfo {
+  path: string;
+  name: string;
+  size: number;
+  modifiedAt: Date;
+  version?: string;
+  buildTime?: string;
+  fileCount: number;
+}
+
+/**
+ * Extract WAR info including version from manifest
+ */
+async function getWarInfo(warPath: string): Promise<WarInfo> {
+  const warStats = await stat(warPath);
+  const zip = new AdmZip(warPath);
+
+  let version: string | undefined;
+  let buildTime: string | undefined;
+
+  // Try to read version from MANIFEST.MF
+  const manifestEntry = zip.getEntry('META-INF/MANIFEST.MF');
+  if (manifestEntry) {
+    const manifest = manifestEntry.getData().toString('utf-8');
+
+    // Look for Implementation-Version or Bundle-Version
+    const versionMatch = manifest.match(/Implementation-Version:\s*(.+)/i)
+      || manifest.match(/Bundle-Version:\s*(.+)/i)
+      || manifest.match(/Specification-Version:\s*(.+)/i);
+    if (versionMatch?.[1]) {
+      version = versionMatch[1].trim();
+    }
+
+    // Look for Build-Time or Build-Timestamp
+    const buildMatch = manifest.match(/Build-Time:\s*(.+)/i)
+      || manifest.match(/Build-Timestamp:\s*(.+)/i)
+      || manifest.match(/Built-At:\s*(.+)/i);
+    if (buildMatch?.[1]) {
+      buildTime = buildMatch[1].trim();
+    }
+  }
+
+  // Count files
+  const fileCount = zip.getEntries().filter(e => !e.isDirectory).length;
+
+  return {
+    path: warPath,
+    name: basename(warPath),
+    size: warStats.size,
+    modifiedAt: warStats.mtime,
+    version,
+    buildTime,
+    fileCount,
+  };
+}
+
+/**
+ * Pre-flight check result for a host
+ */
+interface PreflightResult {
+  host: string;
+  reachable: boolean;
+  agentVersion?: string;
+  pluginVersion?: string;
+  payaraRunning?: boolean;
+  error?: string;
+}
+
+/**
+ * Check if a host is reachable and get basic info
+ */
+async function checkHostReachable(host: string, port: number): Promise<PreflightResult> {
+  const pluginUrl = buildPluginUrl(host, port);
+  const healthUrl = pluginUrl.replace('/plugins/payara', '/health');
+
+  try {
+    const response = await fetch(healthUrl, {
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!response.ok) {
+      return { host, reachable: false, error: `HTTP ${response.status}` };
+    }
+
+    const health = await response.json() as {
+      version?: string;
+      plugins?: Array<{ name: string; version?: string; details?: { running?: boolean } }>;
+    };
+
+    const payaraPlugin = health.plugins?.find(p => p.name === 'payara');
+
+    return {
+      host,
+      reachable: true,
+      agentVersion: health.version,
+      pluginVersion: payaraPlugin?.version,
+      payaraRunning: payaraPlugin?.details?.running,
+    };
+  } catch (err) {
+    return {
+      host,
+      reachable: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/**
  * Create a progress bar string
  */
 function progressBar(current: number, total: number, width = 30): string {
@@ -196,6 +327,76 @@ class ProgressReporter {
 
   constructor(isPlain: boolean) {
     this.isPlain = isPlain;
+  }
+
+  showWarInfo(info: WarInfo): void {
+    if (this.isPlain) {
+      console.log(`WAR: ${info.path}`);
+      console.log(`  Size: ${formatSize(info.size)} (${info.fileCount} files)`);
+      console.log(`  Modified: ${info.modifiedAt.toISOString()}`);
+      if (info.version) console.log(`  Version: ${info.version}`);
+      if (info.buildTime) console.log(`  Built: ${info.buildTime}`);
+    } else {
+      console.log(`${ANSI.dim}  WAR:      ${ANSI.reset}${info.name}`);
+      console.log(`${ANSI.dim}  Path:     ${info.path}${ANSI.reset}`);
+      console.log(`${ANSI.dim}  Size:     ${ANSI.reset}${formatSize(info.size)} ${ANSI.dim}(${info.fileCount} files)${ANSI.reset}`);
+      console.log(`${ANSI.dim}  Modified: ${ANSI.reset}${formatDate(info.modifiedAt)}`);
+      if (info.version) {
+        console.log(`${ANSI.dim}  Version:  ${ANSI.reset}${ANSI.cyan}${info.version}${ANSI.reset}`);
+      }
+      if (info.buildTime) {
+        console.log(`${ANSI.dim}  Built:    ${ANSI.reset}${info.buildTime}`);
+      }
+    }
+  }
+
+  showPreflightHeader(hostCount: number): void {
+    if (this.isPlain) {
+      console.log(`\nPre-flight checks (${hostCount} hosts)...`);
+    } else {
+      console.log(`\n${ANSI.dim}  Pre-flight checks...${ANSI.reset}`);
+    }
+  }
+
+  showPreflightResult(result: PreflightResult, index: number, total: number): void {
+    const status = result.reachable
+      ? `${ANSI.green}✓${ANSI.reset}`
+      : `${ANSI.red}✗${ANSI.reset}`;
+
+    if (this.isPlain) {
+      const info = result.reachable
+        ? `agent ${result.agentVersion || '?'}, plugin ${result.pluginVersion || '?'}, payara ${result.payaraRunning ? 'running' : 'stopped'}`
+        : result.error || 'unreachable';
+      console.log(`  [${index + 1}/${total}] ${result.host}: ${result.reachable ? 'OK' : 'FAIL'} - ${info}`);
+    } else {
+      if (result.reachable) {
+        const payaraStatus = result.payaraRunning
+          ? `${ANSI.green}running${ANSI.reset}`
+          : `${ANSI.yellow}stopped${ANSI.reset}`;
+        console.log(`  ${status} ${result.host} ${ANSI.dim}(agent ${result.agentVersion || '?'}, payara ${payaraStatus}${ANSI.dim})${ANSI.reset}`);
+      } else {
+        console.log(`  ${status} ${result.host} ${ANSI.red}(${result.error || 'unreachable'})${ANSI.reset}`);
+      }
+    }
+  }
+
+  showPreflightSummary(results: PreflightResult[]): boolean {
+    const reachable = results.filter(r => r.reachable).length;
+    const unreachable = results.filter(r => !r.reachable);
+
+    if (unreachable.length === 0) {
+      if (!this.isPlain) {
+        console.log(`${ANSI.dim}  All ${reachable} hosts reachable${ANSI.reset}`);
+      }
+      return true;
+    }
+
+    if (this.isPlain) {
+      console.log(`WARNING: ${unreachable.length} host(s) unreachable`);
+    } else {
+      console.log(`\n  ${ANSI.yellow}⚠ ${unreachable.length} host(s) unreachable${ANSI.reset}`);
+    }
+    return false;
   }
 
   setHost(host: string): void {
@@ -323,11 +524,12 @@ class ProgressReporter {
     }
   }
 
-  retrying(attempt: number, maxAttempts: number, lastError?: string): void {
+  retrying(attempt: number, maxAttempts: number, delayMs: number, lastError?: string): void {
+    const delaySec = Math.round(delayMs / 1000);
     if (this.isPlain) {
-      console.log(`Retry ${attempt}/${maxAttempts}${lastError ? `: ${lastError}` : ''}`);
+      console.log(`Retry ${attempt}/${maxAttempts} in ${delaySec}s${lastError ? `: ${lastError}` : ''}`);
     } else {
-      console.log(`  ${ANSI.yellow}↻ Retry ${attempt}/${maxAttempts}${lastError ? ` (${lastError})` : ''}${ANSI.reset}`);
+      console.log(`  ${ANSI.yellow}↻ Retry ${attempt}/${maxAttempts} in ${delaySec}s${lastError ? ` (${lastError})` : ''}${ANSI.reset}`);
     }
   }
 
@@ -556,7 +758,7 @@ async function deployToHost(
         } catch (err) {
           if (attempt < MAX_RETRIES) {
             // Wait before retry with exponential backoff
-            await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+            await new Promise(r => setTimeout(r, getRetryDelay(attempt)));
             continue;
           }
           // All retries failed - will need full upload
@@ -578,9 +780,9 @@ async function deployToHost(
         }
         lastError = result.error;
         if (attempt < MAX_RETRIES) {
-          // Wait before retry
-          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
-          progress.retrying(attempt, MAX_RETRIES, lastError);
+          const delay = getRetryDelay(attempt);
+          progress.retrying(attempt, MAX_RETRIES, delay, lastError);
+          await new Promise(r => setTimeout(r, delay));
         }
       }
       return { success: false, error: `Failed after ${MAX_RETRIES} attempts: ${lastError}` };
@@ -668,8 +870,9 @@ async function deployToHost(
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
         if (attempt < MAX_RETRIES) {
-          await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
-          progress.retrying(attempt, MAX_RETRIES, lastError);
+          const delay = getRetryDelay(attempt);
+          progress.retrying(attempt, MAX_RETRIES, delay, lastError);
+          await new Promise(r => setTimeout(r, delay));
           continue;
         }
       }
@@ -691,7 +894,7 @@ async function deployToHost(
 export function createPayaraCLIPlugin(): CLIPlugin {
   return {
     name: 'payara',
-    version: '1.7.6',
+    version: '1.7.7',
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
@@ -710,10 +913,14 @@ export function createPayaraCLIPlugin(): CLIPlugin {
         .option('-f, --force', 'Force full deployment (no diff)')
         .option('--dry-run', 'Show what would be deployed without deploying')
         .option('--sequential', 'Deploy to hosts one at a time (override parallel setting)')
+        .option('--skip-preflight', 'Skip pre-flight checks')
+        .option('-y, --yes', 'Skip confirmation prompts')
         .action(async (configName: string, options: {
           force?: boolean;
           dryRun?: boolean;
           sequential?: boolean;
+          skipPreflight?: boolean;
+          yes?: boolean;
         }) => {
           const progress = new ProgressReporter(ctx.isPlainMode());
 
@@ -733,39 +940,81 @@ export function createPayaraCLIPlugin(): CLIPlugin {
               process.exit(1);
             }
 
-            // Resolve WAR path
+            // Resolve WAR path and get detailed info
             const warPath = resolve(config.warPath);
-            let warStats;
+            let warInfo: WarInfo;
             try {
-              warStats = await stat(warPath);
+              warInfo = await getWarInfo(warPath);
             } catch {
               ctx.output.error(`WAR file not found: ${warPath}`);
               process.exit(1);
             }
 
-            // Header
+            // Header with detailed WAR info
             if (!ctx.isPlainMode()) {
               console.log(`\n${ANSI.bold}Deploying ${ANSI.cyan}${configName}${ANSI.reset}`);
-              console.log(`${ANSI.dim}  WAR: ${basename(warPath)}${ANSI.reset}`);
-              console.log(`${ANSI.dim}  Hosts: ${config.hosts.length}${ANSI.reset}`);
-              console.log(`${ANSI.dim}  Mode: ${options.sequential || !config.parallel ? 'sequential' : 'parallel'}${ANSI.reset}`);
             } else {
               ctx.output.info(`Deploying ${configName}`);
-              ctx.output.info(`  WAR: ${warPath}`);
+            }
+            progress.showWarInfo(warInfo);
+
+            if (!ctx.isPlainMode()) {
+              console.log(`${ANSI.dim}  Hosts:    ${ANSI.reset}${config.hosts.length}`);
+              console.log(`${ANSI.dim}  Mode:     ${ANSI.reset}${options.sequential || !config.parallel ? 'sequential' : 'parallel'}`);
+            } else {
               ctx.output.info(`  Hosts: ${config.hosts.length}`);
               ctx.output.info(`  Mode: ${options.sequential || !config.parallel ? 'sequential' : 'parallel'}`);
             }
 
+            // Pre-flight checks
+            if (!options.skipPreflight) {
+              progress.showPreflightHeader(config.hosts.length);
+
+              const preflightResults: PreflightResult[] = [];
+              for (const [i, host] of config.hosts.entries()) {
+                const result = await checkHostReachable(host, config.port);
+                preflightResults.push(result);
+                progress.showPreflightResult(result, i, config.hosts.length);
+              }
+
+              const allReachable = progress.showPreflightSummary(preflightResults);
+
+              if (!allReachable && !options.yes) {
+                // Ask user if they want to continue
+                const unreachableHosts = preflightResults.filter(r => !r.reachable).map(r => r.host);
+                console.log('');
+                ctx.output.warn(`Unreachable hosts will be skipped: ${unreachableHosts.join(', ')}`);
+
+                // Dynamic import of inquirer
+                const inquirerModule = await import('inquirer');
+                const inquirer = inquirerModule.default;
+                const answers = await inquirer.prompt([{
+                  type: 'confirm',
+                  name: 'continue',
+                  message: 'Continue with deployment to reachable hosts?',
+                  default: true,
+                }]) as { continue: boolean };
+
+                if (!answers.continue) {
+                  ctx.output.info('Deployment cancelled');
+                  return;
+                }
+
+                // Filter to only reachable hosts
+                config.hosts = config.hosts.filter(h =>
+                  preflightResults.find(r => r.host === h)?.reachable
+                );
+              }
+            }
+
             // Calculate local hashes once
-            progress.analyzing(warPath);
+            if (!ctx.isPlainMode()) {
+              console.log('');
+            }
             const localHashes = await calculateWarHashes(warPath);
-            progress.foundFiles(Object.keys(localHashes).length, warStats.size);
 
             if (options.dryRun) {
-              ctx.output.info('Dry run - checking each host:');
-              for (const host of config.hosts) {
-                console.log(`  - ${host}`);
-              }
+              ctx.output.info(`Dry run - would deploy ${warInfo.fileCount} files to ${config.hosts.length} host(s)`);
               return;
             }
 
