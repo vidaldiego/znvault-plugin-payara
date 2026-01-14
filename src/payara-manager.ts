@@ -389,12 +389,52 @@ export class PayaraManager {
   async getStatus(): Promise<PayaraStatus> {
     const running = await this.isRunning();
     const healthy = running ? await this.isHealthy() : false;
+    const processPids = await this.getPayaraProcessPids();
 
     return {
       healthy,
       running,
       domain: this.domain,
+      processCount: processPids.length,
+      processPids,
     };
+  }
+
+  /**
+   * Ensure exactly ONE Payara process is running.
+   * If multiple processes detected, kills all and restarts fresh.
+   * Returns true if safe (0 or 1 process), false if had to fix duplicates.
+   */
+  async ensureSingleProcess(): Promise<{ ok: boolean; fixed: boolean; previousCount: number }> {
+    const pids = await this.getPayaraProcessPids();
+
+    if (pids.length <= 1) {
+      return { ok: true, fixed: false, previousCount: pids.length };
+    }
+
+    // CRITICAL: Multiple Payara processes detected - this causes Hazelcast cluster issues
+    this.logger.error({
+      pids,
+      count: pids.length,
+      domain: this.domain,
+    }, 'CRITICAL: Multiple Payara processes detected - will cause cluster issues');
+
+    // Kill all and restart fresh
+    this.logger.warn({ pids }, 'Killing all Payara processes to ensure clean state');
+    await this.aggressiveStop();
+
+    // Verify cleanup
+    const remaining = await this.getPayaraProcessPids();
+    if (remaining.length > 0) {
+      this.logger.error({ remaining }, 'Failed to kill all Payara processes');
+      return { ok: false, fixed: false, previousCount: pids.length };
+    }
+
+    // Restart fresh
+    this.logger.info('Starting Payara fresh after cleanup');
+    await this.safeStart();
+
+    return { ok: true, fixed: true, previousCount: pids.length };
   }
 
   /**

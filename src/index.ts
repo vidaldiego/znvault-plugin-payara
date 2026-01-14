@@ -255,7 +255,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.7.3',
+    version: '1.7.4',
     description: 'Payara application server management with WAR diff deployment, secret injection, and aggressive mode',
 
     async onInit(ctx: PluginContext): Promise<void> {
@@ -334,6 +334,21 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         aggressiveMode: config.aggressiveMode ?? false,
         manageLifecycle,
       }, 'Starting Payara plugin');
+
+      // CRITICAL: Check for duplicate Payara processes on startup
+      // Multiple processes cause Hazelcast cluster instability
+      if (manageLifecycle) {
+        const singleProcessCheck = await payara.ensureSingleProcess();
+        if (singleProcessCheck.fixed) {
+          pluginLogger.warn({
+            previousCount: singleProcessCheck.previousCount,
+          }, 'Fixed duplicate Payara processes on startup');
+        } else if (singleProcessCheck.previousCount > 1 && !singleProcessCheck.ok) {
+          pluginLogger.error({
+            previousCount: singleProcessCheck.previousCount,
+          }, 'CRITICAL: Could not fix duplicate Payara processes - manual intervention required');
+        }
+      }
 
       // CRITICAL: Verify and auto-fix API key file on startup
       // This catches any desync that occurred while agent was down
@@ -586,13 +601,30 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
           }
         }
 
-        // Healthy = domain running + app deployed + health endpoint responding + key in sync
+        // CRITICAL: Check for duplicate Payara processes (causes Hazelcast cluster issues)
+        const processCount = status.processCount ?? 0;
+        const hasDuplicateProcesses = processCount > 1;
+        if (hasDuplicateProcesses) {
+          pluginLogger.error({
+            processCount,
+            pids: status.processPids,
+          }, 'CRITICAL: Multiple Payara processes detected - will cause cluster issues');
+        }
+
+        // Healthy = domain running + app deployed + health endpoint responding + key in sync + single process
         // Degraded = domain running but app not deployed or health check failing
-        // Unhealthy = domain not running OR key out of sync (critical failure)
+        // Unhealthy = domain not running OR key out of sync OR multiple processes (critical failures)
         let healthStatus: 'healthy' | 'degraded' | 'unhealthy';
+        let criticalError: string | undefined;
+
         if (!keySyncValid) {
           // Key desync is CRITICAL - mark as unhealthy
           healthStatus = 'unhealthy';
+          criticalError = keySyncError;
+        } else if (hasDuplicateProcesses) {
+          // Multiple processes is CRITICAL - causes Hazelcast cluster instability
+          healthStatus = 'unhealthy';
+          criticalError = `Multiple Payara processes detected (${processCount} PIDs: ${status.processPids?.join(', ')})`;
         } else if (status.running && appDeployed && status.healthy) {
           healthStatus = 'healthy';
         } else if (status.running) {
@@ -604,13 +636,15 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         return {
           name: 'payara',
           status: healthStatus,
-          message: keySyncError ? `CRITICAL: ${keySyncError}` : undefined,
+          message: criticalError ? `CRITICAL: ${criticalError}` : undefined,
           details: {
             domain: config.domain,
             running: status.running,
             healthy: status.healthy,
             appDeployed,
             keySyncValid,
+            processCount,
+            processPids: status.processPids,
             warPath: config.warPath,
             appName: config.appName,
           },

@@ -306,6 +306,10 @@ export interface PayaraStatus {
   uptime?: number;
   appDeployed?: boolean;
   appName?: string;
+  /** Number of Payara/Java processes detected (should be 0 or 1) */
+  processCount?: number;
+  /** PIDs of detected Payara processes */
+  processPids?: number[];
 }
 
 // Import type for PayaraManager reference in WarDeployerOptions
