@@ -669,13 +669,47 @@ class ProgressReporter {
     }
   }
 
-  diff(changed: number, deleted: number): void {
+  diff(changed: number, deleted: number, changedFiles?: string[], deletedFiles?: string[]): void {
     if (this.isPlain) {
       console.log(`Diff: ${changed} changed, ${deleted} deleted`);
+      if (changedFiles && changedFiles.length > 0) {
+        for (const f of changedFiles.slice(0, 10)) {
+          console.log(`  + ${f}`);
+        }
+        if (changedFiles.length > 10) {
+          console.log(`  ... and ${changedFiles.length - 10} more`);
+        }
+      }
     } else {
       const changeStr = changed > 0 ? `${ANSI.green}+${changed}${ANSI.reset}` : `${ANSI.dim}+0${ANSI.reset}`;
       const deleteStr = deleted > 0 ? `${ANSI.red}-${deleted}${ANSI.reset}` : `${ANSI.dim}-0${ANSI.reset}`;
       console.log(`  ${ANSI.dim}Diff:${ANSI.reset} ${changeStr} ${deleteStr}`);
+
+      // Show changed files (up to 15 for visual display)
+      if (changedFiles && changedFiles.length > 0) {
+        const maxShow = 15;
+        console.log(`${ANSI.dim}  Changed files:${ANSI.reset}`);
+        for (const f of changedFiles.slice(0, maxShow)) {
+          const shortFile = f.length > 65 ? '...' + f.slice(-62) : f;
+          console.log(`    ${ANSI.green}+${ANSI.reset} ${ANSI.dim}${shortFile}${ANSI.reset}`);
+        }
+        if (changedFiles.length > maxShow) {
+          console.log(`    ${ANSI.dim}... and ${changedFiles.length - maxShow} more${ANSI.reset}`);
+        }
+      }
+
+      // Show deleted files
+      if (deletedFiles && deletedFiles.length > 0) {
+        const maxShow = 5;
+        console.log(`${ANSI.dim}  Deleted files:${ANSI.reset}`);
+        for (const f of deletedFiles.slice(0, maxShow)) {
+          const shortFile = f.length > 65 ? '...' + f.slice(-62) : f;
+          console.log(`    ${ANSI.red}-${ANSI.reset} ${ANSI.dim}${shortFile}${ANSI.reset}`);
+        }
+        if (deletedFiles.length > maxShow) {
+          console.log(`    ${ANSI.dim}... and ${deletedFiles.length - maxShow} more${ANSI.reset}`);
+        }
+      }
     }
   }
 
@@ -1064,7 +1098,7 @@ async function deployToHost(
 
     // Calculate diff
     const { changed, deleted } = calculateDiff(localHashes, remoteHashes);
-    progress.diff(changed.length, deleted.length);
+    progress.diff(changed.length, deleted.length, changed, deleted);
 
     if (changed.length === 0 && deleted.length === 0) {
       progress.noChanges();
@@ -1794,7 +1828,7 @@ export function createPayaraCLIPlugin(): CLIPlugin {
             if (remoteIsEmpty) {
               ctx.output.info('Remote has no WAR, will upload full WAR file');
             } else {
-              progress.diff(changed.length, deleted.length);
+              progress.diff(changed.length, deleted.length, changed, deleted);
             }
 
             // Dry run - just show what would be deployed
