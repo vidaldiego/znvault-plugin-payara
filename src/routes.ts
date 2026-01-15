@@ -474,8 +474,13 @@ export async function registerRoutes(
       // Also check if app is deployed
       const appDeployed = await deployer.isAppDeployed();
 
+      // Explicitly list all properties to avoid spread issues
       return {
-        ...status,
+        healthy: status.healthy,
+        running: status.running,
+        domain: status.domain,
+        processCount: status.processCount,
+        processPids: status.processPids,
         appDeployed,
         appName: deployer.getAppName(),
         warPath: deployer.getWarPath(),

@@ -537,9 +537,11 @@ export class PayaraManager {
 
     // Step 1: Get all Java PIDs for user
     // Step 2: Filter by cmdline containing Payara patterns
-    const cmd = `pgrep -u ${this.user} java 2>/dev/null | while read pid; do ` +
-                `ps -p$pid -o pid= -o args= 2>/dev/null | grep -iE "(${patternRegex})" | awk '{print $1}'; ` +
-                `done`;
+    // NOTE: Wrap in bash -c to ensure the whole pipeline runs together
+    // (execCommand uses sudo which only applies to the first command in a pipe)
+    const cmd = `bash -c 'pgrep -u ${this.user} java 2>/dev/null | while read pid; do ` +
+                `ps -p\$pid -o pid= -o args= 2>/dev/null | grep -iE "(${patternRegex})" | awk "{print \\$1}"; ` +
+                `done'`;
 
     try {
       const { stdout } = await this.execCommand(cmd, 5000);
