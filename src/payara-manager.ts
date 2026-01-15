@@ -526,18 +526,20 @@ export class PayaraManager {
 
   /**
    * Get PIDs of Payara-related Java processes.
-   * Matches processes with cmdline containing payara, glassfish, or the domain name.
+   * Matches Java processes for the configured user with cmdline containing
+   * payara, glassfish, or the domain name.
    */
   async getPayaraProcessPids(): Promise<number[]> {
-    // Patterns to match in Java process cmdline
+    // Find Java PIDs for user, then filter by Payara-related patterns
+    // Using two-step approach for compatibility with different ps versions
     const patterns = ['payara', 'glassfish', this.domain];
     const patternRegex = patterns.join('|');
 
-    // Find Java PIDs for user that match our patterns
-    // This uses pgrep -f to match against full cmdline
-    const cmd = `pgrep -u ${this.user} -f "(${patternRegex})" 2>/dev/null | ` +
-                `xargs -r ps -p --no-headers -o pid,cmd 2>/dev/null | ` +
-                `grep -i java | awk '{print $1}'`;
+    // Step 1: Get all Java PIDs for user
+    // Step 2: Filter by cmdline containing Payara patterns
+    const cmd = `pgrep -u ${this.user} java 2>/dev/null | while read pid; do ` +
+                `ps -p$pid -o pid= -o args= 2>/dev/null | grep -iE "(${patternRegex})" | awk '{print $1}'; ` +
+                `done`;
 
     try {
       const { stdout } = await this.execCommand(cmd, 5000);
