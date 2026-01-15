@@ -352,6 +352,47 @@ export class WarDeployer {
   }
 
   /**
+   * Deploy WAR with auto mode selection.
+   * In aggressive mode: full restart cycle (stop → kill → start → deploy)
+   * In normal mode: hot deploy via asadmin deploy --force
+   */
+  async deployAuto(): Promise<{
+    deployed: boolean;
+    applications: string[];
+    deploymentTime: number;
+    aggressiveMode: boolean;
+  }> {
+    const startTime = Date.now();
+
+    if (this.aggressiveMode) {
+      this.logger.info('Using aggressive mode for deployment');
+
+      // Full restart cycle: stop → kill → start → deploy
+      await this.payara.aggressiveStop();
+      await this.payara.safeStart();
+      await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
+
+      const applications = await this.payara.listApplications();
+      const isDeployed = applications.includes(this.appName);
+
+      return {
+        deployed: isDeployed,
+        applications,
+        deploymentTime: Date.now() - startTime,
+        aggressiveMode: true,
+      };
+    } else {
+      // Normal hot deploy
+      const result = await this.deploy();
+      return {
+        ...result,
+        deploymentTime: Date.now() - startTime,
+        aggressiveMode: false,
+      };
+    }
+  }
+
+  /**
    * Check if deployment is in progress
    */
   isDeploying(): boolean {

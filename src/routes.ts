@@ -141,8 +141,8 @@ export async function registerRoutes(
         filesDeleted: deletions.length,
       }, 'Starting deployment via asadmin');
 
-      // Deploy using asadmin deploy command
-      const result = await deployer.applyChanges(changedFiles, deletions);
+      // Deploy using asadmin deploy command (uses aggressive mode if configured)
+      const result = await deployer.applyChangesAuto(changedFiles, deletions);
 
       if (result.success) {
         return {
@@ -168,6 +168,7 @@ export async function registerRoutes(
   /**
    * POST /deploy/full
    * Triggers a full WAR deployment using asadmin deploy (no diff)
+   * In aggressive mode: undeploy → stop → kill → start → deploy
    */
   fastify.post('/deploy/full', async (request, reply) => {
     if (deployer.isDeploying()) {
@@ -180,17 +181,17 @@ export async function registerRoutes(
     try {
       logger.info('Starting full deployment via asadmin');
 
-      const startTime = Date.now();
-      const deployResult = await deployer.deploy();
-      const duration = Date.now() - startTime;
+      // Use deployAuto which respects aggressive mode
+      const result = await deployer.deployAuto();
 
       return {
-        status: deployResult.deployed ? 'deployed' : 'failed',
-        message: deployResult.deployed ? 'Full deployment successful' : 'Deployment failed',
-        deploymentTime: duration,
-        deployed: deployResult.deployed,
-        applications: deployResult.applications,
+        status: result.deployed ? 'deployed' : 'failed',
+        message: result.deployed ? 'Full deployment successful' : 'Deployment failed',
+        deploymentTime: result.deploymentTime,
+        deployed: result.deployed,
+        applications: result.applications,
         appName: deployer.getAppName(),
+        aggressiveMode: result.aggressiveMode,
       };
     } catch (err) {
       logger.error({ err }, 'Full deployment failed');
@@ -241,20 +242,19 @@ export async function registerRoutes(
 
       logger.info({ warPath, size: warBuffer.length }, 'WAR file uploaded, deploying via asadmin...');
 
-      // Deploy the WAR using asadmin deploy
-      const startTime = Date.now();
-      const deployResult = await deployer.deploy();
-      const duration = Date.now() - startTime;
+      // Deploy the WAR using asadmin deploy (respects aggressive mode)
+      const result = await deployer.deployAuto();
 
-      if (deployResult.deployed) {
+      if (result.deployed) {
         return {
           status: 'deployed',
           message: 'WAR uploaded and deployed successfully via asadmin',
           size: warBuffer.length,
-          deploymentTime: duration,
+          deploymentTime: result.deploymentTime,
           deployed: true,
-          applications: deployResult.applications,
+          applications: result.applications,
           appName: deployer.getAppName(),
+          aggressiveMode: result.aggressiveMode,
         };
       } else {
         return reply.code(500).send({
@@ -262,9 +262,9 @@ export async function registerRoutes(
           error: 'Deployment failed',
           message: 'WAR uploaded but deployment via asadmin failed',
           size: warBuffer.length,
-          deploymentTime: duration,
+          deploymentTime: result.deploymentTime,
           deployed: false,
-          applications: deployResult.applications,
+          applications: result.applications,
         });
       }
     } catch (err) {
@@ -358,8 +358,8 @@ export async function registerRoutes(
           filesDeleted: session.deletions.length,
         }, 'Committing chunked deployment via asadmin');
 
-        // Deploy using asadmin deploy command
-        const result = await deployer.applyChanges(changedFiles, session.deletions);
+        // Deploy using asadmin deploy command (uses aggressive mode if configured)
+        const result = await deployer.applyChangesAuto(changedFiles, session.deletions);
 
         // Clean up session
         chunkSessions.delete(session.id);
