@@ -1,6 +1,9 @@
 // Path: src/index.ts
 // Payara plugin for zn-vault-agent
 
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { FastifyInstance } from 'fastify';
 import type { Logger } from 'pino';
 import type {
@@ -36,6 +39,19 @@ import {
   buildErrorHealthStatus,
 } from './plugin-health.js';
 
+// Read version from package.json at module load time
+let pluginVersion = '0.0.0';
+try {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  const pkgPath = join(__dirname, '..', 'package.json');
+  const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
+  pluginVersion = pkg.version || '0.0.0';
+} catch {
+  // Fallback version if package.json cannot be read
+  pluginVersion = '0.0.0';
+}
+
 // Re-export types from agent for consumers that don't have agent installed
 export type {
   AgentPlugin,
@@ -57,7 +73,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
   return {
     name: 'payara',
-    version: '1.7.5',
+    version: pluginVersion,
     description: 'Payara application server management with WAR diff deployment, secret injection, and aggressive mode',
 
     async onInit(ctx: PluginContext): Promise<void> {
