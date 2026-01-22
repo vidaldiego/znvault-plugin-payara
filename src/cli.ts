@@ -11,7 +11,6 @@ import {
   registerLifecycleCommands,
   registerDeployRunCommand,
   registerDeployWarCommand,
-  registerAgentCommands,
 } from './cli/commands/index.js';
 
 // Read version from package.json at module load time
@@ -62,9 +61,6 @@ export function createPayaraCLIPlugin(): CLIPlugin {
 
       // deploy restart, status, applications
       registerLifecycleCommands(deploy, ctx);
-
-      // agent status, update, check
-      registerAgentCommands(program, ctx);
     },
   };
 }
