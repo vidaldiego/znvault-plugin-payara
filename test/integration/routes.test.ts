@@ -176,6 +176,7 @@ describe('HTTP Routes Integration', () => {
 
       // Stop Payara
       mockPayara.simulateStop();
+      payaraManager.invalidateStatusCache();
 
       response = await fastify.inject({
         method: 'GET',

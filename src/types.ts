@@ -143,6 +143,8 @@ export interface PayaraManagerOptions {
   environment?: Record<string, string>;
   /** Path to asadmin password file for Payara 7+ authentication */
   passwordFile?: string;
+  /** TTL for status cache in milliseconds (default: 5000) */
+  statusCacheTtlMs?: number;
 }
 
 /**

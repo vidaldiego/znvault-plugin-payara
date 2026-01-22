@@ -1,0 +1,82 @@
+// Path: src/cli/index.ts
+// CLI module entry point - re-exports all CLI components
+
+// Constants
+export {
+  CHUNK_SIZE,
+  MAX_RETRIES,
+  RETRY_BASE_DELAY_MS,
+  AGENT_TIMEOUT_MS,
+  DEPLOYMENT_TIMEOUT_MS,
+  STATUS_POLL_INTERVAL_MS,
+  STATUS_POLL_MAX_WAIT_MS,
+  CONFIG_DIR,
+  CONFIG_FILE,
+  ANSI,
+  getRetryDelay,
+  parsePort,
+} from './constants.js';
+
+// Types
+export type {
+  CLIPluginContext,
+  CLIPlugin,
+  DeployConfig,
+  DeployConfigStore,
+  DeploymentStatusResponse,
+  AgentPostResult,
+  HostReachableResult,
+  PluginVersionInfo,
+  PluginVersionsResponse,
+  PluginUpdateResult,
+  PluginUpdateResponse,
+  PluginVersionCheckResult,
+  TriggerUpdateResult,
+  DeployToHostResult,
+} from './types.js';
+
+// HTTP client
+export {
+  agentGet,
+  agentPost,
+  agentPostWithStatus,
+  pollDeploymentStatus,
+  buildPluginUrl,
+} from './http-client.js';
+export type { ProgressCallback } from './http-client.js';
+
+// Formatters
+export {
+  formatSize,
+  formatDuration,
+  formatDate,
+  progressBar,
+  truncatePath,
+  formatCount,
+} from './formatters.js';
+
+// Progress reporter
+export {
+  ProgressReporter,
+  getWarInfo,
+} from './progress.js';
+export type {
+  WarInfo,
+  PreflightResult,
+} from './progress.js';
+
+// Config store
+export {
+  loadDeployConfigs,
+  saveDeployConfigs,
+  getConfig,
+  configExists,
+  listConfigNames,
+} from './config-store.js';
+
+// Host checks
+export {
+  checkPluginVersions,
+  triggerPluginUpdate,
+  checkHostReachable,
+} from './host-checks.js';

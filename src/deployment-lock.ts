@@ -46,7 +46,8 @@ export class DeploymentLock {
   private readonly lockPath: string;
   private readonly logger: Logger;
   private pendingShutdown = false;
-  private originalSigtermHandler: NodeJS.SignalsListener | null = null;
+  /** Store ALL original SIGTERM handlers, not just one */
+  private originalSigtermHandlers: NodeJS.SignalsListener[] = [];
   private acquired = false;
   private currentDeploymentId: string | null = null;
 
@@ -220,13 +221,14 @@ export class DeploymentLock {
 
   /**
    * Register SIGTERM handler that defers shutdown during deployment.
+   *
+   * IMPORTANT: Store ALL existing handlers so they can be restored.
+   * Previously this only stored the last one, causing other handlers
+   * (agent graceful shutdown, other plugins) to be permanently lost.
    */
   private registerSignalHandler(): void {
-    // Store existing handler
-    const listeners = process.listeners('SIGTERM');
-    if (listeners.length > 0) {
-      this.originalSigtermHandler = listeners[listeners.length - 1] as NodeJS.SignalsListener;
-    }
+    // Store ALL existing handlers
+    this.originalSigtermHandlers = process.listeners('SIGTERM') as NodeJS.SignalsListener[];
 
     // Remove all existing handlers temporarily
     process.removeAllListeners('SIGTERM');
@@ -239,22 +241,34 @@ export class DeploymentLock {
           'SIGTERM received during deployment - deferring until complete'
         );
         this.pendingShutdown = true;
-      } else if (this.originalSigtermHandler) {
-        this.originalSigtermHandler('SIGTERM');
       } else {
-        process.exit(0);
+        // Not acquired, call all original handlers
+        for (const handler of this.originalSigtermHandlers) {
+          try {
+            handler('SIGTERM');
+          } catch (err) {
+            this.logger.error({ err }, 'Error in SIGTERM handler');
+          }
+        }
+        // If no handlers were registered, exit gracefully
+        if (this.originalSigtermHandlers.length === 0) {
+          process.exit(0);
+        }
       }
     });
   }
 
   /**
-   * Restore the original SIGTERM handler.
+   * Restore ALL original SIGTERM handlers.
    */
   private restoreSignalHandler(): void {
     process.removeAllListeners('SIGTERM');
-    if (this.originalSigtermHandler) {
-      process.on('SIGTERM', this.originalSigtermHandler);
+
+    // Restore ALL original handlers in their original order
+    for (const handler of this.originalSigtermHandlers) {
+      process.on('SIGTERM', handler);
     }
-    this.originalSigtermHandler = null;
+
+    this.originalSigtermHandlers = [];
   }
 }

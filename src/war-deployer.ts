@@ -2,7 +2,7 @@
 // WAR file deployer with diff-based updates - uses asadmin deploy commands only
 
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile, writeFile, mkdir, rm, stat, readdir } from 'node:fs/promises';
+import { writeFile, mkdir, rm, stat } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import AdmZip from 'adm-zip';
 import type { Logger } from 'pino';
@@ -10,6 +10,17 @@ import type { PayaraManager } from './payara-manager.js';
 import type { WarDeployerOptions, WarFileHashes, FileChange, DeployResult, FullDeployResult } from './types.js';
 import { DeploymentLock } from './deployment-lock.js';
 import { DeploymentJournal } from './deployment-journal.js';
+import { createTempDir, cleanupTempDir, withTempDir } from './utils/temp-dir.js';
+import { getErrorMessage } from './utils/error.js';
+import { DeploymentStatusTracker } from './deployment-status.js';
+import type { DeploymentStatus } from './deployment-status.js';
+import { addDirectoryToZip } from './utils/zip.js';
+
+// Re-export WAR utilities for backwards compatibility
+export { calculateDiff, calculateWarHashes, getWarEntry } from './war-utils.js';
+
+// Re-export DeploymentStatus type for backwards compatibility
+export type { DeploymentStatus } from './deployment-status.js';
 
 /**
  * WAR file deployer with diff-based updates
@@ -23,6 +34,7 @@ import { DeploymentJournal } from './deployment-journal.js';
  * - Hash calculation for change detection
  * - Proper deployment status reporting
  */
+
 export class WarDeployer {
   private readonly warPath: string;
   private readonly appName: string;
@@ -40,6 +52,9 @@ export class WarDeployer {
   // Deployment journal for crash recovery
   private readonly journal: DeploymentJournal;
 
+  // Deployment status tracking for long-running deployments
+  private readonly statusTracker: DeploymentStatusTracker;
+
   constructor(options: WarDeployerOptions) {
     this.warPath = options.warPath;
     this.appName = options.appName;
@@ -48,9 +63,10 @@ export class WarDeployer {
     this.logger = options.logger;
     this.aggressiveMode = options.aggressiveMode ?? false;
 
-    // Initialize file-based lock and journal
+    // Initialize file-based lock, journal, and status tracker
     this.fileLock = new DeploymentLock(options.logger);
     this.journal = new DeploymentJournal(options.logger);
+    this.statusTracker = new DeploymentStatusTracker(options.logger);
   }
 
   /**
@@ -148,7 +164,7 @@ export class WarDeployer {
     }
 
     this.deployLock = true;
-    const tempDir = `/tmp/war-deploy-${Date.now()}-${randomBytes(4).toString('hex')}`;
+    const tempDir = await createTempDir('war-deploy');
     const startTime = Date.now();
 
     try {
@@ -156,9 +172,6 @@ export class WarDeployer {
         changed: changedFiles.length,
         deleted: deletedFiles.length,
       }, 'Applying WAR changes');
-
-      // Create temp directory
-      await mkdir(tempDir, { recursive: true });
 
       // Extract current WAR if it exists
       if (await this.warExists()) {
@@ -192,7 +205,7 @@ export class WarDeployer {
 
       // Repackage WAR
       const newZip = new AdmZip();
-      await this.addDirectoryToZip(newZip, tempDir, '');
+      await addDirectoryToZip(newZip, tempDir, '');
 
       // Ensure WAR directory exists
       const warDir = dirname(this.warPath);
@@ -226,19 +239,13 @@ export class WarDeployer {
         success: false,
         filesChanged: changedFiles.length,
         filesDeleted: deletedFiles.length,
-        message: err instanceof Error ? err.message : String(err),
+        message: getErrorMessage(err),
         deploymentTime: duration,
         appName: this.appName,
       };
 
     } finally {
-      // Cleanup temp directory
-      try {
-        await rm(tempDir, { recursive: true, force: true });
-      } catch (err) {
-        this.logger.warn({ err, tempDir }, 'Failed to cleanup temp directory');
-      }
-
+      await cleanupTempDir(tempDir, this.logger);
       this.deployLock = false;
     }
   }
@@ -251,15 +258,11 @@ export class WarDeployer {
     changedFiles: FileChange[],
     deletedFiles: string[]
   ): Promise<void> {
-    const tempDir = `/tmp/war-update-${Date.now()}-${randomBytes(4).toString('hex')}`;
-
-    try {
+    await withTempDir('war-update', async (tempDir) => {
       this.logger.debug({
         changed: changedFiles.length,
         deleted: deletedFiles.length,
       }, 'Applying WAR changes (no deploy)');
-
-      await mkdir(tempDir, { recursive: true });
 
       // Extract current WAR if it exists
       if (await this.warExists()) {
@@ -286,20 +289,13 @@ export class WarDeployer {
 
       // Repackage WAR
       const newZip = new AdmZip();
-      await this.addDirectoryToZip(newZip, tempDir, '');
+      await addDirectoryToZip(newZip, tempDir, '');
 
       const warDir = dirname(this.warPath);
       await mkdir(warDir, { recursive: true });
 
       newZip.writeZip(this.warPath);
-
-    } finally {
-      try {
-        await rm(tempDir, { recursive: true, force: true });
-      } catch {
-        // Ignore cleanup errors
-      }
-    }
+    });
   }
 
   /**
@@ -363,32 +359,85 @@ export class WarDeployer {
     aggressiveMode: boolean;
   }> {
     const startTime = Date.now();
+    const deploymentId = `auto-${Date.now()}`;
 
-    if (this.aggressiveMode) {
-      this.logger.info('Using aggressive mode for deployment');
+    // Mark deployment started for status tracking
+    this.markDeploymentStarted(deploymentId);
 
-      // Full restart cycle: stop → kill → start → deploy
-      await this.payara.aggressiveStop();
-      await this.payara.safeStart();
-      await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
+    try {
+      if (this.aggressiveMode) {
+        this.logger.info('Using aggressive mode for deployment');
 
-      const applications = await this.payara.listApplications();
-      const isDeployed = applications.includes(this.appName);
+        // Full restart cycle: stop → kill → start → deploy
+        this.setDeploymentStep('stopping');
+        await this.payara.aggressiveStop();
 
-      return {
-        deployed: isDeployed,
-        applications,
+        this.setDeploymentStep('starting');
+        await this.payara.safeStart();
+
+        this.setDeploymentStep('deploying');
+        await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
+
+        this.setDeploymentStep('verifying');
+        const applications = await this.payara.listApplications();
+        const isDeployed = applications.includes(this.appName);
+
+        const result = {
+          deployed: isDeployed,
+          applications,
+          deploymentTime: Date.now() - startTime,
+          aggressiveMode: true,
+        };
+
+        // Mark completed
+        this.markDeploymentCompleted({
+          success: isDeployed,
+          filesChanged: 0,
+          filesDeleted: 0,
+          message: isDeployed ? 'Deployment successful' : 'Deployment failed',
+          deploymentTime: result.deploymentTime,
+          appName: this.appName,
+          deployed: isDeployed,
+          applications,
+        });
+
+        return result;
+      } else {
+        // Normal hot deploy
+        this.setDeploymentStep('deploying');
+        const result = await this.deploy();
+
+        const autoResult = {
+          ...result,
+          deploymentTime: Date.now() - startTime,
+          aggressiveMode: false,
+        };
+
+        // Mark completed
+        this.markDeploymentCompleted({
+          success: result.deployed,
+          filesChanged: 0,
+          filesDeleted: 0,
+          message: result.deployed ? 'Deployment successful' : 'Deployment failed',
+          deploymentTime: autoResult.deploymentTime,
+          appName: this.appName,
+          deployed: result.deployed,
+          applications: result.applications,
+        });
+
+        return autoResult;
+      }
+    } catch (err) {
+      // Mark failed
+      this.markDeploymentCompleted({
+        success: false,
+        filesChanged: 0,
+        filesDeleted: 0,
+        message: getErrorMessage(err),
         deploymentTime: Date.now() - startTime,
-        aggressiveMode: true,
-      };
-    } else {
-      // Normal hot deploy
-      const result = await this.deploy();
-      return {
-        ...result,
-        deploymentTime: Date.now() - startTime,
-        aggressiveMode: false,
-      };
+        appName: this.appName,
+      });
+      throw err;
     }
   }
 
@@ -397,6 +446,35 @@ export class WarDeployer {
    */
   isDeploying(): boolean {
     return this.deployLock;
+  }
+
+  /**
+   * Get current deployment status for polling
+   * Used by CLI to check if a long-running deployment has completed
+   */
+  getDeploymentStatus(): DeploymentStatus {
+    return this.statusTracker.getStatus(this.deployLock);
+  }
+
+  /**
+   * Update current deployment step (for status tracking)
+   */
+  private setDeploymentStep(step: string): void {
+    this.statusTracker.setStep(step);
+  }
+
+  /**
+   * Mark deployment as started (for status tracking)
+   */
+  private markDeploymentStarted(deploymentId: string): void {
+    this.statusTracker.markStarted(deploymentId);
+  }
+
+  /**
+   * Mark deployment as completed (for status tracking)
+   */
+  private markDeploymentCompleted(result: DeployResult): void {
+    this.statusTracker.markCompleted(result);
   }
 
   /**
@@ -640,7 +718,7 @@ export class WarDeployer {
         success: false,
         filesChanged: changedFiles.length,
         filesDeleted: deletedFiles.length,
-        message: err instanceof Error ? err.message : String(err),
+        message: getErrorMessage(err),
         deploymentTime: totalDuration,
         appName: this.appName,
         deployed: false,
@@ -667,86 +745,4 @@ export class WarDeployer {
     }
     return this.applyChanges(changedFiles, deletedFiles);
   }
-
-  /**
-   * Recursively add directory contents to ZIP
-   */
-  private async addDirectoryToZip(
-    zip: AdmZip,
-    dirPath: string,
-    zipPath: string
-  ): Promise<void> {
-    const entries = await readdir(dirPath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = join(dirPath, entry.name);
-      const entryZipPath = zipPath ? `${zipPath}/${entry.name}` : entry.name;
-
-      if (entry.isDirectory()) {
-        await this.addDirectoryToZip(zip, fullPath, entryZipPath);
-      } else {
-        const content = await readFile(fullPath);
-        zip.addFile(entryZipPath, content);
-      }
-    }
-  }
-}
-
-/**
- * Calculate diff between local and remote hashes
- */
-export function calculateDiff(
-  localHashes: WarFileHashes,
-  remoteHashes: WarFileHashes
-): { changed: string[]; deleted: string[] } {
-  const changed: string[] = [];
-  const deleted: string[] = [];
-
-  // Find changed/new files
-  for (const [path, hash] of Object.entries(localHashes)) {
-    if (!remoteHashes[path] || remoteHashes[path] !== hash) {
-      changed.push(path);
-    }
-  }
-
-  // Find deleted files
-  for (const path of Object.keys(remoteHashes)) {
-    if (!localHashes[path]) {
-      deleted.push(path);
-    }
-  }
-
-  return { changed, deleted };
-}
-
-/**
- * Calculate hashes for a local WAR file
- */
-export async function calculateWarHashes(warPath: string): Promise<WarFileHashes> {
-  const hashes: WarFileHashes = {};
-  const zip = new AdmZip(warPath);
-
-  for (const entry of zip.getEntries()) {
-    if (!entry.isDirectory) {
-      const content = entry.getData();
-      const hash = createHash('sha256').update(content).digest('hex');
-      hashes[entry.entryName] = hash;
-    }
-  }
-
-  return hashes;
-}
-
-/**
- * Get file content from a WAR file
- */
-export function getWarEntry(warPath: string, path: string): Buffer {
-  const zip = new AdmZip(warPath);
-  const entry = zip.getEntry(path);
-
-  if (!entry || entry.isDirectory) {
-    throw new Error(`Entry not found in WAR: ${path}`);
-  }
-
-  return entry.getData();
 }
