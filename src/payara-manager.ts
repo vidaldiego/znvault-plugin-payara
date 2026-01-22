@@ -131,6 +131,9 @@ export class PayaraManager {
 
   /**
    * Run asadmin command with optional authentication for Payara 7+
+   *
+   * For start-domain commands, sources setenv.conf first to ensure environment
+   * variables are available to the domain JVM.
    */
   private async asadminCommand(args: string[], timeout?: number): Promise<string> {
     // Build auth arguments if password file is configured
@@ -138,7 +141,21 @@ export class PayaraManager {
       ? ['--user', 'admin', '--passwordfile', this.passwordFile]
       : [];
 
-    const command = `${this.asadmin} ${[...authArgs, ...args].join(' ')}`;
+    const baseCommand = `${this.asadmin} ${[...authArgs, ...args].join(' ')}`;
+
+    // For start-domain, source setenv.conf first so env vars are inherited by domain JVM
+    // Payara doesn't automatically source domain-specific setenv files, so we do it here
+    const isStartCommand = args[0] === 'start-domain';
+    let command: string;
+
+    if (isStartCommand && Object.keys(this.environment).length > 0) {
+      const setenvPath = join(this.payaraHome, 'glassfish', 'domains', this.domain, 'config', 'setenv.conf');
+      // Source setenv.conf before running asadmin, env vars will be inherited
+      command = `bash -c 'source "${setenvPath}" 2>/dev/null; ${baseCommand}'`;
+    } else {
+      command = baseCommand;
+    }
+
     const result = await this.execCommand(command, timeout);
     return result.stdout;
   }
