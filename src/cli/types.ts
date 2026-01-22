@@ -36,6 +36,119 @@ export interface CLIPlugin {
 }
 
 /**
+ * Deployment strategy batch
+ * Represents a group of hosts to deploy to in parallel within a batch
+ */
+export interface DeploymentStrategyBatch {
+  /** Number of hosts in this batch, or 'rest' for remaining hosts */
+  count: number | 'rest';
+  /** Label for display (e.g., "1", "2", "rest") */
+  label: string;
+}
+
+/**
+ * Parsed deployment strategy
+ *
+ * Examples:
+ * - "sequential" → batches with count=1 for each host
+ * - "parallel" → single batch with count='rest'
+ * - "1+2" → [{count:1}, {count:2}]
+ * - "1+R" or "1+rest" → [{count:1}, {count:'rest'}]
+ * - "2+3+R" → [{count:2}, {count:3}, {count:'rest'}]
+ */
+export interface DeploymentStrategy {
+  /** Original strategy string for display */
+  name: string;
+  /** Ordered list of batches */
+  batches: DeploymentStrategyBatch[];
+  /** Whether this is a canary strategy (has multiple batches) */
+  isCanary: boolean;
+}
+
+/**
+ * Parse a deployment strategy string into a structured strategy
+ *
+ * @param strategy Strategy string (e.g., "sequential", "parallel", "1+2", "1+R")
+ * @returns Parsed deployment strategy
+ * @throws Error if strategy format is invalid
+ *
+ * @example
+ * parseDeploymentStrategy("1+R") // → { name: "1+R", batches: [{count:1}, {count:'rest'}], isCanary: true }
+ * parseDeploymentStrategy("sequential") // → { name: "sequential", batches: [{count:1}], isCanary: false }
+ */
+export function parseDeploymentStrategy(strategy: string): DeploymentStrategy {
+  const normalized = strategy.toLowerCase().trim();
+
+  // Handle built-in strategies
+  if (normalized === 'sequential') {
+    return {
+      name: 'sequential',
+      batches: [{ count: 1, label: '1' }],
+      isCanary: false,
+    };
+  }
+
+  if (normalized === 'parallel') {
+    return {
+      name: 'parallel',
+      batches: [{ count: 'rest', label: 'all' }],
+      isCanary: false,
+    };
+  }
+
+  // Parse canary strategy (e.g., "1+2", "1+R", "2+3+R")
+  const parts = normalized.split('+').map(p => p.trim());
+
+  if (parts.length < 2) {
+    throw new Error(
+      `Invalid strategy format: "${strategy}". ` +
+      `Use "sequential", "parallel", or canary format like "1+2", "1+R", "2+3+R"`
+    );
+  }
+
+  const batches: DeploymentStrategyBatch[] = [];
+
+  for (const part of parts) {
+    if (part === 'r' || part === 'rest') {
+      batches.push({ count: 'rest', label: 'rest' });
+    } else {
+      const count = parseInt(part, 10);
+      if (isNaN(count) || count < 1) {
+        throw new Error(
+          `Invalid batch count "${part}" in strategy "${strategy}". ` +
+          `Must be a positive number or "R" for rest.`
+        );
+      }
+      batches.push({ count, label: part });
+    }
+  }
+
+  // Validate: 'rest' can only appear at the end
+  const restIndex = batches.findIndex(b => b.count === 'rest');
+  if (restIndex !== -1 && restIndex !== batches.length - 1) {
+    throw new Error(
+      `"R" (rest) can only appear at the end of the strategy. Got: "${strategy}"`
+    );
+  }
+
+  return {
+    name: strategy,
+    batches,
+    isCanary: true,
+  };
+}
+
+/**
+ * Get display name for a deployment strategy
+ */
+export function getStrategyDisplayName(strategy: DeploymentStrategy): string {
+  if (!strategy.isCanary) {
+    return strategy.name;
+  }
+  return `canary (${strategy.name})`;
+}
+
+/**
  * Deployment configuration
  */
 export interface DeployConfig {
@@ -43,7 +156,17 @@ export interface DeployConfig {
   hosts: string[];
   warPath: string;
   port: number;
+  /** @deprecated Use strategy instead. Kept for backwards compatibility. */
   parallel: boolean;
+  /**
+   * Deployment strategy
+   * - "sequential" - deploy one host at a time
+   * - "parallel" - deploy all hosts at once
+   * - "1+R" - deploy to 1 host, if success deploy to rest in parallel
+   * - "1+2" - deploy to 1, then 2 in parallel
+   * - "2+3+R" - deploy to 2, then 3, then rest in parallel
+   */
+  strategy?: string;
   description?: string;
 }
 

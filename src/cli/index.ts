@@ -33,6 +33,14 @@ export type {
   PluginVersionCheckResult,
   TriggerUpdateResult,
   DeployToHostResult,
+  DeploymentStrategy,
+  DeploymentStrategyBatch,
+} from './types.js';
+
+// Strategy functions
+export {
+  parseDeploymentStrategy,
+  getStrategyDisplayName,
 } from './types.js';
 
 // HTTP client
@@ -80,3 +88,13 @@ export {
   triggerPluginUpdate,
   checkHostReachable,
 } from './host-checks.js';
+
+// Strategy executor
+export {
+  executeStrategy,
+  resolveStrategy,
+} from './strategy-executor.js';
+export type {
+  StrategyExecutionResult,
+  StrategyExecutorOptions,
+} from './strategy-executor.js';

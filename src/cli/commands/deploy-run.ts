@@ -18,9 +18,15 @@ import {
   triggerPluginUpdate,
   checkHostReachable,
 } from '../host-checks.js';
-import type { CLIPluginContext, PluginVersionCheckResult } from '../types.js';
+import {
+  type CLIPluginContext,
+  type PluginVersionCheckResult,
+  parseDeploymentStrategy,
+  getStrategyDisplayName,
+} from '../types.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { deployToHost } from './deploy.js';
+import { executeStrategy, resolveStrategy } from '../strategy-executor.js';
 
 /**
  * Register deploy run command for multi-host deployment
@@ -36,6 +42,7 @@ export function registerDeployRunCommand(
     .option('-f, --force', 'Force full deployment (no diff)')
     .option('--dry-run', 'Show what would be deployed without deploying')
     .option('--sequential', 'Deploy to hosts one at a time (override parallel setting)')
+    .option('-s, --strategy <strategy>', 'Deployment strategy: sequential, parallel, or canary (e.g., 1+R, 1+2, 2+3+R)')
     .option('--skip-preflight', 'Skip pre-flight checks')
     .option('--skip-version-check', 'Skip plugin version check')
     .option('--update-plugins', 'Update plugins if updates are available')
@@ -44,6 +51,7 @@ export function registerDeployRunCommand(
       force?: boolean;
       dryRun?: boolean;
       sequential?: boolean;
+      strategy?: string;
       skipPreflight?: boolean;
       skipVersionCheck?: boolean;
       updatePlugins?: boolean;
@@ -85,12 +93,28 @@ export function registerDeployRunCommand(
         }
         progress.showWarInfo(warInfo);
 
+        // Resolve deployment strategy
+        const strategyString = resolveStrategy({
+          strategy: options.strategy,
+          sequential: options.sequential,
+          configStrategy: config.strategy,
+          configParallel: config.parallel,
+        });
+
+        let strategy;
+        try {
+          strategy = parseDeploymentStrategy(strategyString);
+        } catch (err) {
+          ctx.output.error(getErrorMessage(err));
+          process.exit(1);
+        }
+
         if (!ctx.isPlainMode()) {
           console.log(`${ANSI.dim}  Hosts:    ${ANSI.reset}${config.hosts.length}`);
-          console.log(`${ANSI.dim}  Mode:     ${ANSI.reset}${options.sequential || !config.parallel ? 'sequential' : 'parallel'}`);
+          progress.showStrategy(getStrategyDisplayName(strategy), strategy.isCanary);
         } else {
           ctx.output.info(`  Hosts: ${config.hosts.length}`);
-          ctx.output.info(`  Mode: ${options.sequential || !config.parallel ? 'sequential' : 'parallel'}`);
+          ctx.output.info(`  Strategy: ${getStrategyDisplayName(strategy)}`);
         }
 
         // Pre-flight checks
@@ -233,14 +257,8 @@ export function registerDeployRunCommand(
           return;
         }
 
-        const results: Array<{
-          host: string;
-          success: boolean;
-          error?: string;
-          result?: DeployResult;
-        }> = [];
-
-        const deployToHostWrapper = async (host: string) => {
+        // Deploy function for strategy executor
+        const deployFn = async (host: string) => {
           progress.setHost(host);
           const result = await deployToHost(
             ctx,
@@ -251,34 +269,33 @@ export function registerDeployRunCommand(
             options.force ?? false,
             progress
           );
-          results.push({
-            host,
-            success: result.success,
-            error: result.error,
-            result: result.result,
-          });
           if (result.success && result.result) {
             progress.deployed(result.result);
           } else {
             progress.failed(result.error ?? 'Unknown error');
           }
+          return result;
         };
 
-        if (options.sequential || !config.parallel) {
-          // Sequential deployment
-          for (const host of config.hosts) {
-            await deployToHostWrapper(host);
+        // Execute deployment strategy
+        const executionResult = await executeStrategy(
+          strategy,
+          config.hosts,
+          deployFn,
+          {
+            abortOnFailure: strategy.isCanary, // Only abort on failure for canary strategies
+            progress,
           }
-        } else {
-          // Parallel deployment
-          await Promise.all(config.hosts.map(deployToHostWrapper));
-        }
+        );
 
-        const successful = results.filter(r => r.success).length;
-        const failed = results.filter(r => !r.success).length;
-        progress.summary(successful, config.hosts.length, failed);
+        progress.summary(
+          executionResult.successful,
+          executionResult.total,
+          executionResult.failed,
+          executionResult.skipped
+        );
 
-        if (failed > 0) {
+        if (executionResult.failed > 0 || executionResult.aborted) {
           process.exit(1);
         }
       } catch (err) {

@@ -487,16 +487,86 @@ export class ProgressReporter implements ProgressCallback {
     }
   }
 
-  summary(successful: number, total: number, failed: number): void {
+  summary(successful: number, total: number, failed: number, skipped?: number): void {
     console.log('');
+    const skippedText = skipped && skipped > 0 ? `, ${skipped} skipped` : '';
     if (this.isPlain) {
-      console.log(`Deployment complete: ${successful}/${total} hosts successful${failed > 0 ? `, ${failed} failed` : ''}`);
+      console.log(`Deployment complete: ${successful}/${total} hosts successful${failed > 0 ? `, ${failed} failed` : ''}${skippedText}`);
     } else {
-      if (failed === 0) {
+      if (failed === 0 && (!skipped || skipped === 0)) {
         console.log(`${ANSI.bold}${ANSI.green}✓ Deployment complete${ANSI.reset}: ${successful}/${total} hosts successful`);
       } else {
-        console.log(`${ANSI.bold}${ANSI.yellow}⚠ Deployment complete${ANSI.reset}: ${successful}/${total} hosts successful, ${ANSI.red}${failed} failed${ANSI.reset}`);
+        const failedPart = failed > 0 ? `, ${ANSI.red}${failed} failed${ANSI.reset}` : '';
+        const skippedPart = skipped && skipped > 0 ? `, ${ANSI.yellow}${skipped} skipped${ANSI.reset}` : '';
+        console.log(`${ANSI.bold}${ANSI.yellow}⚠ Deployment complete${ANSI.reset}: ${successful}/${total} hosts successful${failedPart}${skippedPart}`);
       }
+    }
+  }
+
+  // ===== Canary/Batch Deployment Methods =====
+
+  /**
+   * Show the strategy being used
+   */
+  showStrategy(strategyName: string, isCanary: boolean): void {
+    if (this.isPlain) {
+      console.log(`  Strategy: ${strategyName}`);
+    } else {
+      const strategyLabel = isCanary
+        ? `${ANSI.cyan}canary${ANSI.reset} (${strategyName})`
+        : strategyName;
+      console.log(`${ANSI.dim}  Strategy: ${ANSI.reset}${strategyLabel}`);
+    }
+  }
+
+  /**
+   * Show batch header for canary deployments
+   */
+  showBatchHeader(batchNumber: number, totalBatches: number, hostCount: number, batchLabel: string): void {
+    const batchName = batchLabel === 'rest' ? 'remaining' : batchLabel;
+    const hostsWord = hostCount === 1 ? 'host' : 'hosts';
+
+    if (this.isPlain) {
+      console.log(`\nBatch ${batchNumber}/${totalBatches}: deploying to ${hostCount} ${hostsWord} (${batchName})`);
+    } else {
+      console.log(`\n${ANSI.bold}${ANSI.blue}━━━ Batch ${batchNumber}/${totalBatches}${ANSI.reset} ${ANSI.dim}(${hostCount} ${hostsWord}${batchLabel === 'rest' ? ' - remaining' : ''})${ANSI.reset}`);
+    }
+  }
+
+  /**
+   * Show batch completion result
+   */
+  showBatchResult(batchNumber: number, successes: number, failures: number): void {
+    if (this.isPlain) {
+      console.log(`Batch ${batchNumber}: ${successes} succeeded, ${failures} failed`);
+    } else {
+      if (failures === 0) {
+        console.log(`${ANSI.dim}  Batch ${batchNumber}:${ANSI.reset} ${ANSI.green}✓ ${successes} succeeded${ANSI.reset}`);
+      } else {
+        console.log(`${ANSI.dim}  Batch ${batchNumber}:${ANSI.reset} ${ANSI.green}${successes} succeeded${ANSI.reset}, ${ANSI.red}${failures} failed${ANSI.reset}`);
+      }
+    }
+  }
+
+  /**
+   * Show canary abort message when a batch fails
+   */
+  showCanaryAbort(failedBatch: number, skippedHosts: number): void {
+    const hostsWord = skippedHosts === 1 ? 'host' : 'hosts';
+    if (this.isPlain) {
+      console.log(`\nCanary failed at batch ${failedBatch}. Aborting deployment.`);
+      console.log(`Skipped ${skippedHosts} remaining ${hostsWord}.`);
+    } else {
+      console.log(`\n${ANSI.red}${ANSI.bold}✗ Canary failed${ANSI.reset} at batch ${failedBatch}. ${ANSI.yellow}Skipping ${skippedHosts} remaining ${hostsWord}.${ANSI.reset}`);
+    }
+  }
+
+  /**
+   * Show canary success message before proceeding to next batch
+   */
+  showCanaryProceeding(nextBatch: number, totalBatches: number): void {
+    if (!this.isPlain) {
+      console.log(`${ANSI.dim}  Proceeding to batch ${nextBatch}/${totalBatches}...${ANSI.reset}`);
     }
   }
 }
