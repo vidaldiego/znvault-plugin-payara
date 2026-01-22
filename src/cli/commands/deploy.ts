@@ -7,6 +7,7 @@ import type { WarFileHashes, ChunkedDeployResponse } from '../../types.js';
 import { calculateWarHashes, calculateDiff } from '../../war-deployer.js';
 import type { CLIPluginContext, DeployOperationResult } from '../types.js';
 import { ProgressReporter, progressBar } from '../progress.js';
+import type { HostAnalysis } from '../unified-progress.js';
 import {
   CHUNK_SIZE,
   MAX_RETRIES,
@@ -22,9 +23,113 @@ import {
   buildPluginUrl,
 } from '../http-client.js';
 import { getErrorMessage } from '../../utils/error.js';
+import { formatSize } from '../formatters.js';
 
 // Re-export type for backwards compatibility
 export type { DeployOperationResult } from '../types.js';
+
+/**
+ * Analyze a host to determine what needs to be deployed
+ * Does NOT perform actual deployment - just fetches remote hashes and calculates diff
+ *
+ * @param host Host address
+ * @param port Agent port
+ * @param localHashes Pre-calculated local WAR hashes
+ * @param force If true, treat as full upload (skip remote hash fetch)
+ * @returns Analysis result with file counts and sizes
+ */
+export async function analyzeHost(
+  host: string,
+  port: number,
+  localHashes: WarFileHashes,
+  force: boolean
+): Promise<HostAnalysis> {
+  try {
+    const pluginUrl = buildPluginUrl(host, port);
+
+    // If force mode, everything is a change
+    if (force) {
+      const files = Object.keys(localHashes);
+      const totalSize = files.reduce((sum, path) => sum + (localHashes[path]?.length ?? 100), 0);
+      return {
+        host,
+        success: true,
+        filesChanged: files.length,
+        filesDeleted: 0,
+        bytesToUpload: totalSize,
+        isFullUpload: true,
+        changedFiles: files,
+        deletedFiles: [],
+      };
+    }
+
+    // Fetch remote hashes
+    let remoteHashes: WarFileHashes = {};
+    let isFullUpload = false;
+
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const response = await agentGet<{ hashes: WarFileHashes; status?: string }>(
+          `${pluginUrl}/hashes`
+        );
+        remoteHashes = response.hashes ?? {};
+
+        // Check if remote has no WAR
+        if (Object.keys(remoteHashes).length === 0 && response.status === 'no_war') {
+          isFullUpload = true;
+        }
+        break;
+      } catch (err) {
+        if (attempt < MAX_RETRIES) {
+          await new Promise(r => setTimeout(r, getRetryDelay(attempt)));
+          continue;
+        }
+        // All retries failed - treat as full upload
+        isFullUpload = true;
+      }
+    }
+
+    // Calculate diff
+    if (isFullUpload) {
+      const files = Object.keys(localHashes);
+      const totalSize = files.reduce((sum, path) => sum + (localHashes[path]?.length ?? 100), 0);
+      return {
+        host,
+        success: true,
+        filesChanged: files.length,
+        filesDeleted: 0,
+        bytesToUpload: totalSize,
+        isFullUpload: true,
+        changedFiles: files,
+        deletedFiles: [],
+      };
+    }
+
+    const { changed, deleted } = calculateDiff(localHashes, remoteHashes);
+    const totalSize = changed.reduce((sum, path) => sum + (localHashes[path]?.length ?? 100), 0);
+
+    return {
+      host,
+      success: true,
+      filesChanged: changed.length,
+      filesDeleted: deleted.length,
+      bytesToUpload: totalSize,
+      isFullUpload: false,
+      changedFiles: changed,
+      deletedFiles: deleted,
+    };
+  } catch (err) {
+    return {
+      host,
+      success: false,
+      error: getErrorMessage(err),
+      filesChanged: 0,
+      filesDeleted: 0,
+      bytesToUpload: 0,
+      isFullUpload: false,
+    };
+  }
+}
 
 /**
  * Upload full WAR file to server with progress tracking and polling

@@ -94,7 +94,8 @@ export function registerConfigCommands(
           }
           console.log(`    Hosts: ${config.hosts.length > 0 ? config.hosts.join(', ') : ANSI.dim + '(none)' + ANSI.reset}`);
           console.log(`    WAR:   ${config.warPath || ANSI.dim + '(not set)' + ANSI.reset}`);
-          console.log(`    Mode:  ${config.parallel ? 'parallel' : 'sequential'}`);
+          const displayStrategy = config.strategy ?? (config.parallel ? 'parallel' : 'sequential');
+          console.log(`    Strategy: ${displayStrategy}`);
           console.log();
         }
       }, 'Failed to list configs');
@@ -120,7 +121,9 @@ export function registerConfigCommands(
         }
         console.log(`  WAR Path:    ${config.warPath || ANSI.dim + '(not set)' + ANSI.reset}`);
         console.log(`  Port:        ${config.port}`);
-        console.log(`  Mode:        ${config.parallel ? 'parallel' : 'sequential'}`);
+        // Display strategy (prefer explicit strategy over legacy parallel flag)
+        const displayStrategy = config.strategy ?? (config.parallel ? 'parallel' : 'sequential');
+        console.log(`  Strategy:    ${displayStrategy}`);
         console.log(`\n  Hosts (${config.hosts.length}):`);
         if (config.hosts.length === 0) {
           console.log(`    ${ANSI.dim}(none)${ANSI.reset}`);
@@ -209,7 +212,7 @@ export function registerConfigCommands(
   // deploy config set <name> <key> <value>
   configCmd
     .command('set <name> <key> <value>')
-    .description('Set a configuration value (war, port, parallel, description)')
+    .description('Set a configuration value (war, port, strategy, parallel, description)')
     .action(async (name: string, key: string, value: string) => {
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
@@ -222,6 +225,15 @@ export function registerConfigCommands(
           case 'port':
             config.port = parsePort(value);
             break;
+          case 'strategy':
+            // Validate strategy format
+            if (!['sequential', 'parallel'].includes(value.toLowerCase()) && !value.includes('+')) {
+              ctx.output.error(`Invalid strategy: ${value}`);
+              ctx.output.info('Use: sequential, parallel, or canary format (1+R, 1+2, 2+3+R)');
+              process.exit(1);
+            }
+            config.strategy = value;
+            break;
           case 'parallel':
             config.parallel = value.toLowerCase() === 'true' || value === '1';
             break;
@@ -231,7 +243,7 @@ export function registerConfigCommands(
             break;
           default:
             ctx.output.error(`Unknown config key: ${key}`);
-            ctx.output.info('Valid keys: war, port, parallel, description');
+            ctx.output.info('Valid keys: war, port, strategy, parallel, description');
             process.exit(1);
         }
 

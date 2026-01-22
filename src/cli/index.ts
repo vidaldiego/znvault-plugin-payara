@@ -98,3 +98,14 @@ export type {
   StrategyExecutionResult,
   StrategyExecutorOptions,
 } from './strategy-executor.js';
+
+// Unified progress
+export {
+  UnifiedProgress,
+} from './unified-progress.js';
+export type {
+  HostState,
+  HostStatus,
+  HostAnalysis,
+  UnifiedProgressOptions,
+} from './unified-progress.js';
