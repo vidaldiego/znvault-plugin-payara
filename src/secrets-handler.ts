@@ -163,7 +163,8 @@ export async function fetchSecrets(
         // Fetch managed API key value from agent config
         // The managed key is bound by the agent and stored in ctx.config.auth.apiKey
         const keyName = source.substring('api-key:'.length);
-        const configuredKeyName = ctx.config.managedKey?.name;
+        // Support both local config (managedKey.name) and config-from-vault (managedKeyName)
+        const configuredKeyName = ctx.config.managedKey?.name ?? (ctx.config as { managedKeyName?: string }).managedKeyName;
 
         if (configuredKeyName && configuredKeyName === keyName) {
           // Use the current API key from auth config (managed key value)
