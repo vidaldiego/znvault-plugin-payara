@@ -7,12 +7,20 @@ import type { WarDeployer } from './war-deployer.js';
 import { waitForWithResult } from './utils/polling.js';
 
 /**
+ * Default delay after starting Payara before deploying (milliseconds)
+ * This allows Payara's env var substitution to fully initialize
+ */
+export const DEFAULT_POST_START_DELAY_MS = 5000;
+
+/**
  * Context for startup operations
  */
 export interface StartupContext {
   payara: PayaraManager;
   deployer: WarDeployer;
   logger: Logger;
+  /** Delay after domain start before deploying (ms) */
+  postStartDelay?: number;
 }
 
 /**
@@ -46,6 +54,8 @@ export async function handleExecModeStartup(ctx: StartupContext): Promise<void> 
 
   // Deploy WAR if it exists and Payara is running
   if (payaraReady && await deployer.warExists()) {
+    // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
+    await applyPostStartDelay(ctx, 'after Payara became ready');
     await deployer.deploy();
   }
 }
@@ -76,6 +86,9 @@ export async function handleAggressiveModeStartup(ctx: StartupContext): Promise<
     // Start Payara fresh
     await payara.safeStart();
 
+    // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
+    await applyPostStartDelay(ctx, 'after fresh start');
+
     // Deploy WAR if it exists
     if (await deployer.warExists()) {
       await deployer.deploy();
@@ -96,6 +109,9 @@ export async function handleNormalModeStartup(ctx: StartupContext): Promise<void
   } else {
     logger.info('Starting Payara...');
     await payara.start();
+
+    // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
+    await applyPostStartDelay(ctx, 'after starting domain');
 
     // Deploy WAR if it exists
     if (await deployer.warExists()) {
@@ -126,4 +142,21 @@ export async function ensureSinglePayaraProcess(
   }
 
   return false;
+}
+
+/**
+ * Wait for a specified delay, used to allow Payara to initialize env var substitution
+ */
+async function applyPostStartDelay(
+  ctx: StartupContext,
+  reason: string
+): Promise<void> {
+  const delay = ctx.postStartDelay ?? DEFAULT_POST_START_DELAY_MS;
+  if (delay > 0) {
+    ctx.logger.info(
+      { delayMs: delay },
+      `Waiting ${delay}ms ${reason} before deploying (postStartDelay)`
+    );
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
 }

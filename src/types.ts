@@ -111,6 +111,25 @@ export interface PayaraPluginConfig {
   manageLifecycle?: boolean;
 
   /**
+   * Delay in milliseconds after starting Payara before deploying the WAR.
+   *
+   * This delay allows Payara to fully initialize its environment variable
+   * substitution system, which is required for @DataSourceDefinition annotations
+   * that use ${ENV=...} placeholders.
+   *
+   * Without this delay, deployments immediately after a fresh domain start may
+   * fail to properly resolve environment variables in resource annotations.
+   *
+   * Default: 5000 (5 seconds)
+   * Set to 0 to disable the delay (not recommended for fresh starts)
+   *
+   * @example
+   * // Use 10 seconds for slower systems
+   * postStartDelay: 10000
+   */
+  postStartDelay?: number;
+
+  /**
    * Secrets to inject as environment variables when starting Payara.
    * Keys are env var names, values are vault references:
    * - "alias:path/to/secret" - fetch secret by alias

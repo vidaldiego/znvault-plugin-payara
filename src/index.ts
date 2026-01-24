@@ -178,7 +178,12 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         await payara.updateEnvironment(secretsEnv);
       }
 
-      const startupCtx = { payara, deployer, logger: pluginLogger };
+      const startupCtx = {
+        payara,
+        deployer,
+        logger: pluginLogger,
+        postStartDelay: config.postStartDelay,
+      };
 
       switch (startupMode) {
         case 'exec':
