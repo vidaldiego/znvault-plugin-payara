@@ -9,26 +9,23 @@ import {
   getWarInfo,
   ProgressReporter,
   type WarInfo,
-  type PreflightResult,
 } from '../progress.js';
 import { ANSI } from '../constants.js';
 import {
-  checkPluginVersions,
-  triggerPluginUpdate,
-  checkHostReachable,
-} from '../host-checks.js';
-import {
   type CLIPluginContext,
-  type PluginVersionCheckResult,
   parseDeploymentStrategy,
   getStrategyDisplayName,
 } from '../types.js';
 import { getErrorMessage } from '../../utils/error.js';
-import { analyzeHost } from './deploy.js';
 import { resolveStrategy } from '../strategy-executor.js';
-import { UnifiedProgress, type HostAnalysis } from '../unified-progress.js';
 import { formatSize } from '../formatters.js';
 import { executeListrDeployment, printDeploymentSummary } from '../listr-deploy.js';
+import {
+  executePreflightChecks,
+  executePluginUpdates,
+  waitForAgentRestart,
+  printPreflightSummary,
+} from '../listr-preflight.js';
 
 /**
  * Register deploy run command for multi-host deployment
@@ -60,7 +57,7 @@ export function registerDeployRunCommand(
       yes?: boolean;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
-      const unified = new UnifiedProgress({ plain: ctx.isPlainMode() });
+      const isPlain = ctx.isPlainMode();
 
       try {
         const store = await loadDeployConfigs();
@@ -89,7 +86,7 @@ export function registerDeployRunCommand(
         }
 
         // Header with detailed WAR info
-        if (!ctx.isPlainMode()) {
+        if (!isPlain) {
           console.log(`\n${ANSI.bold}Deploying ${ANSI.cyan}${configName}${ANSI.reset}`);
         } else {
           ctx.output.info(`Deploying ${configName}`);
@@ -112,7 +109,7 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
-        if (!ctx.isPlainMode()) {
+        if (!isPlain) {
           console.log(`${ANSI.dim}  Hosts:    ${ANSI.reset}${config.hosts.length}`);
           progress.showStrategy(getStrategyDisplayName(strategy), strategy.isCanary);
         } else {
@@ -120,166 +117,110 @@ export function registerDeployRunCommand(
           ctx.output.info(`  Strategy: ${getStrategyDisplayName(strategy)}`);
         }
 
-        // Pre-flight checks
-        if (!options.skipPreflight) {
-          progress.showPreflightHeader(config.hosts.length);
+        // ═══════════════════════════════════════════════════════════════════
+        // PARALLEL PRE-FLIGHT PHASE
+        // Check all hosts in parallel: reachability + version + analysis
+        // ═══════════════════════════════════════════════════════════════════
 
-          const preflightResults: PreflightResult[] = [];
-          for (const [i, host] of config.hosts.entries()) {
-            progress.showPreflightChecking(host);
-            const result = await checkHostReachable(host, config.port, (attempt, delay, error) => {
-              progress.showPreflightRetry(host, attempt, delay, error);
-            });
-            preflightResults.push(result);
-            progress.showPreflightResult(result, i, config.hosts.length);
+        console.log('');
+
+        // Calculate local hashes (needed for analysis)
+        const localHashes = await calculateWarHashes(warPath);
+
+        // Skip preflight entirely if requested
+        if (options.skipPreflight) {
+          ctx.output.info('Skipping pre-flight checks');
+        }
+
+        // Run parallel preflight checks
+        if (!isPlain) {
+          console.log(`${ANSI.bold}Checking ${config.hosts.length} hosts...${ANSI.reset}`);
+        } else {
+          console.log(`Checking ${config.hosts.length} hosts...`);
+        }
+
+        const preflightResult = await executePreflightChecks({
+          hosts: config.hosts,
+          port: config.port,
+          localHashes,
+          force: options.force ?? false,
+          skipVersionCheck: options.skipVersionCheck ?? options.skipPreflight ?? false,
+          isPlain,
+        });
+
+        // Print summary
+        printPreflightSummary(preflightResult, config.hosts.length, isPlain);
+
+        // Handle unreachable hosts
+        const unreachableHosts = config.hosts.filter(h => !preflightResult.reachableHosts.includes(h));
+        if (unreachableHosts.length > 0 && !options.yes) {
+          console.log('');
+          ctx.output.warn(`Unreachable hosts will be skipped: ${unreachableHosts.join(', ')}`);
+
+          const inquirerModule = await import('inquirer');
+          const inquirer = inquirerModule.default;
+          const answers = await inquirer.prompt([{
+            type: 'confirm',
+            name: 'continue',
+            message: 'Continue with deployment to reachable hosts?',
+            default: true,
+          }]) as { continue: boolean };
+
+          if (!answers.continue) {
+            ctx.output.info('Deployment cancelled');
+            return;
           }
+        }
 
-          const allReachable = progress.showPreflightSummary(preflightResults);
+        // Filter to only reachable hosts
+        const reachableHosts = preflightResult.reachableHosts;
+        if (reachableHosts.length === 0) {
+          ctx.output.error('No hosts reachable for deployment');
+          process.exit(1);
+        }
 
-          if (!allReachable && !options.yes) {
-            // Ask user if they want to continue
-            const unreachableHosts = preflightResults.filter(r => !r.reachable).map(r => r.host);
+        // Handle plugin updates
+        if (preflightResult.updateTargets.length > 0) {
+          let shouldUpdate = options.updatePlugins ?? false;
+
+          if (!shouldUpdate && !options.yes) {
             console.log('');
-            ctx.output.warn(`Unreachable hosts will be skipped: ${unreachableHosts.join(', ')}`);
-
-            // Dynamic import of inquirer
             const inquirerModule = await import('inquirer');
             const inquirer = inquirerModule.default;
             const answers = await inquirer.prompt([{
               type: 'confirm',
-              name: 'continue',
-              message: 'Continue with deployment to reachable hosts?',
-              default: true,
-            }]) as { continue: boolean };
+              name: 'update',
+              message: 'Update plugins before deploying?',
+              default: false,
+            }]) as { update: boolean };
+            shouldUpdate = answers.update;
+          }
 
-            if (!answers.continue) {
-              ctx.output.info('Deployment cancelled');
-              return;
+          if (shouldUpdate) {
+            console.log('');
+            if (!isPlain) {
+              console.log(`${ANSI.bold}Updating plugins...${ANSI.reset}`);
             }
 
-            // Filter to only reachable hosts
-            config.hosts = config.hosts.filter(h =>
-              preflightResults.find(r => r.host === h)?.reachable
+            const updateResult = await executePluginUpdates(
+              preflightResult.updateTargets,
+              config.port,
+              isPlain
             );
-          }
-        }
 
-        // Plugin version check (after preflight so we know hosts are reachable)
-        if (!options.skipVersionCheck && !options.skipPreflight) {
-          progress.showVersionCheckHeader();
-
-          const versionResults: Array<{ host: string; result: PluginVersionCheckResult }> = [];
-          for (const host of config.hosts) {
-            const result = await checkPluginVersions(host, config.port);
-            versionResults.push({ host, result });
-            progress.showVersionCheckResult(host, result);
-          }
-
-          const hostsWithUpdates = versionResults.filter(r => r.result.success && r.result.response?.hasUpdates).length;
-          const hasUpdates = progress.showVersionSummary(hostsWithUpdates, config.hosts.length);
-
-          if (hasUpdates) {
-            if (options.updatePlugins) {
-              // Auto-update plugins
+            // Wait for agents to restart if needed
+            if (updateResult.hostsRestarting > 0) {
               console.log('');
-              let hostsRestarting = 0;
-
-              for (const { host, result } of versionResults) {
-                if (!result.success || !result.response?.hasUpdates) continue;
-
-                progress.showVersionUpdateHeader(host);
-                const updateResult = await triggerPluginUpdate(host, config.port);
-                progress.showVersionUpdateResult(host, updateResult);
-
-                if (updateResult.success && updateResult.response?.willRestart) {
-                  hostsRestarting++;
-                }
-              }
-
-              // If any agents are restarting, wait for them
-              if (hostsRestarting > 0) {
-                console.log('');
-                // Wait 25 seconds total for agents to restart (2s delay + 15s restart + buffer)
-                const RESTART_WAIT_TIME = 25;
-                for (let i = RESTART_WAIT_TIME; i > 0; i--) {
-                  progress.showAgentRestartWaiting(i);
-                  await new Promise(r => setTimeout(r, 1000));
-                }
-                progress.showAgentRestartComplete();
-              }
-            } else if (!options.yes) {
-              // Ask user if they want to update
-              console.log('');
-              const inquirerModule = await import('inquirer');
-              const inquirer = inquirerModule.default;
-              const answers = await inquirer.prompt([{
-                type: 'confirm',
-                name: 'update',
-                message: 'Update plugins before deploying?',
-                default: false,
-              }]) as { update: boolean };
-
-              if (answers.update) {
-                let hostsRestarting = 0;
-
-                for (const { host, result } of versionResults) {
-                  if (!result.success || !result.response?.hasUpdates) continue;
-
-                  progress.showVersionUpdateHeader(host);
-                  const updateResult = await triggerPluginUpdate(host, config.port);
-                  progress.showVersionUpdateResult(host, updateResult);
-
-                  if (updateResult.success && updateResult.response?.willRestart) {
-                    hostsRestarting++;
-                  }
-                }
-
-                // If any agents are restarting, wait for them
-                if (hostsRestarting > 0) {
-                  console.log('');
-                  const RESTART_WAIT_TIME = 25;
-                  for (let i = RESTART_WAIT_TIME; i > 0; i--) {
-                    progress.showAgentRestartWaiting(i);
-                    await new Promise(r => setTimeout(r, 1000));
-                  }
-                  progress.showAgentRestartComplete();
-                }
-              }
+              await waitForAgentRestart(25, isPlain);
             }
           }
         }
 
-        // Calculate local hashes once
-        const localHashes = await calculateWarHashes(warPath);
-
-        // ═══════════════════════════════════════════════════════════════════
-        // PRE-DEPLOYMENT ANALYSIS PHASE
-        // Analyze all hosts in parallel to determine what needs to be deployed
-        // ═══════════════════════════════════════════════════════════════════
-
-        unified.initHosts(config.hosts);
-        unified.setStrategy(getStrategyDisplayName(strategy));
-        unified.showAnalysisHeader();
-
-        // Analyze all hosts in parallel
-        const analysisPromises = config.hosts.map(host =>
-          analyzeHost(host, config.port, localHashes, options.force ?? false)
-        );
-        const analysisResults = await Promise.all(analysisPromises);
-
-        // Store analysis results and display
-        const analysisMap = new Map<string, HostAnalysis>();
-        for (const analysis of analysisResults) {
-          analysisMap.set(analysis.host, analysis);
-          unified.setHostAnalysis(analysis.host, analysis);
-          unified.showAnalysisResult(analysis);
-        }
-
-        // Show summary
-        const { totalFiles, totalBytes } = unified.showAnalysisSummary();
+        // Get analysis results from preflight
+        const analysisMap = preflightResult.analysisMap;
 
         // Check for failures in analysis
-        const failedAnalysis = analysisResults.filter(a => !a.success);
+        const failedAnalysis = reachableHosts.filter(h => !analysisMap.has(h) || !analysisMap.get(h)?.success);
         if (failedAnalysis.length > 0 && !options.yes) {
           console.log('');
           ctx.output.warn(`${failedAnalysis.length} host(s) failed analysis`);
@@ -300,7 +241,7 @@ export function registerDeployRunCommand(
         }
 
         // Filter to only successful analyses
-        const deployableHosts = config.hosts.filter(h => analysisMap.get(h)?.success);
+        const deployableHosts = reachableHosts.filter(h => analysisMap.get(h)?.success);
 
         if (deployableHosts.length === 0) {
           ctx.output.error('No hosts available for deployment');
@@ -314,7 +255,7 @@ export function registerDeployRunCommand(
         });
 
         if (hostsWithChanges.length === 0) {
-          if (!ctx.isPlainMode()) {
+          if (!isPlain) {
             console.log(`\n${ANSI.green}✓${ANSI.reset} All hosts up to date - no deployment needed`);
           } else {
             ctx.output.success('All hosts up to date - no deployment needed');
@@ -351,7 +292,7 @@ export function registerDeployRunCommand(
         });
 
         // Print final summary
-        printDeploymentSummary(deployResult, deployableHosts.length, ctx.isPlainMode());
+        printDeploymentSummary(deployResult, deployableHosts.length, isPlain);
 
         if (deployResult.failed > 0 || deployResult.aborted) {
           process.exit(1);

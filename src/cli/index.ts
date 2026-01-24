@@ -119,3 +119,16 @@ export type {
   DeployContext,
   ListrDeployOptions,
 } from './listr-deploy.js';
+
+// Listr-based preflight (parallel checks)
+export {
+  executePreflightChecks,
+  executePluginUpdates,
+  waitForAgentRestart,
+  printPreflightSummary,
+} from './listr-preflight.js';
+export type {
+  HostPreflightResult,
+  PreflightContext,
+  PreflightOptions,
+} from './listr-preflight.js';
