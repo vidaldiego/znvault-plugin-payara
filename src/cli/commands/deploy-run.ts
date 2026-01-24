@@ -342,6 +342,14 @@ export function registerDeployRunCommand(
         // Enable silent mode - UnifiedProgress handles display
         progress.setSilent(true);
 
+        // Wire up progress callbacks to forward updates to UnifiedProgress
+        progress.setOnProgress((host, filesUploaded, _bytesUploaded) => {
+          unified.updateHostProgress(host, filesUploaded, 0);
+        });
+        progress.setOnDeploying((host) => {
+          unified.setHostDeploying(host);
+        });
+
         // Deploy function for strategy executor
         const deployFn = async (host: string) => {
           const analysis = analysisMap.get(host);

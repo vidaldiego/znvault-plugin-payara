@@ -60,6 +60,7 @@ export async function triggerPluginUpdate(
     const response = await fetch(updateUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}), // Fastify requires a body when Content-Type is application/json
       signal: AbortSignal.timeout(180000), // 3 minute timeout for npm install
     });
 

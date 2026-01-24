@@ -45,6 +45,16 @@ export type { WarInfo } from './war-info.js';
  * Progress reporter for visual feedback
  * Implements ProgressCallback for use with pollDeploymentStatus
  */
+/**
+ * Callback for forwarding progress updates to UnifiedProgress
+ */
+export type OnProgressCallback = (host: string, filesUploaded: number, bytesUploaded: number) => void;
+
+/**
+ * Callback for forwarding deploy phase to UnifiedProgress
+ */
+export type OnDeployingCallback = (host: string) => void;
+
 export class ProgressReporter implements ProgressCallback {
   private isPlain: boolean;
   private currentHost = '';
@@ -52,9 +62,27 @@ export class ProgressReporter implements ProgressCallback {
   private maxFileDisplay = 5;
   /** When true, suppress per-host output (UnifiedProgress handles display) */
   private silent = false;
+  /** Callback to forward progress to UnifiedProgress */
+  private onProgress?: OnProgressCallback;
+  /** Callback to forward deploying state to UnifiedProgress */
+  private onDeploying?: OnDeployingCallback;
 
   constructor(isPlain: boolean) {
     this.isPlain = isPlain;
+  }
+
+  /**
+   * Set callback for forwarding progress to UnifiedProgress
+   */
+  setOnProgress(callback: OnProgressCallback): void {
+    this.onProgress = callback;
+  }
+
+  /**
+   * Set callback for forwarding deploy phase to UnifiedProgress
+   */
+  setOnDeploying(callback: OnDeployingCallback): void {
+    this.onDeploying = callback;
   }
 
   /**
@@ -362,6 +390,12 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   uploadProgress(sent: number, total: number, currentFiles?: string[]): void {
+    // Always call callback (for UnifiedProgress), even in silent mode
+    if (this.onProgress && this.currentHost) {
+      // Estimate bytes from file count (rough approximation)
+      this.onProgress(this.currentHost, sent, 0);
+    }
+
     if (this.silent) return;
     if (this.isPlain) {
       console.log(`  Sent ${sent}/${total} files`);
@@ -393,6 +427,11 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   deploying(): void {
+    // Always call callback (for UnifiedProgress), even in silent mode
+    if (this.onDeploying && this.currentHost) {
+      this.onDeploying(this.currentHost);
+    }
+
     if (this.silent) return;
     if (this.isPlain) {
       console.log('Deploying via asadmin...');
