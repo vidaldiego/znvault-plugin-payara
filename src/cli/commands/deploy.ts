@@ -278,8 +278,8 @@ export async function deployChunked(
     let sessionId: string | undefined;
     const totalFiles = changed.length;
 
-    // Initialize progress display
-    if (!ctx.isPlainMode()) {
+    // Initialize progress display (only for single-host mode, not when UnifiedProgress handles display)
+    if (!ctx.isPlainMode() && !progress.isSilent()) {
       // Print placeholder lines for progress display
       console.log(`  ${progressBar(0, totalFiles)} 0/${totalFiles} files`);
       console.log(`${ANSI.dim}  Recent files:${ANSI.reset}`);

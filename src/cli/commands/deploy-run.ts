@@ -339,6 +339,9 @@ export function registerDeployRunCommand(
 
         console.log('');
 
+        // Enable silent mode - UnifiedProgress handles display
+        progress.setSilent(true);
+
         // Deploy function for strategy executor
         const deployFn = async (host: string) => {
           const analysis = analysisMap.get(host);
@@ -357,8 +360,6 @@ export function registerDeployRunCommand(
           }
 
           unified.startHost(host);
-
-          // Use the existing progress reporter for this host
           progress.setHost(host);
 
           const result = await deployToHost(

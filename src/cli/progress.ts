@@ -50,9 +50,26 @@ export class ProgressReporter implements ProgressCallback {
   private currentHost = '';
   private lastFiles: string[] = [];
   private maxFileDisplay = 5;
+  /** When true, suppress per-host output (UnifiedProgress handles display) */
+  private silent = false;
 
   constructor(isPlain: boolean) {
     this.isPlain = isPlain;
+  }
+
+  /**
+   * Enable silent mode - suppresses per-host output for multi-host deployments
+   * where UnifiedProgress handles the display
+   */
+  setSilent(silent: boolean): void {
+    this.silent = silent;
+  }
+
+  /**
+   * Check if silent mode is enabled
+   */
+  isSilent(): boolean {
+    return this.silent;
   }
 
   showWarInfo(info: WarInfo): void {
@@ -247,6 +264,7 @@ export class ProgressReporter implements ProgressCallback {
 
   setHost(host: string): void {
     this.currentHost = host;
+    if (this.silent) return;
     if (!this.isPlain) {
       console.log(`\n${ANSI.bold}${ANSI.blue}▶ Deploying to ${host}${ANSI.reset}`);
     }
@@ -270,6 +288,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   diff(changed: number, deleted: number, changedFiles?: string[], deletedFiles?: string[]): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log(`Diff: ${changed} changed, ${deleted} deleted`);
       if (changedFiles && changedFiles.length > 0) {
@@ -314,6 +333,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   uploadingFullWar(): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log('Uploading full WAR file...');
     } else {
@@ -322,6 +342,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   uploadBytesProgress(uploaded: number, total: number): void {
+    if (this.silent) return;
     if (this.isPlain) {
       const pct = Math.round((uploaded / total) * 100);
       console.log(`  Uploaded ${formatSize(uploaded)}/${formatSize(total)} (${pct}%)`);
@@ -333,6 +354,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   uploadComplete(): void {
+    if (this.silent) return;
     if (!this.isPlain) {
       // Move to next line after progress
       process.stdout.write('\n');
@@ -340,6 +362,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   uploadProgress(sent: number, total: number, currentFiles?: string[]): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log(`  Sent ${sent}/${total} files`);
       return;
@@ -370,6 +393,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   deploying(): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log('Deploying via asadmin...');
     } else {
@@ -378,6 +402,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   deployed(result: DeployResult): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log(`Deployed: ${result.filesChanged} changed, ${result.filesDeleted} deleted (${formatDuration(result.deploymentTime)})`);
     } else {
@@ -389,6 +414,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   noChanges(): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log('No changes to deploy');
     } else {
@@ -397,6 +423,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   hashFetchFailed(reason: string, retriesUsed: number): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log(`WARNING: Hash fetch failed after ${retriesUsed} retries: ${reason}`);
       console.log('Falling back to full WAR upload');
@@ -407,6 +434,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   remoteHasNoWar(): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log('Remote has no WAR file (first deployment)');
     } else {
@@ -415,6 +443,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   failed(error: string): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log(`Failed: ${error}`);
     } else {
@@ -423,6 +452,7 @@ export class ProgressReporter implements ProgressCallback {
   }
 
   retrying(attempt: number, maxAttempts: number, delayMs: number, lastError?: string): void {
+    if (this.silent) return;
     const delaySec = Math.round(delayMs / 1000);
     if (this.isPlain) {
       console.log(`Retry ${attempt}/${maxAttempts} in ${delaySec}s${lastError ? `: ${lastError}` : ''}`);
@@ -436,6 +466,7 @@ export class ProgressReporter implements ProgressCallback {
    * Part of ProgressCallback interface
    */
   waitingForDeployment(elapsedSeconds: number, currentStep?: string): void {
+    if (this.silent) return;
     const stepInfo = currentStep ? ` (${currentStep})` : '';
     if (this.isPlain) {
       console.log(`  Waiting for deployment... ${elapsedSeconds}s${stepInfo}`);
@@ -449,6 +480,7 @@ export class ProgressReporter implements ProgressCallback {
    * Show that the request timed out but deployment may still be running
    */
   deploymentTimedOut(): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log('  Request timed out, checking deployment status...');
     } else {
@@ -460,6 +492,7 @@ export class ProgressReporter implements ProgressCallback {
    * Show that deployment is already in progress (409 response)
    */
   deploymentInProgress(): void {
+    if (this.silent) return;
     if (this.isPlain) {
       console.log('  Deployment already in progress, waiting for completion...');
     } else {
@@ -471,6 +504,7 @@ export class ProgressReporter implements ProgressCallback {
    * Clear the waiting line and move to next line
    */
   clearWaitingLine(): void {
+    if (this.silent) return;
     if (!this.isPlain) {
       process.stdout.write(`\r${ANSI.clearLine}`);
     }
