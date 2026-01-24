@@ -375,7 +375,7 @@ export class UnifiedProgress {
         } else {
           const bar = progressBar(progress.files, progress.totalFiles, 30);
           lines.push('');
-          lines.push(`  ${bar} ${pct}% ${ANSI.dim}(${progress.files}/${progress.totalFiles} files)${ANSI.reset}`);
+          lines.push(`  ${bar} ${ANSI.dim}(${progress.files}/${progress.totalFiles} files)${ANSI.reset}`);
           lines.push('');
         }
       }
