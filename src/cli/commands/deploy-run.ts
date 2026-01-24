@@ -24,10 +24,11 @@ import {
   getStrategyDisplayName,
 } from '../types.js';
 import { getErrorMessage } from '../../utils/error.js';
-import { analyzeHost, deployToHost } from './deploy.js';
-import { executeStrategy, resolveStrategy } from '../strategy-executor.js';
+import { analyzeHost } from './deploy.js';
+import { resolveStrategy } from '../strategy-executor.js';
 import { UnifiedProgress, type HostAnalysis } from '../unified-progress.js';
 import { formatSize } from '../formatters.js';
+import { executeListrDeployment, printDeploymentSummary } from '../listr-deploy.js';
 
 /**
  * Register deploy run command for multi-host deployment
@@ -334,82 +335,25 @@ export function registerDeployRunCommand(
 
         // ═══════════════════════════════════════════════════════════════════
         // DEPLOYMENT PHASE
-        // Deploy to hosts using the selected strategy
+        // Deploy to hosts using Listr2 for proper concurrent progress display
         // ═══════════════════════════════════════════════════════════════════
 
         console.log('');
 
-        // Enable silent mode - UnifiedProgress handles display
-        progress.setSilent(true);
-
-        // Wire up progress callbacks to forward updates to UnifiedProgress
-        progress.setOnProgress((host, filesUploaded, _bytesUploaded) => {
-          unified.updateHostProgress(host, filesUploaded, 0);
+        // Execute deployment using Listr2
+        const deployResult = await executeListrDeployment(strategy, deployableHosts, {
+          ctx,
+          warPath,
+          localHashes,
+          port: config.port,
+          force: options.force ?? false,
+          analysisMap,
         });
-        progress.setOnDeploying((host) => {
-          unified.setHostDeploying(host);
-        });
 
-        // Deploy function for strategy executor
-        const deployFn = async (host: string) => {
-          const analysis = analysisMap.get(host);
+        // Print final summary
+        printDeploymentSummary(deployResult, deployableHosts.length, ctx.isPlainMode());
 
-          // Skip hosts with no changes
-          if (analysis && analysis.filesChanged === 0 && analysis.filesDeleted === 0) {
-            unified.showNoChanges(host);
-            return { success: true, result: {
-              success: true,
-              filesChanged: 0,
-              filesDeleted: 0,
-              message: 'No changes',
-              deploymentTime: 0,
-              appName: '',
-            }};
-          }
-
-          unified.startHost(host);
-          progress.setHost(host);
-
-          const result = await deployToHost(
-            ctx,
-            host,
-            config.port,
-            warPath,
-            localHashes,
-            options.force ?? false,
-            progress
-          );
-
-          if (result.success) {
-            unified.setHostDeployed(host);
-          } else {
-            unified.setHostFailed(host, result.error ?? 'Unknown error');
-          }
-
-          return result;
-        };
-
-        // Execute deployment strategy
-        const executionResult = await executeStrategy(
-          strategy,
-          deployableHosts,
-          deployFn,
-          {
-            abortOnFailure: strategy.isCanary,
-            progress,
-          }
-        );
-
-        // Handle canary abort
-        if (executionResult.aborted) {
-          unified.showCanaryAbort(executionResult.failedBatch ?? 1, executionResult.skipped);
-        }
-
-        // Show final summary
-        unified.finalize();
-        const summary = unified.showSummary();
-
-        if (summary.failed > 0 || executionResult.aborted) {
+        if (deployResult.failed > 0 || deployResult.aborted) {
           process.exit(1);
         }
       } catch (err) {

@@ -109,3 +109,13 @@ export type {
   HostAnalysis,
   UnifiedProgressOptions,
 } from './unified-progress.js';
+
+// Listr-based deployment (concurrent progress)
+export {
+  executeListrDeployment,
+  printDeploymentSummary,
+} from './listr-deploy.js';
+export type {
+  DeployContext,
+  ListrDeployOptions,
+} from './listr-deploy.js';
