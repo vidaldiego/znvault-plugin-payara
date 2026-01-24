@@ -83,15 +83,36 @@ export async function writeSetenvConf(
 
   logger.info({ path: setenvPath, count: Object.keys(environment).length }, 'Writing setenv.conf');
 
-  // Write file (needs to be readable by payara user)
-  await writeFile(setenvPath, content, { mode: 0o640 });
+  const isRoot = process.getuid?.() === 0;
 
-  // Change ownership to payara user
-  if (process.getuid?.() === 0 && user) {
+  if (isRoot) {
+    // Running as root - direct file write
+    await writeFile(setenvPath, content, { mode: 0o640 });
+
+    // Change ownership to payara user
+    if (user) {
+      try {
+        await execAsync(`chown ${user}:${user} "${setenvPath}"`);
+      } catch (err) {
+        logger.warn({ err }, 'Failed to chown setenv.conf');
+      }
+    }
+  } else {
+    // Running as non-root - use sudo to write file
+    // This requires sudoers rule: user ALL=(root) NOPASSWD: /usr/bin/tee <setenvPath>
     try {
-      await execAsync(`chown ${user}:${user} "${setenvPath}"`);
+      // Use tee with sudo to write the file
+      const escapedContent = content.replace(/'/g, "'\\''");
+      await execAsync(`echo '${escapedContent}' | sudo tee "${setenvPath}" > /dev/null`);
+      await execAsync(`sudo chmod 640 "${setenvPath}"`);
+
+      // Change ownership to payara user
+      if (user) {
+        await execAsync(`sudo chown ${user}:${user} "${setenvPath}"`);
+      }
     } catch (err) {
-      logger.warn({ err }, 'Failed to chown setenv.conf');
+      logger.error({ err }, 'Failed to write setenv.conf with sudo');
+      throw err;
     }
   }
 }

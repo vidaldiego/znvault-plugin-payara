@@ -95,6 +95,18 @@ export class PayaraManager {
 
 
   /**
+   * Check if we need to use sudo to run commands as the target user.
+   * Returns true if a user is specified and we're not already that user.
+   */
+  private needsSudo(): boolean {
+    if (!this.user) return false;
+
+    // Get current username
+    const currentUser = process.env.USER || process.env.LOGNAME;
+    return currentUser !== this.user;
+  }
+
+  /**
    * Execute a command, optionally as a different user
    */
   private async execCommand(command: string, timeout?: number): Promise<{ stdout: string; stderr: string }> {
@@ -103,9 +115,9 @@ export class PayaraManager {
     // Build environment prefix for sudo
     const envPrefix = buildEnvPrefix();
 
-    // If running as root and user is specified, use sudo with env vars
+    // If user is specified and we're not that user, use sudo
     // The env vars are passed explicitly because sudo doesn't preserve them by default
-    const fullCommand = process.getuid?.() === 0 && this.user
+    const fullCommand = this.needsSudo()
       ? `sudo -u ${this.user} env ${envPrefix}${command}`
       : `${envPrefix}${command}`;
 
@@ -125,6 +137,36 @@ export class PayaraManager {
         command: sanitizeForLogging(command),
         code: error.code,
       }, 'Command failed');
+      throw err;
+    }
+  }
+
+  /**
+   * Execute a command as root (for process management operations).
+   * Uses sudo without -u flag to run as root.
+   */
+  private async execCommandAsRoot(command: string, timeout?: number): Promise<{ stdout: string; stderr: string }> {
+    const effectiveTimeout = timeout ?? this.operationTimeout;
+
+    // Use sudo to run as root if we're not already root
+    const fullCommand = process.getuid?.() === 0
+      ? command
+      : `sudo ${command}`;
+
+    this.logger.debug({ command }, 'Executing command as root');
+
+    try {
+      const result = await execAsync(fullCommand, {
+        timeout: effectiveTimeout,
+        shell: '/bin/bash',
+      });
+      return result;
+    } catch (err) {
+      const error = err as Error & { stdout?: string; stderr?: string; code?: number };
+      this.logger.error({
+        command: sanitizeForLogging(command),
+        code: error.code,
+      }, 'Root command failed');
       throw err;
     }
   }
@@ -507,7 +549,8 @@ export class PayaraManager {
     await killProcessesByPid(
       pids,
       'Payara',
-      (cmd, timeout) => this.execCommand(cmd, timeout),
+      // Use root executor for kill commands - requires sudo kill permissions
+      (cmd, timeout) => this.execCommandAsRoot(cmd, timeout),
       this.logger,
       () => this.getPayaraProcessPids()
     );
@@ -569,7 +612,8 @@ export class PayaraManager {
     await killProcessesByPkill(
       `-u ${this.user} java`,
       'Java',
-      (cmd, timeout) => this.execCommand(cmd, timeout),
+      // Use root executor for pkill commands - requires sudo pkill permissions
+      (cmd, timeout) => this.execCommandAsRoot(cmd, timeout),
       this.logger,
       () => this.hasJavaProcesses(),
       () => this.getJavaProcessPids()
