@@ -26,7 +26,7 @@ export type DeploymentStep =
  * File-based deployment lock with SIGTERM deferral.
  *
  * This class provides:
- * 1. A persistent lock file at /var/run/znvault-deploy.lock
+ * 1. A persistent lock file at /var/lib/zn-vault-agent/znvault-deploy.lock
  * 2. SIGTERM deferral during active deployments
  * 3. Lock file contains PID, timestamp, deployment ID, and current step
  *
@@ -51,7 +51,7 @@ export class DeploymentLock {
   private acquired = false;
   private currentDeploymentId: string | null = null;
 
-  constructor(logger: Logger, lockPath = '/var/run/znvault-deploy.lock') {
+  constructor(logger: Logger, lockPath = '/var/lib/zn-vault-agent/znvault-deploy.lock') {
     this.lockPath = lockPath;
     this.logger = logger;
   }
