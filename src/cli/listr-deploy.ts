@@ -167,36 +167,29 @@ export async function executeListrDeployment(
     const hostTasks = batchHosts.map(host => createHostTask(host, options));
 
     if (strategy.isCanary) {
-      // Canary: show batch grouping - must await subtasks to ensure sequential batch execution
+      // Canary: show batch grouping
       tasks.push({
         title: batchTitle,
-        task: async (ctx, task) => {
-          const subtasks = task.newListr(hostTasks, {
-            concurrent: batchHosts.length > 1,
-            exitOnError: true,
-            rendererOptions: {
-              collapseSubtasks: false,
-            },
-          });
-          // Explicitly run and await to ensure this batch completes before next batch starts
-          await subtasks.run(ctx);
-        },
+        task: (ctx, task) => task.newListr(hostTasks, {
+          concurrent: batchHosts.length > 1,
+          exitOnError: true,
+          rendererOptions: {
+            collapseSubtasks: false,
+          },
+        }),
         exitOnError: true,
       });
     } else if (strategy.batches[0]?.count === 'rest' || strategy.batches.length === 1) {
       // Parallel or sequential: flat list
       tasks.push(...hostTasks);
     } else {
-      // Multi-batch non-canary - await subtasks for proper sequencing
+      // Multi-batch non-canary
       tasks.push({
         title: batchTitle,
-        task: async (ctx, task) => {
-          const subtasks = task.newListr(hostTasks, {
-            concurrent: batchHosts.length > 1,
-            exitOnError: false,
-          });
-          await subtasks.run(ctx);
-        },
+        task: (ctx, task) => task.newListr(hostTasks, {
+          concurrent: batchHosts.length > 1,
+          exitOnError: false,
+        }),
       });
     }
   }
