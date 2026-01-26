@@ -149,6 +149,35 @@ export function getStrategyDisplayName(strategy: DeploymentStrategy): string {
 }
 
 /**
+ * Health check configuration for post-deployment verification
+ */
+export interface HealthCheckConfig {
+  /** URL path to check (e.g., "/api/health", "/health") */
+  path: string;
+  /** Port to check (default: 8080 for Payara apps) */
+  port?: number;
+  /** Expected HTTP status code (default: 200) */
+  expectedStatus?: number;
+  /** Request timeout in milliseconds (default: 5000) */
+  timeout?: number;
+  /** Number of retry attempts (default: 5) */
+  retries?: number;
+  /** Delay between retries in milliseconds (default: 3000) */
+  retryDelay?: number;
+}
+
+/**
+ * Health check result
+ */
+export interface HealthCheckResult {
+  success: boolean;
+  status?: number;
+  error?: string;
+  attempts: number;
+  totalTime: number;
+}
+
+/**
  * Deployment configuration
  */
 export interface DeployConfig {
@@ -168,6 +197,8 @@ export interface DeployConfig {
    */
   strategy?: string;
   description?: string;
+  /** Health check configuration for post-deployment verification */
+  healthCheck?: HealthCheckConfig;
 }
 
 /**

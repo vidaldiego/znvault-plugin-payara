@@ -2,7 +2,7 @@
 // Deploy config management commands
 
 import type { Command } from 'commander';
-import type { CLIPluginContext, DeployConfig } from '../types.js';
+import type { CLIPluginContext, DeployConfig, HealthCheckConfig } from '../types.js';
 import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
 import { getConfigOrExit, confirmPrompt, withErrorHandling } from './helpers.js';
@@ -132,6 +132,17 @@ export function registerConfigCommands(
             console.log(`    - ${host}`);
           }
         }
+        if (config.healthCheck) {
+          const hc = config.healthCheck;
+          console.log(`\n  Health Check:`);
+          console.log(`    Path:     ${hc.path}`);
+          console.log(`    Port:     ${hc.port ?? 8080}`);
+          console.log(`    Expected: HTTP ${hc.expectedStatus ?? 200}`);
+          console.log(`    Timeout:  ${hc.timeout ?? 5000}ms`);
+          console.log(`    Retries:  ${hc.retries ?? 5} (delay: ${hc.retryDelay ?? 3000}ms)`);
+        } else {
+          console.log(`\n  Health Check: ${ANSI.dim}(not configured)${ANSI.reset}`);
+        }
         console.log();
       }, 'Failed to show config');
     });
@@ -250,5 +261,72 @@ export function registerConfigCommands(
         await saveDeployConfigs(store);
         ctx.output.success(`Set ${key} = ${value}`);
       }, 'Failed to set config');
+    });
+
+  // deploy config health-check <name>
+  configCmd
+    .command('health-check <name>')
+    .description('Configure post-deployment health check')
+    .option('--path <path>', 'Health check URL path (e.g., /api/health)')
+    .option('--port <port>', 'Application port (default: 8080)', '8080')
+    .option('--status <code>', 'Expected HTTP status code (default: 200)', '200')
+    .option('--timeout <ms>', 'Request timeout in milliseconds (default: 5000)', '5000')
+    .option('--retries <n>', 'Number of retry attempts (default: 5)', '5')
+    .option('--retry-delay <ms>', 'Delay between retries in milliseconds (default: 3000)', '3000')
+    .option('--disable', 'Disable health check for this config')
+    .action(async (name: string, options: {
+      path?: string;
+      port: string;
+      status: string;
+      timeout: string;
+      retries: string;
+      retryDelay: string;
+      disable?: boolean;
+    }) => {
+      await withErrorHandling(ctx, async () => {
+        const { store, config } = await getConfigOrExit(ctx, name);
+
+        if (options.disable) {
+          delete config.healthCheck;
+          await saveDeployConfigs(store);
+          ctx.output.success(`Disabled health check for '${name}'`);
+          return;
+        }
+
+        if (!options.path && !config.healthCheck?.path) {
+          ctx.output.error('Health check path is required');
+          ctx.output.info('Usage: znvault deploy config health-check <name> --path /api/health');
+          process.exit(1);
+        }
+
+        const healthCheck: HealthCheckConfig = {
+          path: options.path ?? config.healthCheck?.path ?? '/health',
+          port: parseInt(options.port, 10),
+          expectedStatus: parseInt(options.status, 10),
+          timeout: parseInt(options.timeout, 10),
+          retries: parseInt(options.retries, 10),
+          retryDelay: parseInt(options.retryDelay, 10),
+        };
+
+        // Validate
+        if (isNaN(healthCheck.port!) || healthCheck.port! < 1 || healthCheck.port! > 65535) {
+          ctx.output.error(`Invalid port: ${options.port}`);
+          process.exit(1);
+        }
+        if (isNaN(healthCheck.expectedStatus!)) {
+          ctx.output.error(`Invalid status code: ${options.status}`);
+          process.exit(1);
+        }
+
+        config.healthCheck = healthCheck;
+        await saveDeployConfigs(store);
+
+        ctx.output.success(`Configured health check for '${name}'`);
+        ctx.output.info(`  Path:     ${healthCheck.path}`);
+        ctx.output.info(`  Port:     ${healthCheck.port}`);
+        ctx.output.info(`  Expected: HTTP ${healthCheck.expectedStatus}`);
+        ctx.output.info(`  Timeout:  ${healthCheck.timeout}ms`);
+        ctx.output.info(`  Retries:  ${healthCheck.retries} (delay: ${healthCheck.retryDelay}ms)`);
+      }, 'Failed to configure health check');
     });
 }

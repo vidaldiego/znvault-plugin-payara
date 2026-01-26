@@ -3,9 +3,10 @@
 
 import { Listr, ListrTask, PRESET_TIMER } from 'listr2';
 import type { WarFileHashes } from '../types.js';
-import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult } from './types.js';
+import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult, HealthCheckConfig } from './types.js';
 import type { HostAnalysis } from './unified-progress.js';
 import { deployToHost } from './commands/deploy.js';
+import { performHealthCheck } from './host-checks.js';
 import { ProgressReporter } from './progress.js';
 import { formatSize, formatDuration } from './formatters.js';
 
@@ -25,6 +26,8 @@ export interface DeployContext {
   successful: number;
   /** Failed count */
   failed: number;
+  /** Health check failures */
+  healthCheckFailed: number;
 }
 
 /**
@@ -37,6 +40,8 @@ export interface ListrDeployOptions {
   port: number;
   force: boolean;
   analysisMap: Map<string, HostAnalysis>;
+  /** Optional health check configuration */
+  healthCheck?: HealthCheckConfig;
 }
 
 /**
@@ -104,17 +109,50 @@ function createHostTask(
         progress
       );
 
-      const elapsed = formatDuration(Date.now() - startTime);
       ctx.results.set(host, result);
 
-      if (result.success) {
-        ctx.successful++;
-        task.title = `${host} - deployed (${elapsed})`;
-      } else {
+      if (!result.success) {
         ctx.failed++;
         const errorMsg = result.error?.substring(0, 50) ?? 'Unknown error';
         task.title = `${host} - FAILED: ${errorMsg}`;
         throw new Error(result.error ?? 'Deployment failed');
+      }
+
+      // Run health check if configured
+      if (options.healthCheck) {
+        task.output = 'Running health check...';
+
+        const healthResult = await performHealthCheck(
+          host,
+          options.healthCheck,
+          (attempt, maxAttempts, status, error) => {
+            if (error) {
+              task.output = `Health check attempt ${attempt}/${maxAttempts}: ${error}`;
+            } else if (status !== undefined) {
+              task.output = `Health check attempt ${attempt}/${maxAttempts}: HTTP ${status}`;
+            } else {
+              task.output = `Health check attempt ${attempt}/${maxAttempts}...`;
+            }
+          }
+        );
+
+        const elapsed = formatDuration(Date.now() - startTime);
+
+        if (healthResult.success) {
+          ctx.successful++;
+          task.title = `${host} - deployed + healthy (${elapsed})`;
+        } else {
+          ctx.healthCheckFailed++;
+          const errorMsg = healthResult.error ?? `HTTP ${healthResult.status}`;
+          task.title = `${host} - deployed but UNHEALTHY: ${errorMsg}`;
+          // In canary mode, health check failure should stop deployment
+          throw new Error(`Health check failed: ${errorMsg}`);
+        }
+      } else {
+        // No health check configured
+        const elapsed = formatDuration(Date.now() - startTime);
+        ctx.successful++;
+        task.title = `${host} - deployed (${elapsed})`;
       }
     },
     rendererOptions: {
@@ -141,6 +179,7 @@ export async function executeListrDeployment(
     skipped: 0,
     successful: 0,
     failed: 0,
+    healthCheckFailed: 0,
   };
 
   // Build tasks based on strategy
@@ -271,14 +310,15 @@ export function printDeploymentSummary(
 
   const skippedText = ctx.skipped > 0 ? `, ${ctx.skipped} skipped` : '';
   const failedText = ctx.failed > 0 ? `, ${ctx.failed} failed` : '';
+  const unhealthyText = ctx.healthCheckFailed > 0 ? `, ${ctx.healthCheckFailed} unhealthy` : '';
 
   if (isPlain) {
-    console.log(`Deployment complete: ${ctx.successful}/${totalHosts} hosts successful${failedText}${skippedText}`);
+    console.log(`Deployment complete: ${ctx.successful}/${totalHosts} hosts successful${failedText}${unhealthyText}${skippedText}`);
   } else {
-    if (ctx.failed === 0 && ctx.skipped === 0) {
+    if (ctx.failed === 0 && ctx.skipped === 0 && ctx.healthCheckFailed === 0) {
       console.log(`\x1b[32m\x1b[1m✓ Deployment complete\x1b[0m: ${ctx.successful}/${totalHosts} hosts successful`);
     } else {
-      console.log(`\x1b[33m\x1b[1m⚠ Deployment complete\x1b[0m: ${ctx.successful}/${totalHosts} hosts successful${failedText}${skippedText}`);
+      console.log(`\x1b[33m\x1b[1m⚠ Deployment complete\x1b[0m: ${ctx.successful}/${totalHosts} hosts successful${failedText}${unhealthyText}${skippedText}`);
     }
   }
 }

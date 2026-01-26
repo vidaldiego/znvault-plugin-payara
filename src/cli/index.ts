@@ -35,6 +35,8 @@ export type {
   DeployToHostResult,
   DeploymentStrategy,
   DeploymentStrategyBatch,
+  HealthCheckConfig,
+  HealthCheckResult,
 } from './types.js';
 
 // Strategy functions
@@ -87,6 +89,7 @@ export {
   checkPluginVersions,
   triggerPluginUpdate,
   checkHostReachable,
+  performHealthCheck,
 } from './host-checks.js';
 
 // Strategy executor

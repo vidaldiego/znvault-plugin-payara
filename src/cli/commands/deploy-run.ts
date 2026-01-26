@@ -289,6 +289,7 @@ export function registerDeployRunCommand(
           port: config.port,
           force: options.force ?? false,
           analysisMap,
+          healthCheck: config.healthCheck,
         });
 
         // Print final summary

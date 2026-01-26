@@ -9,8 +9,19 @@ import type {
   PluginUpdateResponse,
   PluginVersionCheckResult,
   TriggerUpdateResult,
+  HealthCheckConfig,
+  HealthCheckResult,
 } from './types.js';
 import type { PreflightResult } from './progress.js';
+
+/** Default health check configuration values */
+const HEALTH_CHECK_DEFAULTS = {
+  port: 8080,
+  expectedStatus: 200,
+  timeout: 5000,
+  retries: 5,
+  retryDelay: 3000,
+} as const;
 
 /**
  * Check plugin versions on a host
@@ -143,5 +154,81 @@ export async function checkHostReachable(
     host,
     reachable: false,
     error: lastError,
+  };
+}
+
+/**
+ * Perform post-deployment health check on the application
+ * Retries with configurable delay until success or max retries reached
+ *
+ * @param host Host address (IP or hostname)
+ * @param config Health check configuration
+ * @param onAttempt Optional callback for each attempt
+ * @returns Health check result
+ */
+export async function performHealthCheck(
+  host: string,
+  config: HealthCheckConfig,
+  onAttempt?: (attempt: number, maxAttempts: number, status?: number, error?: string) => void
+): Promise<HealthCheckResult> {
+  const port = config.port ?? HEALTH_CHECK_DEFAULTS.port;
+  const expectedStatus = config.expectedStatus ?? HEALTH_CHECK_DEFAULTS.expectedStatus;
+  const timeout = config.timeout ?? HEALTH_CHECK_DEFAULTS.timeout;
+  const maxRetries = config.retries ?? HEALTH_CHECK_DEFAULTS.retries;
+  const retryDelay = config.retryDelay ?? HEALTH_CHECK_DEFAULTS.retryDelay;
+
+  // Build health check URL
+  const path = config.path.startsWith('/') ? config.path : `/${config.path}`;
+  const url = `http://${host}:${port}${path}`;
+
+  const startTime = Date.now();
+  let lastStatus: number | undefined;
+  let lastError: string | undefined;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      onAttempt?.(attempt, maxRetries, undefined, undefined);
+
+      const response = await fetch(url, {
+        method: 'GET',
+        signal: AbortSignal.timeout(timeout),
+      });
+
+      lastStatus = response.status;
+
+      if (response.status === expectedStatus) {
+        return {
+          success: true,
+          status: response.status,
+          attempts: attempt,
+          totalTime: Date.now() - startTime,
+        };
+      }
+
+      // Wrong status code
+      lastError = `Expected ${expectedStatus}, got ${response.status}`;
+      onAttempt?.(attempt, maxRetries, response.status, lastError);
+    } catch (err) {
+      lastError = getErrorMessage(err);
+      if (lastError.includes('timeout') || lastError.includes('aborted')) {
+        lastError = 'Request timed out';
+      } else if (lastError.includes('ECONNREFUSED')) {
+        lastError = 'Connection refused';
+      }
+      onAttempt?.(attempt, maxRetries, undefined, lastError);
+    }
+
+    // Wait before retry (unless this was the last attempt)
+    if (attempt < maxRetries) {
+      await new Promise(r => setTimeout(r, retryDelay));
+    }
+  }
+
+  return {
+    success: false,
+    status: lastStatus,
+    error: lastError ?? 'Health check failed',
+    attempts: maxRetries,
+    totalTime: Date.now() - startTime,
   };
 }
