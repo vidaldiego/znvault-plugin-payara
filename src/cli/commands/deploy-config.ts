@@ -143,6 +143,19 @@ export function registerConfigCommands(
         } else {
           console.log(`\n  Health Check: ${ANSI.dim}(not configured)${ANSI.reset}`);
         }
+        // TLS configuration
+        if (config.tls && (config.tls.verify !== false || config.tls.httpsPort)) {
+          console.log(`\n  TLS:`);
+          console.log(`    Enabled:  ${config.tls.verify !== false ? ANSI.green + 'yes' + ANSI.reset : ANSI.yellow + 'no (insecure)' + ANSI.reset}`);
+          console.log(`    Port:     ${config.tls.httpsPort ?? 9443}`);
+          if (config.tls.useVaultCA) {
+            console.log(`    CA:       vault (auto-fetched)`);
+          } else if (config.tls.caCertPath) {
+            console.log(`    CA:       ${config.tls.caCertPath}`);
+          }
+        } else {
+          console.log(`\n  TLS: ${ANSI.dim}(not configured - using HTTP)${ANSI.reset}`);
+        }
         console.log();
       }, 'Failed to show config');
     });
@@ -223,7 +236,7 @@ export function registerConfigCommands(
   // deploy config set <name> <key> <value>
   configCmd
     .command('set <name> <key> <value>')
-    .description('Set a configuration value (war, port, strategy, parallel, description)')
+    .description('Set a configuration value (war, port, strategy, parallel, description, tls, tls-port)')
     .action(async (name: string, key: string, value: string) => {
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
@@ -252,9 +265,45 @@ export function registerConfigCommands(
           case 'desc':
             config.description = value;
             break;
+          case 'tls':
+            // Enable/disable TLS for this config
+            if (!config.tls) {
+              config.tls = {};
+            }
+            if (value.toLowerCase() === 'true' || value === '1') {
+              config.tls.verify = true;
+              config.tls.useVaultCA = true;
+              ctx.output.info('TLS enabled with vault CA. Run "znvault deploy tls setup" to fetch CA certificate.');
+            } else if (value.toLowerCase() === 'false' || value === '0') {
+              config.tls.verify = false;
+              config.tls.useVaultCA = false;
+            } else {
+              ctx.output.error('Invalid TLS value. Use "true" or "false"');
+              process.exit(1);
+            }
+            break;
+          case 'tls-port':
+          case 'tlsport':
+          case 'https-port':
+          case 'httpsport':
+            if (!config.tls) {
+              config.tls = { verify: true, useVaultCA: true };
+            }
+            config.tls.httpsPort = parsePort(value);
+            break;
+          case 'tls-ca':
+          case 'tlsca':
+          case 'ca-path':
+          case 'capath':
+            if (!config.tls) {
+              config.tls = { verify: true };
+            }
+            config.tls.caCertPath = value;
+            config.tls.useVaultCA = false;
+            break;
           default:
             ctx.output.error(`Unknown config key: ${key}`);
-            ctx.output.info('Valid keys: war, port, strategy, parallel, description');
+            ctx.output.info('Valid keys: war, port, strategy, parallel, description, tls, tls-port, tls-ca');
             process.exit(1);
         }
 

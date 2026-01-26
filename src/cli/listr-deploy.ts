@@ -9,6 +9,8 @@ import { deployToHost } from './commands/deploy.js';
 import { performHealthCheck } from './host-checks.js';
 import { ProgressReporter } from './progress.js';
 import { formatSize, formatDuration, formatTime } from './formatters.js';
+import type { ConnectionInfo } from './http-client.js';
+import { getTLSIndicator } from './http-client.js';
 
 /**
  * Context passed through Listr tasks
@@ -42,6 +44,10 @@ export interface ListrDeployOptions {
   analysisMap: Map<string, HostAnalysis>;
   /** Optional health check configuration */
   healthCheck?: HealthCheckConfig;
+  /** Whether to use HTTPS for agent connections */
+  useTLS?: boolean;
+  /** Connection info per host (for TLS auto-detection) */
+  connectionMap?: Map<string, ConnectionInfo>;
 }
 
 /**
@@ -52,18 +58,24 @@ function createHostTask(
   options: ListrDeployOptions
 ): ListrTask<DeployContext> {
   const analysis = options.analysisMap.get(host);
+  const connInfo = options.connectionMap?.get(host);
+  const isPlain = options.ctx.isPlainMode();
+
   const filesInfo = analysis
     ? `+${analysis.filesChanged} -${analysis.filesDeleted} (${formatSize(analysis.bytesToUpload)})`
     : '';
 
+  // Add TLS indicator to title if connection info available
+  const tlsIndicator = connInfo ? ` ${getTLSIndicator(connInfo, isPlain)}` : '';
+
   return {
-    title: `${host} ${filesInfo}`,
+    title: `${host}${tlsIndicator} ${filesInfo}`,
     task: async (ctx, task) => {
       const startTime = Date.now();
 
       // Skip hosts with no changes
       if (analysis && analysis.filesChanged === 0 && analysis.filesDeleted === 0) {
-        task.title = `${host} - no changes`;
+        task.title = `${host}${tlsIndicator} - no changes`;
         ctx.results.set(host, {
           success: true,
           result: {
@@ -99,14 +111,19 @@ function createHostTask(
 
       task.output = 'Starting deployment...';
 
+      // Use connection info if available, otherwise fall back to useTLS flag
+      const useTLS = connInfo?.tls ?? options.useTLS ?? false;
+      const port = connInfo?.port ?? options.port;
+
       const result = await deployToHost(
         options.ctx,
         host,
-        options.port,
+        port,
         options.warPath,
         options.localHashes,
         options.force,
-        progress
+        progress,
+        useTLS
       );
 
       ctx.results.set(host, result);
@@ -114,7 +131,7 @@ function createHostTask(
       if (!result.success) {
         ctx.failed++;
         const errorMsg = result.error?.substring(0, 50) ?? 'Unknown error';
-        task.title = `${host} - FAILED: ${errorMsg}`;
+        task.title = `${host}${tlsIndicator} - FAILED: ${errorMsg}`;
         throw new Error(result.error ?? 'Deployment failed');
       }
 
@@ -142,11 +159,11 @@ function createHostTask(
 
         if (healthResult.success) {
           ctx.successful++;
-          task.title = `${host} - deployed + healthy (${elapsed})${timeStr}`;
+          task.title = `${host}${tlsIndicator} - deployed + healthy (${elapsed})${timeStr}`;
         } else {
           ctx.healthCheckFailed++;
           const errorMsg = healthResult.error ?? `HTTP ${healthResult.status}`;
-          task.title = `${host} - deployed but UNHEALTHY: ${errorMsg}`;
+          task.title = `${host}${tlsIndicator} - deployed but UNHEALTHY: ${errorMsg}`;
           // In canary mode, health check failure should stop deployment
           throw new Error(`Health check failed: ${errorMsg}`);
         }
@@ -156,7 +173,7 @@ function createHostTask(
         const completedAt = result.result?.completedAt;
         const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
         ctx.successful++;
-        task.title = `${host} - deployed (${elapsed})${timeStr}`;
+        task.title = `${host}${tlsIndicator} - deployed (${elapsed})${timeStr}`;
       }
     },
     rendererOptions: {
@@ -292,6 +309,48 @@ export async function executeListrDeployment(
   }
 
   return ctx;
+}
+
+/**
+ * Print connection summary header before deployment
+ */
+export function printConnectionSummary(
+  connectionMap: Map<string, ConnectionInfo>,
+  isPlain: boolean
+): void {
+  const connections = Array.from(connectionMap.values());
+  const tlsCount = connections.filter(c => c.tls).length;
+  const httpCount = connections.filter(c => !c.tls).length;
+  const verifiedCount = connections.filter(c => c.tls && c.verified).length;
+
+  if (isPlain) {
+    if (tlsCount > 0 && httpCount > 0) {
+      console.log(`Connection: ${tlsCount} HTTPS, ${httpCount} HTTP`);
+    } else if (tlsCount > 0) {
+      const verifyText = verifiedCount === tlsCount
+        ? 'verified'
+        : verifiedCount > 0
+          ? `${verifiedCount} verified`
+          : 'unverified';
+      console.log(`Connection: HTTPS (${verifyText})`);
+    } else {
+      console.log('Connection: HTTP (unencrypted)');
+    }
+  } else {
+    if (tlsCount > 0 && httpCount > 0) {
+      console.log(`\x1b[36m🔐 Mixed:\x1b[0m ${tlsCount} \x1b[32mHTTPS\x1b[0m, ${httpCount} \x1b[33mHTTP\x1b[0m`);
+    } else if (tlsCount > 0) {
+      const icon = verifiedCount === tlsCount ? '🔒' : '🔐';
+      const verifyText = verifiedCount === tlsCount
+        ? '\x1b[32mverified\x1b[0m'
+        : verifiedCount > 0
+          ? `\x1b[36m${verifiedCount} verified\x1b[0m`
+          : '\x1b[36munverified\x1b[0m';
+      console.log(`\x1b[32m${icon} HTTPS\x1b[0m (${verifyText})`);
+    } else {
+      console.log('\x1b[33m🔓 HTTP\x1b[0m (unencrypted)');
+    }
+  }
 }
 
 /**

@@ -47,6 +47,8 @@ export interface PreflightOptions {
   force: boolean;
   skipVersionCheck: boolean;
   isPlain: boolean;
+  /** Whether to use HTTPS for agent connections */
+  useTLS?: boolean;
 }
 
 /**
@@ -67,7 +69,7 @@ function createHostPreflightTask(
 
       // Step 1: Check reachability
       task.output = 'Checking connectivity...';
-      const preflight = await checkHostReachable(host, options.port);
+      const preflight = await checkHostReachable(host, options.port, undefined, options.useTLS);
       result.preflight = preflight;
 
       if (!preflight.reachable) {
@@ -83,7 +85,7 @@ function createHostPreflightTask(
       // Step 2: Check plugin versions (if not skipped)
       if (!options.skipVersionCheck) {
         task.output = 'Checking plugin versions...';
-        const versionCheck = await checkPluginVersions(host, options.port);
+        const versionCheck = await checkPluginVersions(host, options.port, options.useTLS);
         result.versionCheck = versionCheck;
 
         if (versionCheck.success && versionCheck.response?.hasUpdates) {
@@ -94,7 +96,7 @@ function createHostPreflightTask(
 
       // Step 3: Analyze what needs to be deployed
       task.output = 'Analyzing deployment...';
-      const analysis = await analyzeHost(host, options.port, options.localHashes, options.force);
+      const analysis = await analyzeHost(host, options.port, options.localHashes, options.force, options.useTLS);
       result.analysis = analysis;
 
       if (analysis.success) {
@@ -157,7 +159,8 @@ export async function executePreflightChecks(
 export async function executePluginUpdates(
   targets: Array<{ host: string; result: PluginVersionCheckResult }>,
   port: number,
-  isPlain: boolean
+  isPlain: boolean,
+  useTLS = false
 ): Promise<{ hostsRestarting: number }> {
   let hostsRestarting = 0;
 
@@ -168,7 +171,7 @@ export async function executePluginUpdates(
       const plugins = updates.map(u => u.package).join(', ') || 'plugins';
       task.output = `Updating ${plugins}...`;
 
-      const updateResult = await triggerPluginUpdate(host, port);
+      const updateResult = await triggerPluginUpdate(host, port, useTLS);
 
       if (updateResult.success) {
         const count = updateResult.response?.updated ?? 0;

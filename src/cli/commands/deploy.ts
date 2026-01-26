@@ -36,16 +36,18 @@ export type { DeployOperationResult } from '../types.js';
  * @param port Agent port
  * @param localHashes Pre-calculated local WAR hashes
  * @param force If true, treat as full upload (skip remote hash fetch)
+ * @param useTLS If true, use HTTPS for agent connection
  * @returns Analysis result with file counts and sizes
  */
 export async function analyzeHost(
   host: string,
   port: number,
   localHashes: WarFileHashes,
-  force: boolean
+  force: boolean,
+  useTLS = false
 ): Promise<HostAnalysis> {
   try {
-    const pluginUrl = buildPluginUrl(host, port);
+    const pluginUrl = buildPluginUrl(host, port, useTLS);
 
     // If force mode, everything is a change
     if (force) {
@@ -404,10 +406,11 @@ export async function deployToHost(
   warPath: string,
   localHashes: WarFileHashes,
   force: boolean,
-  progress: ProgressReporter
+  progress: ProgressReporter,
+  useTLS = false
 ): Promise<DeployOperationResult> {
   try {
-    const pluginUrl = buildPluginUrl(host, port);
+    const pluginUrl = buildPluginUrl(host, port, useTLS);
 
     // Get remote hashes with retry logic
     let remoteHashes: WarFileHashes = {};

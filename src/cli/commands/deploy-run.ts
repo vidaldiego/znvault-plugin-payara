@@ -3,6 +3,9 @@
 
 import type { Command } from 'commander';
 import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { calculateWarHashes } from '../../war-deployer.js';
 import { loadDeployConfigs } from '../config-store.js';
 import {
@@ -13,6 +16,7 @@ import {
 import { ANSI } from '../constants.js';
 import {
   type CLIPluginContext,
+  type DeployConfig,
   parseDeploymentStrategy,
   getStrategyDisplayName,
 } from '../types.js';
@@ -26,6 +30,55 @@ import {
   waitForAgentRestart,
   printPreflightSummary,
 } from '../listr-preflight.js';
+import { configureTLS } from '../http-client.js';
+
+/** Default CA certificate path */
+const DEFAULT_CA_PATH = join(homedir(), '.znvault', 'ca', 'agent-tls-ca.pem');
+
+/**
+ * Configure TLS for deployment based on config settings
+ * Returns the effective port to use (HTTP or HTTPS)
+ */
+function configureTLSForDeployment(config: DeployConfig, ctx: CLIPluginContext): { port: number; useTLS: boolean } {
+  const tlsConfig = config.tls;
+
+  // No TLS configured - use HTTP
+  if (!tlsConfig || tlsConfig.verify === false) {
+    if (tlsConfig?.verify === false) {
+      // Explicitly disabled TLS verification (insecure mode)
+      configureTLS({ verify: false });
+      return { port: tlsConfig.httpsPort ?? 9443, useTLS: true };
+    }
+    return { port: config.port, useTLS: false };
+  }
+
+  // TLS enabled - determine CA certificate path
+  let caCertPath: string | undefined;
+
+  if (tlsConfig.caCertPath) {
+    // Explicit CA path provided
+    caCertPath = tlsConfig.caCertPath;
+  } else if (tlsConfig.useVaultCA !== false) {
+    // Use vault CA (default)
+    caCertPath = DEFAULT_CA_PATH;
+  }
+
+  // Verify CA certificate exists
+  if (caCertPath && !existsSync(caCertPath)) {
+    ctx.output.warn(`CA certificate not found at ${caCertPath}`);
+    ctx.output.info('Run "znvault deploy tls setup" to fetch CA from vault');
+    ctx.output.info('Falling back to HTTP (insecure)');
+    return { port: config.port, useTLS: false };
+  }
+
+  // Configure TLS
+  configureTLS({
+    verify: true,
+    caCertPath,
+  });
+
+  return { port: tlsConfig.httpsPort ?? 9443, useTLS: true };
+}
 
 /**
  * Register deploy run command for multi-host deployment
@@ -85,6 +138,9 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
+        // Configure TLS if enabled
+        const { port: effectivePort, useTLS } = configureTLSForDeployment(config, ctx);
+
         // Header with detailed WAR info
         if (!isPlain) {
           console.log(`\n${ANSI.bold}Deploying ${ANSI.cyan}${configName}${ANSI.reset}`);
@@ -92,6 +148,13 @@ export function registerDeployRunCommand(
           ctx.output.info(`Deploying ${configName}`);
         }
         progress.showWarInfo(warInfo);
+
+        // Show TLS status
+        if (useTLS && !isPlain) {
+          console.log(`${ANSI.dim}  TLS:      ${ANSI.reset}${ANSI.green}enabled${ANSI.reset} (HTTPS port ${effectivePort})`);
+        } else if (useTLS && isPlain) {
+          ctx.output.info(`  TLS: enabled (HTTPS port ${effectivePort})`);
+        }
 
         // Resolve deployment strategy
         const strategyString = resolveStrategy({
@@ -141,11 +204,12 @@ export function registerDeployRunCommand(
 
         const preflightResult = await executePreflightChecks({
           hosts: config.hosts,
-          port: config.port,
+          port: effectivePort,
           localHashes,
           force: options.force ?? false,
           skipVersionCheck: options.skipVersionCheck ?? options.skipPreflight ?? false,
           isPlain,
+          useTLS,
         });
 
         // Print summary
@@ -204,8 +268,9 @@ export function registerDeployRunCommand(
 
             const updateResult = await executePluginUpdates(
               preflightResult.updateTargets,
-              config.port,
-              isPlain
+              effectivePort,
+              isPlain,
+              useTLS
             );
 
             // Wait for agents to restart if needed
@@ -286,10 +351,11 @@ export function registerDeployRunCommand(
           ctx,
           warPath,
           localHashes,
-          port: config.port,
+          port: effectivePort,
           force: options.force ?? false,
           analysisMap,
           healthCheck: config.healthCheck,
+          useTLS,
         });
 
         // Print final summary
