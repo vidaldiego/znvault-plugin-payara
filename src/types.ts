@@ -250,6 +250,8 @@ export interface DeployResult {
   deployed?: boolean;
   /** List of all deployed applications */
   applications?: string[];
+  /** Unix timestamp when deployment completed */
+  completedAt?: number;
 }
 
 /**
@@ -315,6 +317,8 @@ export interface ChunkedDeployResponse {
   filesReceived: number;
   /** Whether deployment was committed */
   committed: boolean;
+  /** Unix timestamp when deployment completed (only if committed) */
+  completedAt?: number;
   /** Deployment result (only if committed) */
   result?: DeployResult;
 }

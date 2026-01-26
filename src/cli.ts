@@ -11,6 +11,7 @@ import {
   registerLifecycleCommands,
   registerDeployRunCommand,
   registerDeployWarCommand,
+  registerTLSCommands,
 } from './cli/commands/index.js';
 
 // Read version from package.json at module load time
@@ -61,6 +62,9 @@ export function createPayaraCLIPlugin(): CLIPlugin {
 
       // deploy restart, status, applications
       registerLifecycleCommands(deploy, ctx);
+
+      // deploy tls - TLS certificate management
+      registerTLSCommands(deploy, ctx);
     },
   };
 }

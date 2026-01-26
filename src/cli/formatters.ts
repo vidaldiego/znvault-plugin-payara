@@ -36,6 +36,14 @@ export function formatDate(date: Date): string {
 }
 
 /**
+ * Format timestamp to time only (HH:MM:SS)
+ */
+export function formatTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+/**
  * Create a progress bar string
  */
 export function progressBar(current: number, total: number, width = 30): string {

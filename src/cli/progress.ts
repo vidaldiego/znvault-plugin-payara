@@ -15,6 +15,7 @@ import {
   formatSize,
   formatDuration,
   formatDate,
+  formatTime,
   progressBar,
 } from './formatters.js';
 import type { WarInfo } from './war-info.js';
@@ -442,10 +443,11 @@ export class ProgressReporter implements ProgressCallback {
 
   deployed(result: DeployResult): void {
     if (this.silent) return;
+    const timeStr = result.completedAt ? ` - completed at ${formatTime(result.completedAt)}` : '';
     if (this.isPlain) {
-      console.log(`Deployed: ${result.filesChanged} changed, ${result.filesDeleted} deleted (${formatDuration(result.deploymentTime)})`);
+      console.log(`Deployed: ${result.filesChanged} changed, ${result.filesDeleted} deleted (${formatDuration(result.deploymentTime)})${timeStr}`);
     } else {
-      console.log(`  ${ANSI.green}✓ Deployed${ANSI.reset} ${result.filesChanged} changed, ${result.filesDeleted} deleted ${ANSI.dim}(${formatDuration(result.deploymentTime)})${ANSI.reset}`);
+      console.log(`  ${ANSI.green}✓ Deployed${ANSI.reset} ${result.filesChanged} changed, ${result.filesDeleted} deleted ${ANSI.dim}(${formatDuration(result.deploymentTime)})${timeStr}${ANSI.reset}`);
       if (result.applications && result.applications.length > 0) {
         console.log(`  ${ANSI.dim}  Applications: ${result.applications.join(', ')}${ANSI.reset}`);
       }

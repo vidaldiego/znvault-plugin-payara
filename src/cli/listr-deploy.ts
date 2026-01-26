@@ -8,7 +8,7 @@ import type { HostAnalysis } from './unified-progress.js';
 import { deployToHost } from './commands/deploy.js';
 import { performHealthCheck } from './host-checks.js';
 import { ProgressReporter } from './progress.js';
-import { formatSize, formatDuration } from './formatters.js';
+import { formatSize, formatDuration, formatTime } from './formatters.js';
 
 /**
  * Context passed through Listr tasks
@@ -137,10 +137,12 @@ function createHostTask(
         );
 
         const elapsed = formatDuration(Date.now() - startTime);
+        const completedAt = result.result?.completedAt;
+        const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
 
         if (healthResult.success) {
           ctx.successful++;
-          task.title = `${host} - deployed + healthy (${elapsed})`;
+          task.title = `${host} - deployed + healthy (${elapsed})${timeStr}`;
         } else {
           ctx.healthCheckFailed++;
           const errorMsg = healthResult.error ?? `HTTP ${healthResult.status}`;
@@ -151,8 +153,10 @@ function createHostTask(
       } else {
         // No health check configured
         const elapsed = formatDuration(Date.now() - startTime);
+        const completedAt = result.result?.completedAt;
+        const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
         ctx.successful++;
-        task.title = `${host} - deployed (${elapsed})`;
+        task.title = `${host} - deployed (${elapsed})${timeStr}`;
       }
     },
     rendererOptions: {

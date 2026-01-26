@@ -64,15 +64,19 @@ export async function registerDeployRoutes(
       // Deploy using asadmin deploy command (uses aggressive mode if configured)
       const result = await deployer.applyChangesAuto(changedFiles, deletions);
 
+      const completedAt = Date.now();
+
       if (result.success) {
         return {
           status: 'deployed',
+          completedAt,
           ...result,
         };
       } else {
         return reply.code(500).send({
           status: 'failed',
           error: 'Deployment failed',
+          completedAt,
           ...result,
         });
       }
@@ -100,10 +104,12 @@ export async function registerDeployRoutes(
 
       // Use deployAuto which respects aggressive mode
       const result = await deployer.deployAuto();
+      const completedAt = Date.now();
 
       return {
         status: result.deployed ? 'deployed' : 'failed',
         message: result.deployed ? 'Full deployment successful' : 'Deployment failed',
+        completedAt,
         deploymentTime: result.deploymentTime,
         deployed: result.deployed,
         applications: result.applications,
@@ -115,6 +121,7 @@ export async function registerDeployRoutes(
       return reply.code(500).send({
         error: 'Deployment failed',
         message: getErrorMessage(err),
+        completedAt: Date.now(),
       });
     }
   });
@@ -156,11 +163,13 @@ export async function registerDeployRoutes(
 
       // Deploy the WAR using asadmin deploy (respects aggressive mode)
       const result = await deployer.deployAuto();
+      const completedAt = Date.now();
 
       if (result.deployed) {
         return {
           status: 'deployed',
           message: 'WAR uploaded and deployed successfully via asadmin',
+          completedAt,
           size: warBuffer.length,
           deploymentTime: result.deploymentTime,
           deployed: true,
@@ -173,6 +182,7 @@ export async function registerDeployRoutes(
           status: 'failed',
           error: 'Deployment failed',
           message: 'WAR uploaded but deployment via asadmin failed',
+          completedAt,
           size: warBuffer.length,
           deploymentTime: result.deploymentTime,
           deployed: false,
@@ -184,6 +194,7 @@ export async function registerDeployRoutes(
       return reply.code(500).send({
         error: 'WAR upload failed',
         message: getErrorMessage(err),
+        completedAt: Date.now(),
       });
     }
   });
@@ -255,11 +266,13 @@ export async function registerDeployRoutes(
 
         // Deploy using asadmin deploy command (uses aggressive mode if configured)
         const result = await deployer.applyChangesAuto(changedFiles, session.deletions);
+        const completedAt = Date.now();
 
         // Clean up session
         sessionStore.delete(session.id);
 
         response.committed = true;
+        response.completedAt = completedAt;
         response.result = result;
       } catch (err) {
         // Clean up session on error
@@ -269,6 +282,7 @@ export async function registerDeployRoutes(
         return reply.code(500).send({
           error: 'Deployment failed',
           message: getErrorMessage(err),
+          completedAt: Date.now(),
         });
       }
     }

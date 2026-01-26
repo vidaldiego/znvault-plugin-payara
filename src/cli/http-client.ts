@@ -1,5 +1,5 @@
 // Path: src/cli/http-client.ts
-// HTTP client for agent communication
+// HTTP/HTTPS client for agent communication
 
 import type { DeployResult } from '../types.js';
 import type { AgentPostResult, DeploymentStatusResponse } from './types.js';
@@ -10,16 +10,101 @@ import {
   STATUS_POLL_MAX_WAIT_MS,
 } from './constants.js';
 import { getErrorMessage } from '../utils/error.js';
+import { readFileSync } from 'node:fs';
+import { Agent as HttpsAgent } from 'node:https';
+
+/**
+ * TLS configuration for HTTPS connections
+ */
+export interface TLSOptions {
+  /** Enable TLS verification (default: true) */
+  verify?: boolean;
+  /** Path to CA certificate file (PEM format) */
+  caCertPath?: string;
+  /** Inline CA certificate (PEM format) */
+  caCert?: string;
+}
+
+// Global TLS options for all requests
+let globalTLSOptions: TLSOptions = { verify: true };
+
+/**
+ * Configure TLS options for all HTTPS requests
+ */
+export function configureTLS(options: TLSOptions): void {
+  globalTLSOptions = { ...globalTLSOptions, ...options };
+}
+
+/**
+ * Get fetch options with TLS configuration for HTTPS URLs
+ */
+function getFetchOptions(url: string, baseOptions: RequestInit): RequestInit {
+  // Only apply TLS options for HTTPS URLs
+  if (!url.startsWith('https://')) {
+    return baseOptions;
+  }
+
+  const options: RequestInit & { dispatcher?: unknown } = { ...baseOptions };
+
+  // Note: Node.js native fetch doesn't support custom TLS options directly.
+  // We use undici's dispatcher option which is compatible with Node 18+
+  // For older Node versions or when using node-fetch, different approach is needed.
+
+  // For Bun runtime, TLS options are handled differently
+  if (typeof process !== 'undefined' && process.versions?.bun) {
+    // Bun uses native TLS options
+    if (!globalTLSOptions.verify) {
+      (options as Record<string, unknown>).tls = { rejectUnauthorized: false };
+    } else if (globalTLSOptions.caCertPath || globalTLSOptions.caCert) {
+      const ca = globalTLSOptions.caCert ??
+        (globalTLSOptions.caCertPath ? readFileSync(globalTLSOptions.caCertPath, 'utf-8') : undefined);
+      if (ca) {
+        (options as Record<string, unknown>).tls = { ca };
+      }
+    }
+    return options;
+  }
+
+  // For Node.js, we need to use the undici dispatcher
+  try {
+    // Dynamic import to avoid issues if undici is not available
+    const { Agent } = require('undici') as { Agent: new (options: Record<string, unknown>) => unknown };
+    const agentOptions: Record<string, unknown> = {};
+
+    if (!globalTLSOptions.verify) {
+      agentOptions.connect = { rejectUnauthorized: false };
+    } else if (globalTLSOptions.caCertPath || globalTLSOptions.caCert) {
+      const ca = globalTLSOptions.caCert ??
+        (globalTLSOptions.caCertPath ? readFileSync(globalTLSOptions.caCertPath, 'utf-8') : undefined);
+      if (ca) {
+        agentOptions.connect = { ca };
+      }
+    }
+
+    if (Object.keys(agentOptions).length > 0) {
+      options.dispatcher = new Agent(agentOptions) as RequestInit['dispatcher'];
+    }
+  } catch {
+    // undici not available, fall back to process.env workaround
+    if (!globalTLSOptions.verify) {
+      // WARNING: This disables TLS verification globally
+      process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+    }
+  }
+
+  return options;
+}
 
 /**
  * GET request to agent endpoint
  */
 export async function agentGet<T>(url: string, timeout = AGENT_TIMEOUT_MS): Promise<T> {
-  const response = await fetch(url, {
+  const options = getFetchOptions(url, {
     method: 'GET',
     headers: { 'Accept': 'application/json' },
     signal: AbortSignal.timeout(timeout),
   });
+  const response = await fetch(url, options);
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`Agent request failed: ${response.status} ${text}`);
@@ -37,7 +122,7 @@ export async function agentPostWithStatus<T>(
   timeout = DEPLOYMENT_TIMEOUT_MS
 ): Promise<AgentPostResult<T>> {
   try {
-    const response = await fetch(url, {
+    const options = getFetchOptions(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -46,6 +131,7 @@ export async function agentPostWithStatus<T>(
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeout),
     });
+    const response = await fetch(url, options);
 
     if (response.ok) {
       const data = await response.json() as T;
@@ -72,7 +158,7 @@ export async function agentPostWithStatus<T>(
  * Legacy agentPost for backwards compatibility (throws on non-2xx)
  */
 export async function agentPost<T>(url: string, body: unknown): Promise<T> {
-  const response = await fetch(url, {
+  const options = getFetchOptions(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -81,6 +167,7 @@ export async function agentPost<T>(url: string, body: unknown): Promise<T> {
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(AGENT_TIMEOUT_MS),
   });
+  const response = await fetch(url, options);
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`Agent request failed: ${response.status} ${text}`);
@@ -151,14 +238,17 @@ export async function pollDeploymentStatus(
  * 1. Host already includes protocol and port (e.g., http://host:9100)
  * 2. Host includes protocol but no port (e.g., http://host)
  * 3. Host is just hostname/IP (e.g., 172.16.220.55)
+ *
+ * @param useTLS - If true, use HTTPS protocol (default: false for backwards compat)
  */
-export function buildPluginUrl(host: string, defaultPort: number): string {
+export function buildPluginUrl(host: string, defaultPort: number, useTLS = false): string {
   const trimmed = host.replace(/\/$/, '');
+  const defaultProtocol = useTLS ? 'https' : 'http';
 
   // Parse the URL to check for existing port
   try {
     // Add protocol if missing for URL parsing
-    const urlString = trimmed.startsWith('http') ? trimmed : `http://${trimmed}`;
+    const urlString = trimmed.startsWith('http') ? trimmed : `${defaultProtocol}://${trimmed}`;
     const url = new URL(urlString);
 
     // If URL has a port explicitly set, use it; otherwise use defaultPort
@@ -166,7 +256,19 @@ export function buildPluginUrl(host: string, defaultPort: number): string {
     return `${url.protocol}//${url.hostname}:${effectivePort}/plugins/payara`;
   } catch {
     // Fallback for invalid URLs - just append port
-    const withProtocol = trimmed.startsWith('http') ? trimmed : `http://${trimmed}`;
+    const withProtocol = trimmed.startsWith('http') ? trimmed : `${defaultProtocol}://${trimmed}`;
     return `${withProtocol}:${defaultPort}/plugins/payara`;
   }
+}
+
+/**
+ * Build plugin URL with automatic TLS detection
+ * Uses HTTPS if TLS is configured, otherwise HTTP
+ */
+export function buildPluginUrlAuto(host: string, httpPort: number, httpsPort: number): string {
+  const useTLS = globalTLSOptions.caCertPath !== undefined ||
+                 globalTLSOptions.caCert !== undefined ||
+                 !globalTLSOptions.verify;
+  const port = useTLS ? httpsPort : httpPort;
+  return buildPluginUrl(host, port, useTLS);
 }

@@ -178,6 +178,20 @@ export interface HealthCheckResult {
 }
 
 /**
+ * TLS configuration for agent connections
+ */
+export interface DeployTLSConfig {
+  /** Enable TLS verification (default: true) */
+  verify?: boolean;
+  /** Path to CA certificate file (PEM format) */
+  caCertPath?: string;
+  /** Use vault's agent TLS CA (auto-fetched) */
+  useVaultCA?: boolean;
+  /** HTTPS port for agent connections (default: 9443) */
+  httpsPort?: number;
+}
+
+/**
  * Deployment configuration
  */
 export interface DeployConfig {
@@ -199,6 +213,8 @@ export interface DeployConfig {
   description?: string;
   /** Health check configuration for post-deployment verification */
   healthCheck?: HealthCheckConfig;
+  /** TLS configuration for secure agent connections */
+  tls?: DeployTLSConfig;
 }
 
 /**
