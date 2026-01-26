@@ -3,7 +3,7 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 import { writeFile, mkdir, rm, stat } from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { join, dirname, normalize, isAbsolute } from 'node:path';
 import AdmZip from 'adm-zip';
 import type { Logger } from 'pino';
 import type { PayaraManager } from './payara-manager.js';
@@ -15,6 +15,41 @@ import { getErrorMessage } from './utils/error.js';
 import { DeploymentStatusTracker } from './deployment-status.js';
 import type { DeploymentStatus } from './deployment-status.js';
 import { addDirectoryToZip } from './utils/zip.js';
+
+/**
+ * Validate and sanitize a file path to prevent directory traversal attacks.
+ * Ensures the path stays within the specified base directory.
+ *
+ * @param basePath - The base directory that files must stay within
+ * @param filePath - The relative file path to validate
+ * @returns The safe, absolute path within basePath
+ * @throws Error if path would escape basePath
+ */
+export function getSafePath(basePath: string, filePath: string): string {
+  // Normalize the path to resolve . and .. components
+  const normalizedPath = normalize(filePath);
+
+  // Reject absolute paths
+  if (isAbsolute(normalizedPath)) {
+    throw new Error(`Path traversal attempt: absolute path not allowed: ${filePath}`);
+  }
+
+  // Reject paths that start with ..
+  if (normalizedPath.startsWith('..')) {
+    throw new Error(`Path traversal attempt: path escapes base directory: ${filePath}`);
+  }
+
+  // Join with base and normalize again
+  const fullPath = normalize(join(basePath, normalizedPath));
+
+  // Verify the resolved path is still within basePath
+  // This catches cases like "foo/../../bar" that normalize to "../bar"
+  if (!fullPath.startsWith(basePath)) {
+    throw new Error(`Path traversal attempt: resolved path escapes base: ${filePath}`);
+  }
+
+  return fullPath;
+}
 
 // Re-export WAR utilities for backwards compatibility
 export { calculateDiff, calculateWarHashes, getWarEntry } from './war-utils.js';
@@ -179,10 +214,10 @@ export class WarDeployer {
         zip.extractAllTo(tempDir, true);
       }
 
-      // Apply deletions
+      // Apply deletions (with path traversal protection)
       for (const file of deletedFiles) {
-        const fullPath = join(tempDir, file);
         try {
+          const fullPath = getSafePath(tempDir, file);
           await rm(fullPath, { force: true });
           this.logger.debug({ file }, 'Deleted file');
         } catch (err) {
@@ -190,9 +225,9 @@ export class WarDeployer {
         }
       }
 
-      // Apply changes
+      // Apply changes (with path traversal protection)
       for (const { path, content } of changedFiles) {
-        const fullPath = join(tempDir, path);
+        const fullPath = getSafePath(tempDir, path);
         const dir = dirname(fullPath);
 
         // Ensure parent directory exists
@@ -270,19 +305,19 @@ export class WarDeployer {
         zip.extractAllTo(tempDir, true);
       }
 
-      // Apply deletions
+      // Apply deletions (with path traversal protection)
       for (const file of deletedFiles) {
-        const fullPath = join(tempDir, file);
         try {
+          const fullPath = getSafePath(tempDir, file);
           await rm(fullPath, { force: true });
         } catch {
-          // Ignore deletion errors
+          // Ignore deletion errors (including path traversal rejections)
         }
       }
 
-      // Apply changes
+      // Apply changes (with path traversal protection)
       for (const { path, content } of changedFiles) {
-        const fullPath = join(tempDir, path);
+        const fullPath = getSafePath(tempDir, path);
         await mkdir(dirname(fullPath), { recursive: true });
         await writeFile(fullPath, content);
       }
@@ -560,27 +595,24 @@ export class WarDeployer {
     changedFiles: FileChange[],
     deletedFiles: string[]
   ): Promise<FullDeployResult> {
+    // Check in-memory lock first (quick check for same-process concurrency)
     if (this.deployLock) {
       throw new Error('Deployment already in progress');
     }
 
-    // Check for file-based lock (another process)
-    const { locked, data } = await this.fileLock.isLocked();
-    if (locked && data) {
-      throw new Error(
-        `Another deployment is in progress: ${data.deploymentId} ` +
-        `(started ${Math.round((Date.now() - data.started) / 1000)}s ago, step: ${data.step})`
-      );
-    }
-
-    this.deployLock = true;
     const startTime = Date.now();
     const deploymentId = `deploy-${Date.now()}-${randomBytes(4).toString('hex')}`;
     const timings: FullDeployResult['timings'] = {};
 
+    // Acquire file-based lock FIRST (handles cross-process concurrency + SIGTERM deferral)
+    // This also checks for stale locks and cleans them up
+    // If this throws, we don't set in-memory lock (desired behavior)
+    await this.fileLock.acquire(deploymentId);
+
+    // Only set in-memory lock after file lock is successfully acquired
+    this.deployLock = true;
+
     try {
-      // Acquire file-based lock (defers SIGTERM)
-      await this.fileLock.acquire(deploymentId);
 
       // Start deployment journal
       await this.journal.start({

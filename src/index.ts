@@ -104,6 +104,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         healthEndpoint: config.healthEndpoint,
         healthCheckTimeout: config.healthCheckTimeout,
         operationTimeout: config.operationTimeout,
+        deployTimeout: config.deployTimeout,
         logger: pluginLogger,
         environment: secretsEnv,
         passwordFile: config.passwordFile,

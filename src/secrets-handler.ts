@@ -75,10 +75,15 @@ export async function verifyApiKeyFile(
     if (fileKey === expectedKey) {
       return { valid: true, fileKey };
     } else {
+      // Log minimal info to avoid exposing API key material
+      // Only log length difference and first 4 chars (safe prefix for debugging)
+      const SAFE_PREFIX_LEN = 4;
       logger.error({
         path: filePath,
-        expectedPrefix: expectedKey.substring(0, 20),
-        filePrefix: fileKey.substring(0, 20),
+        expectedLength: expectedKey.length,
+        fileLength: fileKey.length,
+        expectedPrefix: expectedKey.substring(0, SAFE_PREFIX_LEN) + '...',
+        filePrefix: fileKey.substring(0, SAFE_PREFIX_LEN) + '...',
       }, 'CRITICAL: API key file MISMATCH - file contains different key than agent');
       return { valid: false, fileKey, error: 'Key mismatch' };
     }

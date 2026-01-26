@@ -30,6 +30,7 @@ export class PayaraManager {
   private readonly healthEndpoint?: string;
   private readonly healthCheckTimeout: number;
   private readonly operationTimeout: number;
+  private readonly deployTimeout: number;
   private readonly logger: Logger;
   private environment: Record<string, string>;
   private readonly passwordFile?: string;
@@ -44,6 +45,9 @@ export class PayaraManager {
     this.healthEndpoint = options.healthEndpoint;
     this.healthCheckTimeout = options.healthCheckTimeout ?? 30000;
     this.operationTimeout = options.operationTimeout ?? 120000;
+    // Deploy timeout should be longer than operation timeout (default 10 minutes)
+    // Deployment can take a long time for large WARs
+    this.deployTimeout = options.deployTimeout ?? 600000;
     this.logger = options.logger;
     this.environment = options.environment ?? {};
     this.passwordFile = options.passwordFile;
@@ -229,16 +233,14 @@ export class PayaraManager {
       return this.isRunning();
     }
 
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), this.healthCheckTimeout);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.healthCheckTimeout);
 
+    try {
       const response = await fetch(this.healthEndpoint, {
         signal: controller.signal,
         headers: { 'Accept': 'application/json' },
       });
-
-      clearTimeout(timeout);
 
       if (!response.ok) {
         this.logger.warn({ status: response.status }, 'Health check returned non-OK status');
@@ -249,6 +251,9 @@ export class PayaraManager {
     } catch (err) {
       this.logger.debug({ err, endpoint: this.healthEndpoint }, 'Health check failed');
       return false;
+    } finally {
+      // Always clear timeout to prevent memory leak
+      clearTimeout(timeout);
     }
   }
 
@@ -366,7 +371,8 @@ export class PayaraManager {
     args.push(warPath);
 
     try {
-      await this.asadminCommand(args);
+      // Use longer deploy timeout (default 10 minutes) as deployment can take a while
+      await this.asadminCommand(args, this.deployTimeout);
       this.logger.info({ appName }, 'Application deployed');
     } catch (err) {
       const error = err as Error & { stderr?: string };
@@ -380,8 +386,8 @@ export class PayaraManager {
         } catch {
           // Ignore undeploy errors
         }
-        // Retry deploy
-        await this.asadminCommand(args);
+        // Retry deploy with longer timeout
+        await this.asadminCommand(args, this.deployTimeout);
         this.logger.info({ appName }, 'Application deployed after aggressive cleanup');
       } else {
         throw err;

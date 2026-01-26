@@ -136,12 +136,18 @@ export class SessionStore {
   cleanup(): void {
     const now = Date.now();
 
-    // First pass: remove expired sessions
+    // First pass: collect expired session IDs (don't delete during iteration)
+    const expiredIds: string[] = [];
     for (const [id, session] of this.sessions.entries()) {
       if (now - session.createdAt > this.timeoutMs) {
-        this.sessions.delete(id);
-        this.logger.debug({ sessionId: id }, 'Removed expired chunk session');
+        expiredIds.push(id);
       }
+    }
+
+    // Delete expired sessions
+    for (const id of expiredIds) {
+      this.sessions.delete(id);
+      this.logger.debug({ sessionId: id }, 'Removed expired chunk session');
     }
 
     // Second pass: enforce max sessions via LRU eviction

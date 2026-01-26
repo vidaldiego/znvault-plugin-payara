@@ -56,6 +56,12 @@ export interface PayaraPluginConfig {
   /** Timeout for Payara start/stop operations in milliseconds (default: 120000) */
   operationTimeout?: number;
 
+  /**
+   * Timeout for deploy commands in milliseconds (default: 600000 = 10 minutes).
+   * Deploy operations can take longer than regular operations for large WARs.
+   */
+  deployTimeout?: number;
+
   /** Deploy context root (default: /) */
   contextRoot?: string;
 
@@ -157,6 +163,11 @@ export interface PayaraManagerOptions {
   healthEndpoint?: string;
   healthCheckTimeout?: number;
   operationTimeout?: number;
+  /**
+   * Timeout for deploy commands in milliseconds (default: 600000 = 10 minutes).
+   * Deploy operations can take longer than regular operations for large WARs.
+   */
+  deployTimeout?: number;
   logger: Logger;
   /** Environment variables to pass to Payara processes */
   environment?: Record<string, string>;

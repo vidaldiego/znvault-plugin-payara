@@ -1,13 +1,70 @@
 // Path: src/payara-env.ts
 // Payara environment configuration utilities
 
-import { exec } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { join } from 'node:path';
 import { writeFile } from 'node:fs/promises';
 import type { Logger } from 'pino';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+/**
+ * Execute a command with stdin input using spawn.
+ * Safer than shell interpolation for passing content.
+ */
+async function execWithStdin(
+  command: string,
+  args: string[],
+  stdin: string
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args, {
+      stdio: ['pipe', 'ignore', 'pipe'],
+    });
+
+    let stderr = '';
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`Command failed with code ${code}: ${stderr}`));
+      }
+    });
+
+    proc.stdin.write(stdin);
+    proc.stdin.end();
+  });
+}
+
+/** Pattern for validating safe usernames (prevents shell injection) */
+export const SAFE_USERNAME_PATTERN = /^[a-zA-Z_][a-zA-Z0-9_-]*$/;
+
+/** Pattern for validating safe paths (no shell metacharacters) */
+export const SAFE_PATH_PATTERN = /^[a-zA-Z0-9_./-]+$/;
+
+/**
+ * Validate that a username is safe for shell commands.
+ * @returns true if valid, false otherwise
+ */
+export function isValidUsername(username: string): boolean {
+  return SAFE_USERNAME_PATTERN.test(username);
+}
+
+/**
+ * Validate that a value is safe for shell interpolation.
+ * Throws if the value contains potentially dangerous characters.
+ */
+export function validateSafeValue(value: string, context: string): void {
+  if (!SAFE_PATH_PATTERN.test(value)) {
+    throw new Error(`Unsafe ${context}: contains shell metacharacters: ${value}`);
+  }
+}
 
 /**
  * Options for setenv.conf writer
@@ -91,8 +148,13 @@ export async function writeSetenvConf(
 
     // Change ownership to payara user
     if (user) {
+      // Validate username to prevent injection
+      if (!SAFE_USERNAME_PATTERN.test(user)) {
+        throw new Error(`Invalid username format: ${user}`);
+      }
       try {
-        await execAsync(`chown ${user}:${user} "${setenvPath}"`);
+        // Use execFile for safe command execution (no shell)
+        await execFileAsync('chown', [`${user}:${user}`, setenvPath]);
       } catch (err) {
         logger.warn({ err }, 'Failed to chown setenv.conf');
       }
@@ -101,14 +163,23 @@ export async function writeSetenvConf(
     // Running as non-root - use sudo to write file
     // This requires sudoers rule: user ALL=(root) NOPASSWD: /usr/bin/tee <setenvPath>
     try {
-      // Use tee with sudo to write the file
-      const escapedContent = content.replace(/'/g, "'\\''");
-      await execAsync(`echo '${escapedContent}' | sudo tee "${setenvPath}" > /dev/null`);
-      await execAsync(`sudo chmod 640 "${setenvPath}"`);
+      // Validate path before using in shell commands
+      validateSafeValue(setenvPath, 'setenv path');
+
+      // Use spawn with sudo tee for safer command execution
+      // Write content via stdin to avoid shell interpretation
+      await execWithStdin('sudo', ['tee', setenvPath], content);
+
+      // Set permissions using execFile (no shell)
+      await execFileAsync('sudo', ['chmod', '640', setenvPath]);
 
       // Change ownership to payara user
       if (user) {
-        await execAsync(`sudo chown ${user}:${user} "${setenvPath}"`);
+        // Validate username to prevent injection
+        if (!SAFE_USERNAME_PATTERN.test(user)) {
+          throw new Error(`Invalid username format: ${user}`);
+        }
+        await execFileAsync('sudo', ['chown', `${user}:${user}`, setenvPath]);
       }
     } catch (err) {
       logger.error({ err }, 'Failed to write setenv.conf with sudo');

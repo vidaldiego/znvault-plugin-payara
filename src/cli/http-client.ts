@@ -131,10 +131,10 @@ export async function pollDeploymentStatus(
       if (status.deploying) {
         const elapsed = Math.round((Date.now() - pollStart) / 1000);
         progress.waitingForDeployment(elapsed, status.currentStep);
-      } else if (status.appDeployed && status.healthy) {
-        // Not deploying but app is deployed and healthy - likely completed
-        return { success: true };
       }
+      // NOTE: We intentionally do NOT return early based on appDeployed && healthy
+      // because that could be from a PREVIOUS deployment. We MUST wait for
+      // lastCompletedAt > startedAfter to confirm THIS deployment finished.
 
       await new Promise(r => setTimeout(r, STATUS_POLL_INTERVAL_MS));
     } catch {
