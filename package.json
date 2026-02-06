@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-payara",
-  "version": "1.16.0",
+  "version": "1.16.1",
   "description": "Payara application server plugin for zn-vault-agent with WAR diff deployment",
   "type": "module",
   "main": "dist/index.js",
@@ -52,7 +52,7 @@
     "url": "git+https://github.com/vidaldiego/znvault-plugin-payara.git"
   },
   "peerDependencies": {
-    "@zincapp/zn-vault-agent": ">=1.14.0",
+    "@zincapp/zn-vault-agent": ">=1.20.14",
     "@zincapp/znvault-cli": ">=2.11.0"
   },
   "peerDependenciesMeta": {
