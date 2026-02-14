@@ -3,7 +3,7 @@
 
 import { Listr, ListrTask, PRESET_TIMER } from 'listr2';
 import type { WarFileHashes } from '../types.js';
-import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult, HealthCheckConfig } from './types.js';
+import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult, HealthCheckConfig, HAProxyConfig } from './types.js';
 import type { HostAnalysis } from './unified-progress.js';
 import { deployToHost } from './commands/deploy.js';
 import { performHealthCheck } from './host-checks.js';
@@ -11,6 +11,7 @@ import { ProgressReporter } from './progress.js';
 import { formatSize, formatDuration, formatTime } from './formatters.js';
 import type { ConnectionInfo } from './http-client.js';
 import { getTLSIndicator } from './http-client.js';
+import { drainServer, readyServer } from './haproxy.js';
 
 /**
  * Context passed through Listr tasks
@@ -48,6 +49,8 @@ export interface ListrDeployOptions {
   useTLS?: boolean;
   /** Connection info per host (for TLS auto-detection) */
   connectionMap?: Map<string, ConnectionInfo>;
+  /** HAProxy drain/ready configuration */
+  haproxy?: HAProxyConfig;
 }
 
 /**
@@ -91,89 +94,122 @@ function createHostTask(
         return;
       }
 
-      // Create a silent progress reporter for this host
-      const progress = new ProgressReporter(options.ctx.isPlainMode());
-      progress.setSilent(true);
-      progress.setHost(host);
+      // HAProxy drain/ready wrapping
+      const shouldDrain = options.haproxy && options.haproxy.serverMap[host];
+      let drained = false;
 
-      // Update task output as deployment progresses
-      let lastProgress = '';
-      progress.setOnProgress((_host, filesUploaded, _bytes) => {
-        const total = analysis?.filesChanged ?? 0;
-        const pct = total > 0 ? Math.round((filesUploaded / total) * 100) : 0;
-        lastProgress = `Uploading ${filesUploaded}/${total} files (${pct}%)`;
-        task.output = lastProgress;
-      });
-
-      progress.setOnDeploying(() => {
-        task.output = 'Deploying via asadmin...';
-      });
-
-      task.output = 'Starting deployment...';
-
-      // Use connection info if available, otherwise fall back to useTLS flag
-      const useTLS = connInfo?.tls ?? options.useTLS ?? false;
-      const port = connInfo?.port ?? options.port;
-
-      const result = await deployToHost(
-        options.ctx,
-        host,
-        port,
-        options.warPath,
-        options.localHashes,
-        options.force,
-        progress,
-        useTLS
-      );
-
-      ctx.results.set(host, result);
-
-      if (!result.success) {
-        ctx.failed++;
-        const errorMsg = result.error?.substring(0, 50) ?? 'Unknown error';
-        task.title = `${host}${tlsIndicator} - FAILED: ${errorMsg}`;
-        throw new Error(result.error ?? 'Deployment failed');
-      }
-
-      // Run health check if configured
-      if (options.healthCheck) {
-        task.output = 'Running health check...';
-
-        const healthResult = await performHealthCheck(
-          host,
-          options.healthCheck,
-          (attempt, maxAttempts, status, error) => {
-            if (error) {
-              task.output = `Health check attempt ${attempt}/${maxAttempts}: ${error}`;
-            } else if (status !== undefined) {
-              task.output = `Health check attempt ${attempt}/${maxAttempts}: HTTP ${status}`;
-            } else {
-              task.output = `Health check attempt ${attempt}/${maxAttempts}...`;
-            }
+      try {
+        // --- Drain from HAProxy ---
+        if (shouldDrain) {
+          task.output = 'Draining from HAProxy...';
+          const drainResult = await drainServer(options.haproxy!, host);
+          if (!drainResult.success) {
+            const failedHosts = drainResult.results.filter(r => !r.success).map(r => `${r.host}: ${r.error}`);
+            throw new Error(`HAProxy drain failed: ${failedHosts.join('; ')}`);
           }
+          drained = true;
+          const waitSec = options.haproxy!.drainWaitSeconds ?? 5;
+          task.output = `Drain wait (${waitSec}s)...`;
+          await new Promise(resolve => setTimeout(resolve, waitSec * 1000));
+        }
+
+        // --- Deploy ---
+        // Create a silent progress reporter for this host
+        const progress = new ProgressReporter(options.ctx.isPlainMode());
+        progress.setSilent(true);
+        progress.setHost(host);
+
+        // Update task output as deployment progresses
+        let lastProgress = '';
+        progress.setOnProgress((_host, filesUploaded, _bytes) => {
+          const total = analysis?.filesChanged ?? 0;
+          const pct = total > 0 ? Math.round((filesUploaded / total) * 100) : 0;
+          lastProgress = `Uploading ${filesUploaded}/${total} files (${pct}%)`;
+          task.output = lastProgress;
+        });
+
+        progress.setOnDeploying(() => {
+          task.output = 'Deploying via asadmin...';
+        });
+
+        task.output = 'Starting deployment...';
+
+        // Use connection info if available, otherwise fall back to useTLS flag
+        const useTLS = connInfo?.tls ?? options.useTLS ?? false;
+        const port = connInfo?.port ?? options.port;
+
+        const result = await deployToHost(
+          options.ctx,
+          host,
+          port,
+          options.warPath,
+          options.localHashes,
+          options.force,
+          progress,
+          useTLS
         );
 
-        const elapsed = formatDuration(Date.now() - startTime);
-        const completedAt = result.result?.completedAt;
-        const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
+        ctx.results.set(host, result);
 
-        if (healthResult.success) {
-          ctx.successful++;
-          task.title = `${host}${tlsIndicator} - deployed + healthy (${elapsed})${timeStr}`;
-        } else {
-          ctx.healthCheckFailed++;
-          const errorMsg = healthResult.error ?? `HTTP ${healthResult.status}`;
-          task.title = `${host}${tlsIndicator} - deployed but UNHEALTHY: ${errorMsg}`;
-          // In canary mode, health check failure should stop deployment
-          throw new Error(`Health check failed: ${errorMsg}`);
+        if (!result.success) {
+          ctx.failed++;
+          const errorMsg = result.error?.substring(0, 50) ?? 'Unknown error';
+          task.title = `${host}${tlsIndicator} - FAILED: ${errorMsg}`;
+          throw new Error(result.error ?? 'Deployment failed');
         }
-      } else {
-        // No health check configured
-        const elapsed = formatDuration(Date.now() - startTime);
-        const completedAt = result.result?.completedAt;
-        const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
-        ctx.successful++;
-        task.title = `${host}${tlsIndicator} - deployed (${elapsed})${timeStr}`;
+
+        // --- Health check ---
+        if (options.healthCheck) {
+          task.output = 'Running health check...';
+
+          const healthResult = await performHealthCheck(
+            host,
+            options.healthCheck,
+            (attempt, maxAttempts, status, error) => {
+              if (error) {
+                task.output = `Health check attempt ${attempt}/${maxAttempts}: ${error}`;
+              } else if (status !== undefined) {
+                task.output = `Health check attempt ${attempt}/${maxAttempts}: HTTP ${status}`;
+              } else {
+                task.output = `Health check attempt ${attempt}/${maxAttempts}...`;
+              }
+            }
+          );
+
+          const elapsed = formatDuration(Date.now() - startTime);
+          const completedAt = result.result?.completedAt;
+          const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
+
+          if (healthResult.success) {
+            ctx.successful++;
+            task.title = `${host}${tlsIndicator} - deployed + healthy (${elapsed})${timeStr}`;
+          } else {
+            ctx.healthCheckFailed++;
+            const errorMsg = healthResult.error ?? `HTTP ${healthResult.status}`;
+            task.title = `${host}${tlsIndicator} - deployed but UNHEALTHY: ${errorMsg}`;
+            // In canary mode, health check failure should stop deployment
+            throw new Error(`Health check failed: ${errorMsg}`);
+          }
+        } else {
+          // No health check configured
+          const elapsed = formatDuration(Date.now() - startTime);
+          const completedAt = result.result?.completedAt;
+          const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
+          ctx.successful++;
+          task.title = `${host}${tlsIndicator} - deployed (${elapsed})${timeStr}`;
+        }
+
+        // --- Set ready in HAProxy after successful deploy + health check ---
+        if (drained) {
+          task.output = 'Setting ready in HAProxy...';
+          await readyServer(options.haproxy!, host);
+          drained = false; // Prevent finally from double-restoring
+        }
+      } finally {
+        // ALWAYS restore server to ready if we drained it, even on failure
+        if (drained && options.haproxy) {
+          try { await readyServer(options.haproxy, host); } catch { /* don't mask original error */ }
+        }
       }
     },
     rendererOptions: {

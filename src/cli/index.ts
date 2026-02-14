@@ -37,6 +37,7 @@ export type {
   DeploymentStrategyBatch,
   HealthCheckConfig,
   HealthCheckResult,
+  HAProxyConfig,
 } from './types.js';
 
 // Strategy functions
@@ -112,6 +113,18 @@ export type {
   HostAnalysis,
   UnifiedProgressOptions,
 } from './unified-progress.js';
+
+// HAProxy drain/ready operations
+export {
+  drainServer,
+  readyServer,
+  testHAProxyConnectivity,
+  getUnmappedHosts,
+} from './haproxy.js';
+export type {
+  SSHExecResult,
+  HAProxyOperationResult,
+} from './haproxy.js';
 
 // Listr-based deployment (concurrent progress)
 export {

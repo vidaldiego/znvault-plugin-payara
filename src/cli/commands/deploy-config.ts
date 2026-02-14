@@ -2,7 +2,7 @@
 // Deploy config management commands
 
 import type { Command } from 'commander';
-import type { CLIPluginContext, DeployConfig, HealthCheckConfig } from '../types.js';
+import type { CLIPluginContext, DeployConfig, HealthCheckConfig, HAProxyConfig } from '../types.js';
 import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
 import { getConfigOrExit, confirmPrompt, withErrorHandling } from './helpers.js';
@@ -155,6 +155,27 @@ export function registerConfigCommands(
           }
         } else {
           console.log(`\n  TLS: ${ANSI.dim}(not configured - using HTTP)${ANSI.reset}`);
+        }
+        // HAProxy configuration
+        if (config.haproxy) {
+          const ha = config.haproxy;
+          console.log(`\n  HAProxy:`);
+          console.log(`    Hosts:    ${ha.hosts.join(', ')}`);
+          console.log(`    Backend:  ${ha.backend}`);
+          console.log(`    Socket:   ${ha.socketPath ?? '/run/haproxy/admin.sock'}`);
+          console.log(`    User:     ${ha.user ?? 'sysadmin'}`);
+          console.log(`    Drain wait: ${ha.drainWaitSeconds ?? 5}s`);
+          const mappings = Object.entries(ha.serverMap);
+          if (mappings.length > 0) {
+            console.log(`    Server map (${mappings.length}):`);
+            for (const [appHost, serverName] of mappings) {
+              console.log(`      ${appHost} → ${serverName}`);
+            }
+          } else {
+            console.log(`    Server map: ${ANSI.dim}(empty)${ANSI.reset}`);
+          }
+        } else {
+          console.log(`\n  HAProxy: ${ANSI.dim}(not configured)${ANSI.reset}`);
         }
         console.log();
       }, 'Failed to show config');
@@ -378,4 +399,194 @@ export function registerConfigCommands(
         ctx.output.info(`  Retries:  ${healthCheck.retries} (delay: ${healthCheck.retryDelay}ms)`);
       }, 'Failed to configure health check');
     });
+
+  // deploy config haproxy <name>
+  configCmd
+    .command('haproxy <name>')
+    .description('Configure HAProxy drain/ready for zero-downtime deployments')
+    .option('--hosts <hosts>', 'Comma-separated HAProxy host addresses')
+    .option('--user <user>', 'SSH user (default: sysadmin)')
+    .option('--ssh-port <port>', 'SSH port (default: 22)')
+    .option('--socket <path>', 'HAProxy admin socket path (default: /run/haproxy/admin.sock)')
+    .option('--backend <name>', 'HAProxy backend name')
+    .option('--drain-wait <seconds>', 'Seconds to wait after drain (default: 5)')
+    .option('--disable', 'Disable HAProxy integration for this config')
+    .action(async (name: string, options: {
+      hosts?: string;
+      user?: string;
+      sshPort?: string;
+      socket?: string;
+      backend?: string;
+      drainWait?: string;
+      disable?: boolean;
+    }) => {
+      await withErrorHandling(ctx, async () => {
+        const { store, config } = await getConfigOrExit(ctx, name);
+
+        if (options.disable) {
+          delete config.haproxy;
+          await saveDeployConfigs(store);
+          ctx.output.success(`Disabled HAProxy for '${name}'`);
+          return;
+        }
+
+        // Build or update HAProxy config
+        const existing = config.haproxy;
+
+        if (!options.hosts && !existing?.hosts?.length && !options.backend && !existing?.backend) {
+          ctx.output.error('HAProxy hosts and backend are required');
+          ctx.output.info('Usage: znvault deploy config haproxy <name> --hosts 1.2.3.4,1.2.3.5 --backend api_servers');
+          process.exit(1);
+        }
+
+        const haproxy: HAProxyConfig = {
+          hosts: options.hosts
+            ? options.hosts.split(',').map(h => h.trim())
+            : existing?.hosts ?? [],
+          backend: options.backend ?? existing?.backend ?? '',
+          serverMap: existing?.serverMap ?? {},
+        };
+
+        if (!haproxy.backend) {
+          ctx.output.error('HAProxy backend name is required (--backend)');
+          process.exit(1);
+        }
+
+        if (haproxy.hosts.length === 0) {
+          ctx.output.error('At least one HAProxy host is required (--hosts)');
+          process.exit(1);
+        }
+
+        // Optional fields
+        if (options.user) haproxy.user = options.user;
+        else if (existing?.user) haproxy.user = existing.user;
+
+        if (options.sshPort) {
+          haproxy.sshPort = parsePort(options.sshPort, 'ssh-port');
+        } else if (existing?.sshPort) {
+          haproxy.sshPort = existing.sshPort;
+        }
+
+        if (options.socket) haproxy.socketPath = options.socket;
+        else if (existing?.socketPath) haproxy.socketPath = existing.socketPath;
+
+        if (options.drainWait) {
+          const wait = parseInt(options.drainWait, 10);
+          if (isNaN(wait) || wait < 0) {
+            ctx.output.error(`Invalid drain-wait: ${options.drainWait}`);
+            process.exit(1);
+          }
+          haproxy.drainWaitSeconds = wait;
+        } else if (existing?.drainWaitSeconds !== undefined) {
+          haproxy.drainWaitSeconds = existing.drainWaitSeconds;
+        }
+
+        if (existing?.sshTimeout !== undefined) {
+          haproxy.sshTimeout = existing.sshTimeout;
+        }
+
+        config.haproxy = haproxy;
+        await saveDeployConfigs(store);
+
+        ctx.output.success(`Configured HAProxy for '${name}'`);
+        ctx.output.info(`  Hosts:      ${haproxy.hosts.join(', ')}`);
+        ctx.output.info(`  Backend:    ${haproxy.backend}`);
+        ctx.output.info(`  Socket:     ${haproxy.socketPath ?? '/run/haproxy/admin.sock'}`);
+        ctx.output.info(`  Drain wait: ${haproxy.drainWaitSeconds ?? 5}s`);
+        const mapCount = Object.keys(haproxy.serverMap).length;
+        if (mapCount > 0) {
+          ctx.output.info(`  Server map: ${mapCount} mapping(s)`);
+        } else {
+          ctx.output.warn('  Server map: empty — use "znvault deploy config haproxy-map" to add mappings');
+        }
+      }, 'Failed to configure HAProxy');
+    });
+
+  // deploy config haproxy-map <name>
+  configCmd
+    .command('haproxy-map <name>')
+    .description('Manage HAProxy server name mappings (app host → HAProxy server)')
+    .option('--set <mapping>', 'Set mapping (host=server), can be repeated', collectMappings, [])
+    .option('--remove <host>', 'Remove mapping for host')
+    .option('--clear', 'Remove all mappings')
+    .action(async (name: string, options: {
+      set: string[];
+      remove?: string;
+      clear?: boolean;
+    }) => {
+      await withErrorHandling(ctx, async () => {
+        const { store, config } = await getConfigOrExit(ctx, name);
+
+        if (!config.haproxy) {
+          ctx.output.error('HAProxy not configured for this deployment');
+          ctx.output.info(`Use "znvault deploy config haproxy ${name} --hosts ... --backend ..." first`);
+          process.exit(1);
+        }
+
+        if (options.clear) {
+          config.haproxy.serverMap = {};
+          await saveDeployConfigs(store);
+          ctx.output.success('Cleared all HAProxy server mappings');
+          return;
+        }
+
+        if (options.remove) {
+          if (!config.haproxy.serverMap[options.remove]) {
+            ctx.output.warn(`No mapping found for host '${options.remove}'`);
+            return;
+          }
+          delete config.haproxy.serverMap[options.remove];
+          await saveDeployConfigs(store);
+          ctx.output.success(`Removed mapping for ${options.remove}`);
+          return;
+        }
+
+        if (options.set.length === 0) {
+          // Show current mappings
+          const mappings = Object.entries(config.haproxy.serverMap);
+          if (mappings.length === 0) {
+            ctx.output.info('No HAProxy server mappings configured');
+            ctx.output.info('Usage: znvault deploy config haproxy-map <name> --set host=server');
+            return;
+          }
+          console.log(`\nHAProxy server mappings for '${name}':\n`);
+          for (const [appHost, serverName] of mappings) {
+            console.log(`  ${appHost} → ${serverName}`);
+          }
+          console.log();
+          return;
+        }
+
+        // Apply set mappings
+        for (const mapping of options.set) {
+          const eqIndex = mapping.indexOf('=');
+          if (eqIndex === -1) {
+            ctx.output.error(`Invalid mapping format: "${mapping}" (expected host=server)`);
+            process.exit(1);
+          }
+          const appHost = mapping.substring(0, eqIndex).trim();
+          const serverName = mapping.substring(eqIndex + 1).trim();
+          if (!appHost || !serverName) {
+            ctx.output.error(`Invalid mapping: "${mapping}" (host and server name required)`);
+            process.exit(1);
+          }
+          config.haproxy.serverMap[appHost] = serverName;
+        }
+
+        await saveDeployConfigs(store);
+
+        ctx.output.success(`Updated ${options.set.length} HAProxy server mapping(s)`);
+        for (const mapping of options.set) {
+          const eqIndex = mapping.indexOf('=');
+          ctx.output.info(`  ${mapping.substring(0, eqIndex)} → ${mapping.substring(eqIndex + 1)}`);
+        }
+      }, 'Failed to update HAProxy mappings');
+    });
+}
+
+/**
+ * Collector function for repeatable --set option
+ */
+function collectMappings(value: string, previous: string[]): string[] {
+  return previous.concat([value]);
 }

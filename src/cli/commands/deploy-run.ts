@@ -31,6 +31,7 @@ import {
   printPreflightSummary,
 } from '../listr-preflight.js';
 import { configureTLS } from '../http-client.js';
+import { getUnmappedHosts, testHAProxyConnectivity } from '../haproxy.js';
 
 /** Default CA certificate path */
 const DEFAULT_CA_PATH = join(homedir(), '.znvault', 'ca', 'agent-tls-ca.pem');
@@ -97,6 +98,7 @@ export function registerDeployRunCommand(
     .option('-s, --strategy <strategy>', 'Deployment strategy: sequential, parallel, or canary (e.g., 1+R, 1+2, 2+3+R)')
     .option('--skip-preflight', 'Skip pre-flight checks')
     .option('--skip-version-check', 'Skip plugin version check')
+    .option('--skip-drain', 'Skip HAProxy drain/ready operations')
     .option('--update-plugins', 'Update plugins if updates are available')
     .option('-y, --yes', 'Skip confirmation prompts')
     .action(async (configName: string, options: {
@@ -106,6 +108,7 @@ export function registerDeployRunCommand(
       strategy?: string;
       skipPreflight?: boolean;
       skipVersionCheck?: boolean;
+      skipDrain?: boolean;
       updatePlugins?: boolean;
       yes?: boolean;
     }) => {
@@ -178,6 +181,27 @@ export function registerDeployRunCommand(
         } else {
           ctx.output.info(`  Hosts: ${config.hosts.length}`);
           ctx.output.info(`  Strategy: ${getStrategyDisplayName(strategy)}`);
+        }
+
+        // HAProxy drain/ready info
+        const haproxyConfig = (!options.skipDrain && config.haproxy) ? config.haproxy : undefined;
+        if (config.haproxy && options.skipDrain) {
+          if (!isPlain) {
+            console.log(`${ANSI.dim}  HAProxy:  ${ANSI.reset}${ANSI.yellow}skipped${ANSI.reset} (--skip-drain)`);
+          } else {
+            ctx.output.info('  HAProxy: skipped (--skip-drain)');
+          }
+        } else if (haproxyConfig) {
+          const mappedCount = config.hosts.filter(h => haproxyConfig.serverMap[h]).length;
+          const unmapped = getUnmappedHosts(haproxyConfig, config.hosts);
+          if (!isPlain) {
+            console.log(`${ANSI.dim}  HAProxy:  ${ANSI.reset}${ANSI.green}enabled${ANSI.reset} (${haproxyConfig.hosts.length} LB, ${mappedCount} mapped)`);
+          } else {
+            ctx.output.info(`  HAProxy: enabled (${haproxyConfig.hosts.length} LB, ${mappedCount} mapped)`);
+          }
+          if (unmapped.length > 0) {
+            ctx.output.warn(`  Unmapped hosts (will deploy without drain): ${unmapped.join(', ')}`);
+          }
         }
 
         // ═══════════════════════════════════════════════════════════════════
@@ -346,6 +370,29 @@ export function registerDeployRunCommand(
 
         console.log('');
 
+        // HAProxy connectivity pre-check
+        if (haproxyConfig) {
+          if (!isPlain) {
+            console.log(`${ANSI.dim}Checking HAProxy connectivity...${ANSI.reset}`);
+          } else {
+            console.log('Checking HAProxy connectivity...');
+          }
+          const connResult = await testHAProxyConnectivity(haproxyConfig);
+          if (!connResult.success) {
+            const failed = connResult.results.filter(r => !r.success);
+            for (const f of failed) {
+              ctx.output.error(`  HAProxy ${f.host}: ${f.error}`);
+            }
+            ctx.output.error('Cannot reach all HAProxy hosts. Use --skip-drain to deploy without drain/ready.');
+            process.exit(1);
+          }
+          if (!isPlain) {
+            console.log(`${ANSI.green}✓${ANSI.reset} All ${haproxyConfig.hosts.length} HAProxy hosts reachable\n`);
+          } else {
+            console.log(`All ${haproxyConfig.hosts.length} HAProxy hosts reachable`);
+          }
+        }
+
         // Execute deployment using Listr2
         const deployResult = await executeListrDeployment(strategy, deployableHosts, {
           ctx,
@@ -356,6 +403,7 @@ export function registerDeployRunCommand(
           analysisMap,
           healthCheck: config.healthCheck,
           useTLS,
+          haproxy: haproxyConfig,
         });
 
         // Print final summary

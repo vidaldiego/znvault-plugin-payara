@@ -192,6 +192,28 @@ export interface DeployTLSConfig {
 }
 
 /**
+ * HAProxy drain/ready configuration for zero-downtime rolling deployments
+ */
+export interface HAProxyConfig {
+  /** HAProxy host addresses to SSH into */
+  hosts: string[];
+  /** SSH user (default: "sysadmin") */
+  user?: string;
+  /** SSH port (default: 22) */
+  sshPort?: number;
+  /** Admin socket path (default: "/run/haproxy/admin.sock") */
+  socketPath?: string;
+  /** HAProxy backend name (e.g., "api_servers") */
+  backend: string;
+  /** Mapping from app host to HAProxy server name */
+  serverMap: Record<string, string>;
+  /** Seconds to wait after draining before deploying (default: 5) */
+  drainWaitSeconds?: number;
+  /** SSH command timeout in milliseconds (default: 10000) */
+  sshTimeout?: number;
+}
+
+/**
  * Deployment configuration
  */
 export interface DeployConfig {
@@ -215,6 +237,8 @@ export interface DeployConfig {
   healthCheck?: HealthCheckConfig;
   /** TLS configuration for secure agent connections */
   tls?: DeployTLSConfig;
+  /** HAProxy drain/ready configuration for zero-downtime deployments */
+  haproxy?: HAProxyConfig;
 }
 
 /**
