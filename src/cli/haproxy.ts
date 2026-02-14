@@ -71,8 +71,9 @@ export function sshExec(
 /**
  * Build the socat command to set HAProxy server state
  */
-function buildSocatCommand(socketPath: string, backend: string, serverName: string, state: 'drain' | 'ready'): string {
-  return `echo "set server ${backend}/${serverName} state ${state}" | socat stdio ${socketPath}`;
+function buildSocatCommand(socketPath: string, backend: string, serverName: string, state: 'drain' | 'ready', sudo: boolean): string {
+  const prefix = sudo ? 'sudo ' : '';
+  return `echo "set server ${backend}/${serverName} state ${state}" | ${prefix}socat stdio ${socketPath}`;
 }
 
 /**
@@ -102,7 +103,8 @@ export async function setServerState(
   const port = config.sshPort ?? DEFAULT_SSH_PORT;
   const socketPath = config.socketPath ?? DEFAULT_SOCKET_PATH;
   const timeout = config.sshTimeout ?? DEFAULT_SSH_TIMEOUT;
-  const command = buildSocatCommand(socketPath, config.backend, serverName, state);
+  const sudo = config.sudo !== false; // default true
+  const command = buildSocatCommand(socketPath, config.backend, serverName, state, sudo);
 
   const results = await Promise.all(
     config.hosts.map(haHost => sshExec(haHost, user, port, command, timeout))

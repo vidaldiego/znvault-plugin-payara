@@ -211,6 +211,8 @@ export interface HAProxyConfig {
   drainWaitSeconds?: number;
   /** SSH command timeout in milliseconds (default: 10000) */
   sshTimeout?: number;
+  /** Use sudo for socat commands (default: true) */
+  sudo?: boolean;
 }
 
 /**

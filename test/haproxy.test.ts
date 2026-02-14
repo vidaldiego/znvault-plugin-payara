@@ -118,7 +118,36 @@ describe('setServerState', () => {
     const firstCallArgs = mockExecFile.mock.calls[0]![1] as string[];
     const command = firstCallArgs[firstCallArgs.length - 1];
     expect(command).toContain('set server api_servers/server1 state drain');
-    expect(command).toContain('socat stdio /run/haproxy/admin.sock');
+    expect(command).toContain('sudo socat stdio /run/haproxy/admin.sock');
+  });
+
+  it('should use sudo by default', async () => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+      cb(null, '', '');
+      return { on: vi.fn() };
+    });
+
+    const config = makeConfig();
+    await setServerState(config, '172.16.211.10', 'drain');
+
+    const firstCallArgs = mockExecFile.mock.calls[0]![1] as string[];
+    const command = firstCallArgs[firstCallArgs.length - 1];
+    expect(command).toContain('| sudo socat stdio');
+  });
+
+  it('should skip sudo when sudo is false', async () => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+      cb(null, '', '');
+      return { on: vi.fn() };
+    });
+
+    const config = makeConfig({ sudo: false });
+    await setServerState(config, '172.16.211.10', 'drain');
+
+    const firstCallArgs = mockExecFile.mock.calls[0]![1] as string[];
+    const command = firstCallArgs[firstCallArgs.length - 1];
+    expect(command).not.toContain('sudo');
+    expect(command).toContain('| socat stdio');
   });
 
   it('should return failure if host not in serverMap', async () => {

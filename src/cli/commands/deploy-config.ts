@@ -164,6 +164,7 @@ export function registerConfigCommands(
           console.log(`    Backend:  ${ha.backend}`);
           console.log(`    Socket:   ${ha.socketPath ?? '/run/haproxy/admin.sock'}`);
           console.log(`    User:     ${ha.user ?? 'sysadmin'}`);
+          console.log(`    Sudo:     ${ha.sudo !== false ? 'yes' : 'no'}`);
           console.log(`    Drain wait: ${ha.drainWaitSeconds ?? 5}s`);
           const mappings = Object.entries(ha.serverMap);
           if (mappings.length > 0) {
@@ -410,6 +411,7 @@ export function registerConfigCommands(
     .option('--socket <path>', 'HAProxy admin socket path (default: /run/haproxy/admin.sock)')
     .option('--backend <name>', 'HAProxy backend name')
     .option('--drain-wait <seconds>', 'Seconds to wait after drain (default: 5)')
+    .option('--no-sudo', 'Disable sudo for socat commands (sudo enabled by default)')
     .option('--disable', 'Disable HAProxy integration for this config')
     .action(async (name: string, options: {
       hosts?: string;
@@ -418,6 +420,7 @@ export function registerConfigCommands(
       socket?: string;
       backend?: string;
       drainWait?: string;
+      sudo: boolean;
       disable?: boolean;
     }) => {
       await withErrorHandling(ctx, async () => {
@@ -483,6 +486,11 @@ export function registerConfigCommands(
 
         if (existing?.sshTimeout !== undefined) {
           haproxy.sshTimeout = existing.sshTimeout;
+        }
+
+        // sudo defaults to true; only store false when --no-sudo is passed
+        if (!options.sudo) {
+          haproxy.sudo = false;
         }
 
         config.haproxy = haproxy;
