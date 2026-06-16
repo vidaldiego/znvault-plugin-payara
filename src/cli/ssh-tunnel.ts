@@ -78,23 +78,29 @@ export async function openTunnel(host: string, opts: OpenTunnelOptions = {}): Pr
     const onClose = (code: number | null): void => {
       if (!settled) { settled = true; reject(new Error(`ssh forward exited (code ${code ?? 'null'}) before reporting a port`)); }
     };
+    const onError = (err: Error): void => {
+      if (!settled) { settled = true; reject(err); }
+    };
     child.on('close', onClose);
-    child.on('error', (err) => { if (!settled) { settled = true; reject(err); } });
+    child.on('error', onError);
     child.stdout?.on('data', (chunk: Buffer) => {
+      if (settled) return;
       buf += chunk.toString('utf8');
-      const nl = buf.indexOf('\n');
-      if (nl >= 0 && !settled) {
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
         const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);          // consume the line
+        if (!line) continue;
         try {
           const parsed = JSON.parse(line) as { localPort?: number };
           if (typeof parsed.localPort === 'number') {
             settled = true;
             child.removeListener('close', onClose);
+            child.removeListener('error', onError);
             resolve(parsed.localPort);
+            return;
           }
-        } catch {
-          // not the JSON line yet; keep buffering
-        }
+        } catch { /* not the JSON line; try the next one */ }
       }
     });
   });
@@ -111,7 +117,7 @@ export async function openTunnel(host: string, opts: OpenTunnelOptions = {}): Pr
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://127.0.0.1:${localPort}/health`, {
-        signal: AbortSignal.timeout(2000),
+        signal: AbortSignal.timeout(Math.max(1, Math.min(2000, deadline - Date.now()))),
       });
       if (res.ok) return { host, localPort, pid: child.pid, close };
       lastErr = `HTTP ${res.status}`;

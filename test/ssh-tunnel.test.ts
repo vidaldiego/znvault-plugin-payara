@@ -32,19 +32,46 @@ vi.mock('node:child_process', () => ({ spawn: (...a: unknown[]) => mockSpawn(...
 // Re-import with child_process mocked
 const tunnelMod = await import('../src/cli/ssh-tunnel.js');
 
-function fakeForwardChild(localPort: number): EventEmitter & {
+type FakeChild = EventEmitter & {
   stdout: EventEmitter; stderr: EventEmitter; kill: (sig?: string) => void; pid: number;
-} {
-  const child = new EventEmitter() as EventEmitter & {
-    stdout: EventEmitter; stderr: EventEmitter; kill: (sig?: string) => void; pid: number;
-  };
+};
+
+function makeChild(): FakeChild {
+  const child = new EventEmitter() as FakeChild;
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.pid = 4242;
   child.kill = vi.fn();
+  return child;
+}
+
+function fakeForwardChild(localPort: number): FakeChild {
+  const child = makeChild();
   // Emit the contract line on next tick
   setTimeout(() => {
     child.stdout.emit('data', Buffer.from(JSON.stringify({ localPort, pid: 4242, forwardUp: true }) + '\n'));
+  }, 5);
+  return child;
+}
+
+/** Emits one or more noise lines BEFORE the JSON contract line. */
+function fakeForwardChildWithPrefix(localPort: number, prefix: string): FakeChild {
+  const child = makeChild();
+  setTimeout(() => {
+    child.stdout.emit('data', Buffer.from(prefix));
+    child.stdout.emit('data', Buffer.from(JSON.stringify({ localPort, pid: 4242, forwardUp: true }) + '\n'));
+  }, 5);
+  return child;
+}
+
+/** Emits the JSON contract line split across two separate data chunks. */
+function fakeForwardChildSplit(localPort: number): FakeChild {
+  const child = makeChild();
+  const full = JSON.stringify({ localPort, pid: 4242, forwardUp: true }) + '\n';
+  const at = '{"localPo'.length;
+  setTimeout(() => {
+    child.stdout.emit('data', Buffer.from(full.slice(0, at)));
+    child.stdout.emit('data', Buffer.from(full.slice(at)));
   }, 5);
   return child;
 }
@@ -93,4 +120,57 @@ describe('openTunnel', () => {
     setTimeout(() => child.emit('close', 255), 5);
     await expect(p).rejects.toThrow();
   });
+
+  // Regression (FIX 1): a non-JSON line before the JSON contract line must NOT
+  // deadlock the port read. Before the fix, the unparseable first line was
+  // re-found on every chunk and the promise never settled → openTunnel hung.
+  it('resolves when a non-JSON line precedes the JSON contract line', async () => {
+    const child = fakeForwardChildWithPrefix(agentPort, 'some startup warning\n');
+    mockSpawn.mockReturnValue(child);
+
+    const t = await tunnelMod.openTunnel('172.16.220.55', {
+      user: 'sysadmin', remotePort: 9100, znvaultBin: 'znvault', readinessTimeoutMs: 2000,
+    });
+
+    expect(t.localPort).toBe(agentPort);
+    await t.close();
+  }, 5000);
+
+  // Regression: the JSON contract line arriving split across two data chunks
+  // must be reassembled and parsed correctly.
+  it('resolves when the JSON contract line is split across two chunks', async () => {
+    const child = fakeForwardChildSplit(agentPort);
+    mockSpawn.mockReturnValue(child);
+
+    const t = await tunnelMod.openTunnel('172.16.220.55', {
+      user: 'sysadmin', remotePort: 9100, znvaultBin: 'znvault', readinessTimeoutMs: 2000,
+    });
+
+    expect(t.localPort).toBe(agentPort);
+    await t.close();
+  }, 5000);
+
+  // Readiness timeout: a valid port is printed but /health never answers (no
+  // server on that port). openTunnel must reject AND kill the child (close()
+  // runs before throwing).
+  it('rejects and kills the child when /health never answers', async () => {
+    // Bind then immediately release a port so nothing is listening on it.
+    const dead = http.createServer();
+    const deadPort = await new Promise<number>((resolve) => {
+      dead.listen(0, '127.0.0.1', () => {
+        const p = (dead.address() as import('node:net').AddressInfo).port;
+        dead.close(() => resolve(p));
+      });
+    });
+
+    const child = fakeForwardChild(deadPort);
+    mockSpawn.mockReturnValue(child);
+
+    await expect(
+      tunnelMod.openTunnel('172.16.220.55', {
+        user: 'sysadmin', remotePort: 9100, znvaultBin: 'znvault', readinessTimeoutMs: 600,
+      }),
+    ).rejects.toThrow(/never answered/);
+    expect(child.kill).toHaveBeenCalled();
+  }, 3000);
 });
