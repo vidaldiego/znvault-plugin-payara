@@ -316,7 +316,37 @@ export async function pollDeploymentStatus(
  *
  * @param useTLS - If true, use HTTPS protocol (default: false for backwards compat)
  */
+/**
+ * Per-host endpoint overrides. When a deploy runs through SSH tunnels, each
+ * real host is mapped to a 127.0.0.1:<localPort> endpoint. buildPluginUrl
+ * consults this map so only the URL the fetch hits is rewritten — the rest of
+ * the orchestration keeps using the real host IP as identity/display/HAProxy key.
+ */
+const endpointOverrides = new Map<string, { host: string; port: number }>();
+
+/** Register a tunnel endpoint for a host (real host → loopback:localPort). */
+export function setEndpointOverride(host: string, localHost: string, localPort: number): void {
+  endpointOverrides.set(host, { host: localHost, port: localPort });
+}
+
+/** Remove a single host's override. */
+export function clearEndpointOverride(host: string): void {
+  endpointOverrides.delete(host);
+}
+
+/** Remove all overrides (call in deploy teardown). */
+export function clearAllEndpointOverrides(): void {
+  endpointOverrides.clear();
+}
+
 export function buildPluginUrl(host: string, defaultPort: number, useTLS = false): string {
+  const override = endpointOverrides.get(host);
+  if (override) {
+    host = override.host;
+    defaultPort = override.port;
+    useTLS = false; // tunnel terminates at the loopback HTTP agent
+  }
+
   const trimmed = host.replace(/\/$/, '');
   const defaultProtocol = useTLS ? 'https' : 'http';
 
