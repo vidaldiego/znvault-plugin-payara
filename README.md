@@ -215,6 +215,40 @@ znvault deploy config set staging war /new/path.war
 znvault deploy config delete staging
 ```
 
+### Tunneled Deployment (`tunnel: true`)
+
+Deploy agents bind their `:9100` deploy/health server to loopback only, so it
+is never exposed on the network. Set `tunnel: true` on a deploy config to route
+the deploy through an **SSH-CA-authenticated local port-forward** to each host
+instead — the deploy opens one `znvault ssh forward` per host, rewrites only the
+fetched agent URL to `127.0.0.1:<ephemeral>`, runs the existing preflight + WAR
+transfer through the tunnel, and tears it down afterward.
+
+```jsonc
+{
+  "name": "staging",
+  "war": "/path/to/app.war",
+  "hosts": ["172.16.220.55", "172.16.220.56", "172.16.220.57"],
+  "tunnel": true,
+  "ssh": {
+    "user": "sysadmin",            // optional; SSH user for the forward
+    "readinessTimeoutMs": 30000    // optional; wait for /health through the tunnel
+  }
+}
+```
+
+| Config field | Type | Required | Description |
+|--------------|------|----------|-------------|
+| `tunnel` | boolean | No | Route the deploy through a per-host SSH-CA port-forward (default: `false`) |
+| `ssh.user` | string | No | SSH user for the forward (default: `sysadmin`, honoring `~/.ssh/config`) |
+| `ssh.readinessTimeoutMs` | number | No | How long to wait for the agent's `/health` through the tunnel before failing |
+
+Requires `@zincapp/znvault-cli` >= 4.5.0 (ships `znvault ssh forward`) and this
+plugin >= 1.18.0. See the
+[Deployment Guide → Tunneled Deploys](../docs/DEPLOYMENT_GUIDE.md#tunneled-deploys)
+for the full how-it-works, version matrix, loopback cutover procedure, and the
+important caution about `deploy --force` with `aggressiveMode`.
+
 ### Single-Host Deployment
 
 ```bash
@@ -378,6 +412,9 @@ npm run lint
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v1.18.0
+- Added opt-in `tunnel: true` deploy-config flag (+ optional `ssh: {user?, readinessTimeoutMs?}`): route deploys through a per-host SSH-CA local port-forward so agents stay loopback-only and `:9100` is never on the wire. Requires `@zincapp/znvault-cli` >= 4.5.0. See the [Deployment Guide → Tunneled Deploys](../docs/DEPLOYMENT_GUIDE.md#tunneled-deploys).
 
 ### v1.7.3
 - Fix: Always write setenv.conf on agent start (even when skipping Payara restart in aggressive mode)
