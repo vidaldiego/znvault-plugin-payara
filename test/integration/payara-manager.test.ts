@@ -1,7 +1,7 @@
 // Path: test/integration/payara-manager.test.ts
 // PayaraManager integration tests with mock Payara
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { PayaraManager } from '../../src/payara-manager.js';
 import { createMockPayara, MockPayara } from '../helpers/mock-payara.js';
 import { createTestWar, createTempDir, cleanupTempDir } from '../helpers/war-utils.js';
@@ -219,6 +219,71 @@ describe('PayaraManager Integration', () => {
       });
 
       await expect(manager.deploy(warPath, 'TestApp')).rejects.toThrow();
+    });
+  });
+
+  describe('waitForBootDeploySettled', () => {
+    function makeManager(): PayaraManager {
+      return new PayaraManager({
+        payaraHome: mockPayara.payaraHome,
+        domain: mockPayara.domain,
+        user: process.env.USER || 'test',
+        logger,
+      });
+    }
+
+    it('PM-13: should settle once the app appears in two consecutive stable polls', async () => {
+      const manager = makeManager();
+
+      // Simulate boot auto-deploy: app not visible yet, then appears and stays.
+      const listSpy = vi
+        .spyOn(manager, 'listApplications')
+        .mockResolvedValueOnce([]) // boot deploy still exploding the WAR
+        .mockResolvedValueOnce(['ZincAPI']) // app now visible
+        .mockResolvedValue(['ZincAPI']); // stable from here on
+
+      await expect(
+        manager.waitForBootDeploySettled('ZincAPI', 1000, 10)
+      ).resolves.toBeUndefined();
+
+      // Must have polled (at least: empty, app, app-again to confirm stability).
+      expect(listSpy.mock.calls.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('PM-14: should return (settled-empty) when no app ever appears, without hanging', async () => {
+      const manager = makeManager();
+
+      // Genuinely-empty domain (no <application-ref> registered): list stays empty.
+      const listSpy = vi.spyOn(manager, 'listApplications').mockResolvedValue([]);
+
+      // With a small timeout, the empty-grace is short, so this resolves quickly.
+      await expect(
+        manager.waitForBootDeploySettled('ZincAPI', 200, 10)
+      ).resolves.toBeUndefined();
+
+      expect(listSpy).toHaveBeenCalled();
+    });
+
+    it('PM-15: should time out gracefully (warn + return) when the list never stabilizes', async () => {
+      const manager = makeManager();
+
+      // Never-stable: the set keeps changing on every poll (mid-flight forever).
+      let flip = false;
+      const listSpy = vi.spyOn(manager, 'listApplications').mockImplementation(async () => {
+        flip = !flip;
+        return flip ? ['ZincAPI'] : ['ZincAPI', 'Other'];
+      });
+
+      const warnSpy = vi.spyOn(logger, 'warn');
+
+      await expect(
+        manager.waitForBootDeploySettled('ZincAPI', 100, 10)
+      ).resolves.toBeUndefined();
+
+      expect(listSpy).toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalled();
+
+      warnSpy.mockRestore();
     });
   });
 });

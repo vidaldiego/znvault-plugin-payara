@@ -20,6 +20,18 @@ import {
 const execAsync = promisify(exec);
 
 /**
+ * Compare two application-name lists as sets (order-independent).
+ * Used to detect a stable `list-applications` snapshot across polls.
+ */
+function sameApps(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  const setA = new Set(a);
+  return b.every(name => setA.has(name));
+}
+
+/**
  * Manages Payara application server lifecycle
  */
 export class PayaraManager {
@@ -735,6 +747,95 @@ export class PayaraManager {
     this.invalidateStatusCache();
 
     this.logger.info({ domain: this.domain }, 'Payara domain started successfully');
+  }
+
+  /**
+   * Wait for the post-start boot auto-deploy to SETTLE.
+   *
+   * `start-domain` auto-deploys whatever app is registered in domain.xml
+   * (`<application-ref ref="...">`), so the WAR may still be exploding into
+   * `applications/<app>/` right after the domain process reports "running".
+   * A subsequent undeploy/deploy --force would then race that boot deploy —
+   * two writers in one directory corrupt the exploded archive (invalid-zip →
+   * CDI/EJB NPEs → ContainerBase.addChild NPE). This method polls until the
+   * boot deploy is no longer mid-flight, so the redeploy runs serially.
+   *
+   * Settle decision (using `listApplications()`, which returns `[]` on a
+   * transient `list-applications` failure — treated as "not yet settled"):
+   *  - settled-with-app: two consecutive identical NON-EMPTY snapshots where
+   *    the app is present (boot deploy finished and the list is stable).
+   *  - settled-empty: the list stays empty past a short grace window (no
+   *    boot-deploy is happening, e.g. a fresh domain) — return so we don't hang.
+   *  - timeout: the overall timeout elapses without settling — log a warning
+   *    and RETURN (do not throw). Proceeding to a serial deploy is still
+   *    correct; we simply could not positively confirm settle, and we have
+   *    already waited long enough that the racing risk is low.
+   *
+   * @param appName - The application expected to be boot-deployed
+   * @param timeoutMs - Overall bound on how long to wait (default 120000ms)
+   * @param pollIntervalMs - Interval between `listApplications` polls (default 2000ms)
+   */
+  async waitForBootDeploySettled(
+    appName: string,
+    timeoutMs = 120000,
+    pollIntervalMs = 2000
+  ): Promise<void> {
+    // The empty-grace is shorter than the overall timeout so a genuinely-empty
+    // domain (no boot-deploy registered) doesn't block for the full window.
+    // Capped at timeoutMs so callers passing a tiny timeout still settle fast.
+    const EMPTY_GRACE_MS = 20000;
+    const emptyGraceMs = Math.min(EMPTY_GRACE_MS, timeoutMs);
+
+    this.logger.info(
+      { appName, timeoutMs, pollIntervalMs },
+      'Waiting for boot auto-deploy to settle before redeploy'
+    );
+
+    const startTime = Date.now();
+    let previous: string[] | null = null;
+
+    while (Date.now() - startTime < timeoutMs) {
+      const current = await this.listApplications();
+
+      // An empty list means either the boot deploy hasn't surfaced the app yet
+      // OR a transient list-applications failure (listApplications() swallows
+      // errors → []). Either way it's "not yet settled" — keep polling, unless
+      // the list has stayed empty past the grace (genuinely no boot-deploy).
+      if (current.length === 0) {
+        if (Date.now() - startTime >= emptyGraceMs) {
+          this.logger.info(
+            { appName, waitedMs: Date.now() - startTime },
+            'Boot auto-deploy settled (no application registered for boot-deploy)'
+          );
+          return;
+        }
+      } else if (previous !== null && sameApps(previous, current)) {
+        // Two consecutive identical NON-EMPTY snapshots: the list is stable.
+        if (current.includes(appName)) {
+          this.logger.info(
+            { appName, applications: current, waitedMs: Date.now() - startTime },
+            'Boot auto-deploy settled (application deployed and list stable)'
+          );
+          return;
+        }
+        // Stable but our app isn't there — some other app is boot-deployed and
+        // settled, while ours isn't (and isn't going to appear via boot). Safe
+        // to proceed: the boot deploy of registered apps has finished.
+        this.logger.info(
+          { appName, applications: current, waitedMs: Date.now() - startTime },
+          'Boot auto-deploy settled (application list stable; target app not boot-deployed)'
+        );
+        return;
+      }
+
+      previous = current;
+      await this.sleep(pollIntervalMs);
+    }
+
+    this.logger.warn(
+      { appName, timeoutMs },
+      'Boot auto-deploy did not confirm settle within timeout; proceeding with serial deploy'
+    );
   }
 
   /**

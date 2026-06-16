@@ -410,6 +410,11 @@ export class WarDeployer {
         this.setDeploymentStep('starting');
         await this.payara.safeStart();
 
+        // Wait for start-domain's boot auto-deploy (domain.xml <application-ref>) to
+        // SETTLE before redeploying — otherwise undeploy/deploy --force races the boot
+        // deploy and both write applications/<app>/ concurrently (corrupts the deploy).
+        await this.payara.waitForBootDeploySettled(this.appName);
+
         this.setDeploymentStep('deploying');
         await this.payara.deploy(this.warPath, this.appName, this.contextRoot);
 
