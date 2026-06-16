@@ -696,6 +696,11 @@ export class WarDeployer {
       timings.start = Date.now() - startPayaraStart;
       this.logger.info({ duration: timings.start }, 'Payara started fresh');
 
+      // Wait for start-domain's boot auto-deploy (domain.xml <application-ref>) to
+      // SETTLE before redeploying — otherwise undeploy/deploy --force races the boot
+      // deploy and both write applications/<app>/ concurrently (corrupts the deploy).
+      await this.payara.waitForBootDeploySettled(this.appName);
+
       // ======================================================================
       // STEP 6: Deploy WAR file
       // ======================================================================

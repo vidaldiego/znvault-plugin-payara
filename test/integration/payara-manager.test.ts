@@ -285,5 +285,36 @@ describe('PayaraManager Integration', () => {
 
       warnSpy.mockRestore();
     });
+
+    it('PM-16: a transient empty-list window must not prematurely settle-empty before the app appears', async () => {
+      const manager = makeManager();
+
+      // Simulate a transient list-applications failure during boot: listApplications()
+      // swallows errors and returns [] on failure. The first few polls come back empty
+      // (transient), THEN the app surfaces and the list stabilizes. With pollInterval=10ms
+      // the empty window (~30ms) is far shorter than the empty-grace (min(20000, 2000)=2000ms),
+      // so the method must NOT return settled-empty during the transient window — it must
+      // keep polling until the app is present and the list is stable.
+      const listSpy = vi
+        .spyOn(manager, 'listApplications')
+        .mockResolvedValueOnce([]) // transient list-applications failure
+        .mockResolvedValueOnce([]) // transient list-applications failure
+        .mockResolvedValueOnce([]) // transient list-applications failure
+        .mockResolvedValue(['ZincAPI']); // app now visible and stable from here on
+
+      // Large enough timeout that the grace isn't hit during the transient empty window.
+      await expect(
+        manager.waitForBootDeploySettled('ZincAPI', 2000, 10)
+      ).resolves.toBeUndefined();
+
+      // Must have polled past the transient empties (3) plus at least two stable
+      // non-empty snapshots to confirm settle WITH the app present.
+      expect(listSpy.mock.calls.length).toBeGreaterThanOrEqual(5);
+
+      // The last observed snapshot used to confirm settle must contain the app —
+      // i.e. it settled settled-with-app, NOT settled-empty.
+      const lastResult = await listSpy.mock.results[listSpy.mock.results.length - 1].value;
+      expect(lastResult).toContain('ZincAPI');
+    });
   });
 });

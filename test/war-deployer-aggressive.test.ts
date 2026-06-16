@@ -97,3 +97,121 @@ describe('WarDeployer.deployAuto (aggressive mode)', () => {
     ]);
   });
 });
+
+describe('WarDeployer.deployWithFullRestart (aggressive diff path)', () => {
+  const logger = pino({ level: 'silent' });
+
+  /**
+   * Mocked PayaraManager for the diff path. Same call-order-recording harness
+   * as the deployAuto tests, but also records the diff-path-only methods
+   * (undeploy) so we can assert their relative position.
+   */
+  function makeMockPayara(calls: string[]): PayaraManager {
+    const record = (name: string) =>
+      vi.fn(async () => {
+        calls.push(name);
+      });
+
+    const mock = {
+      undeploy: record('undeploy'),
+      aggressiveStop: record('aggressiveStop'),
+      safeStart: record('safeStart'),
+      waitForBootDeploySettled: vi.fn(async (_appName: string) => {
+        calls.push('waitForBootDeploySettled');
+      }),
+      deploy: vi.fn(async () => {
+        calls.push('deploy');
+      }),
+      listApplications: vi.fn(async () => {
+        // Reports the app as already deployed so STEP 2 actually undeploys,
+        // and as deployed again so STEP 7 verification passes.
+        return ['TestApp'];
+      }),
+    };
+
+    return mock as unknown as PayaraManager;
+  }
+
+  /**
+   * Build a WarDeployer in aggressive mode with its filesystem-touching
+   * collaborators (file lock, journal) and the real WAR-update step stubbed
+   * out, so deployWithFullRestart runs purely through its lifecycle calls.
+   */
+  function makeDeployer(payara: PayaraManager): WarDeployer {
+    const deployer = new WarDeployer({
+      warPath: '/tmp/does-not-matter.war',
+      appName: 'TestApp',
+      payara,
+      logger,
+      aggressiveMode: true,
+    });
+
+    // Stub the DeploymentLock (writes to /var/lib/...) and DeploymentJournal so
+    // the method doesn't touch the real filesystem lock/journal paths.
+    const noop = vi.fn(async () => {});
+    (deployer as unknown as { fileLock: unknown }).fileLock = {
+      acquire: noop,
+      updateStep: noop,
+      release: noop,
+    };
+    (deployer as unknown as { journal: unknown }).journal = {
+      start: noop,
+      updateStep: noop,
+      complete: noop,
+    };
+
+    // Stub the WAR-repackaging step (STEP 1) so no real WAR file is required.
+    (deployer as unknown as { applyChangesWithoutDeploy: unknown }).applyChangesWithoutDeploy =
+      vi.fn(async () => {});
+
+    return deployer;
+  }
+
+  it('WD-AGG-03: waits for boot auto-deploy to settle between safeStart and deploy', async () => {
+    const calls: string[] = [];
+    const payara = makeMockPayara(calls);
+    const deployer = makeDeployer(payara);
+
+    const result = await deployer.deployWithFullRestart(
+      [{ path: 'index.html', content: Buffer.from('hi') }],
+      []
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.deployed).toBe(true);
+
+    expect(payara.waitForBootDeploySettled).toHaveBeenCalledWith('TestApp');
+
+    const safeStartIdx = calls.indexOf('safeStart');
+    const settleIdx = calls.indexOf('waitForBootDeploySettled');
+    const deployIdx = calls.indexOf('deploy');
+
+    expect(safeStartIdx).toBeGreaterThanOrEqual(0);
+    expect(settleIdx).toBeGreaterThan(safeStartIdx);
+    expect(deployIdx).toBeGreaterThan(settleIdx);
+  });
+
+  it('WD-AGG-04: full diff-path order is undeploy -> stop -> start -> settle -> deploy', async () => {
+    const calls: string[] = [];
+    const payara = makeMockPayara(calls);
+    const deployer = makeDeployer(payara);
+
+    await deployer.deployWithFullRestart(
+      [{ path: 'index.html', content: Buffer.from('hi') }],
+      []
+    );
+
+    // The lifecycle methods must appear in this relative order. The settle-wait
+    // must run after the undeploy/aggressiveStop/safeStart steps and before deploy.
+    const order = calls.filter(c =>
+      ['undeploy', 'aggressiveStop', 'safeStart', 'waitForBootDeploySettled', 'deploy'].includes(c)
+    );
+    expect(order).toEqual([
+      'undeploy',
+      'aggressiveStop',
+      'safeStart',
+      'waitForBootDeploySettled',
+      'deploy',
+    ]);
+  });
+});
