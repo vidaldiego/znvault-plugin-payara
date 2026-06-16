@@ -30,7 +30,12 @@ import {
   waitForAgentRestart,
   printPreflightSummary,
 } from '../listr-preflight.js';
-import { configureTLS } from '../http-client.js';
+import {
+  configureTLS,
+  setEndpointOverride,
+  clearAllEndpointOverrides,
+} from '../http-client.js';
+import { openTunnel, type Tunnel } from '../ssh-tunnel.js';
 import { getUnmappedHosts, testHAProxyConnectivity } from '../haproxy.js';
 
 /** Default CA certificate path */
@@ -115,9 +120,22 @@ export function registerDeployRunCommand(
       const progress = new ProgressReporter(ctx.isPlainMode());
       const isPlain = ctx.isPlainMode();
 
+      // Hoisted so the finally + exit backstop can see them across all early-exit paths.
+      let config: DeployConfig | undefined;
+      const openTunnels: Tunnel[] = [];
+
+      // Synchronous backstop: process.exit() does NOT await an async finally,
+      // so kill any open ssh -N children synchronously on process exit.
+      const killTunnelsSync = (): void => {
+        for (const t of openTunnels) {
+          if (t.pid) { try { process.kill(t.pid, 'SIGTERM'); } catch { /* already gone */ } }
+        }
+      };
+      process.on('exit', killTunnelsSync);
+
       try {
         const store = await loadDeployConfigs();
-        const config = store.configs[configName];
+        config = store.configs[configName];
 
         if (!config) {
           ctx.output.error(`Deployment config '${configName}' not found`);
@@ -213,6 +231,34 @@ export function registerDeployRunCommand(
 
         // Calculate local hashes (needed for analysis)
         const localHashes = await calculateWarHashes(warPath);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // SSH TUNNEL PHASE (opt-in via config.tunnel)
+        // Open one SSH-CA forward per host so the agent can stay loopback-only.
+        // Real host IPs remain the identity/display/HAProxy key; only the URL
+        // the fetch hits is rewritten (via setEndpointOverride).
+        // ═══════════════════════════════════════════════════════════════════
+        if (config.tunnel) {
+          if (!isPlain) {
+            console.log(`${ANSI.bold}Opening SSH tunnels (${config.hosts.length} hosts)...${ANSI.reset}`);
+          } else {
+            console.log(`Opening SSH tunnels (${config.hosts.length} hosts)...`);
+          }
+          for (const host of config.hosts) {
+            try {
+              const t = await openTunnel(host, {
+                user: config.ssh?.user,
+                remotePort: config.port,
+                readinessTimeoutMs: config.ssh?.readinessTimeoutMs,
+              });
+              setEndpointOverride(host, '127.0.0.1', t.localPort);
+              openTunnels.push(t);
+              ctx.output.info(`  ${host} → 127.0.0.1:${t.localPort}`);
+            } catch (err) {
+              ctx.output.warn(`  ${host}: tunnel failed (${getErrorMessage(err)})`);
+            }
+          }
+        }
 
         // Skip preflight entirely if requested
         if (options.skipPreflight) {
@@ -415,6 +461,14 @@ export function registerDeployRunCommand(
       } catch (err) {
         ctx.output.error(`Deployment failed: ${getErrorMessage(err)}`);
         process.exit(1);
+      } finally {
+        // Normal-path teardown: close tunnels + clear overrides. (process.exit
+        // paths are covered by the synchronous killTunnelsSync backstop above.)
+        if (config?.tunnel) {
+          clearAllEndpointOverrides();
+          await Promise.all(openTunnels.map(t => t.close().catch(() => undefined)));
+        }
+        process.removeListener('exit', killTunnelsSync);
       }
     });
 }
