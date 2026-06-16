@@ -216,6 +216,17 @@ export interface HAProxyConfig {
 }
 
 /**
+ * SSH tunnel settings for tunneled deploys. Identity is convention + ~/.ssh/config;
+ * these are optional overrides.
+ */
+export interface DeploySshConfig {
+  /** SSH user for the tunnel (default: "sysadmin"). */
+  user?: string;
+  /** Readiness timeout in ms for the tunneled agent /health (default: 15000). */
+  readinessTimeoutMs?: number;
+}
+
+/**
  * Deployment configuration
  */
 export interface DeployConfig {
@@ -241,6 +252,14 @@ export interface DeployConfig {
   tls?: DeployTLSConfig;
   /** HAProxy drain/ready configuration for zero-downtime deployments */
   haproxy?: HAProxyConfig;
+  /**
+   * When true, reach each host's agent through an SSH-CA-authenticated local
+   * port-forward (via `znvault ssh forward`) instead of connecting to :9100
+   * directly. Lets the agent bind loopback-only. Default: false.
+   */
+  tunnel?: boolean;
+  /** SSH tunnel settings (only used when tunnel is true). */
+  ssh?: DeploySshConfig;
 }
 
 /**
