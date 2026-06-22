@@ -276,10 +276,10 @@ Add a `quiesce` block to a deploy config and, optionally, per-host timeout overr
     }
   },
   "quiesce": {
-    "enabled": true,          // required to activate; everything else is optional
-    "pollMs": 2000,           // how often to poll inFlightUnits (default: 2000)
-    "drainTimeoutMs": 30000,  // max wait for in-flight units to reach 0 (default: 30000)
-    "originHeader": "deploy"  // X-Internal-Origin value sent to znapi (default: "deploy")
+    "enabled": true,            // required to activate; everything else is optional
+    "pollMs": 2000,             // how often to poll inFlightUnits (default: 2000)
+    "drainTimeoutMs": 120000    // max wait for in-flight units to reach 0 (default: 120000)
+    // The agent always sends X-Internal-Origin: deploy; this is not operator-configurable.
   },
   "hostConfigs": {
     "172.16.220.57": {
@@ -293,8 +293,7 @@ Add a `quiesce` block to a deploy config and, optionally, per-host timeout overr
 |-------|------|---------|-------------|
 | `quiesce.enabled` | boolean | `false` | Activate scheduler quiesce on this deploy config |
 | `quiesce.pollMs` | number | `2000` | Polling interval (ms) while waiting for in-flight units to drain |
-| `quiesce.drainTimeoutMs` | number | `30000` | Max time (ms) to wait for in-flight count to reach zero |
-| `quiesce.originHeader` | string | `"deploy"` | Value sent as `X-Internal-Origin` header to znapi |
+| `quiesce.drainTimeoutMs` | number | `120000` | Max time (ms) to wait for in-flight count to reach zero |
 | `hostConfigs.<host>.quiesceTimeoutMs` | number | _(inherits `drainTimeoutMs`)_ | Per-host override for the drain timeout |
 
 There is no `role` field. A "worker node" is simply a host that is absent from `haproxy.serverMap` — it skips the HAProxy drain/ready cycle but still receives the quiesce call before the WAR transfer.

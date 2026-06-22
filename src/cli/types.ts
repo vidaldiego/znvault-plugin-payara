@@ -271,11 +271,6 @@ export interface DeployConfig {
     pollMs?: number;
     /** Maximum ms to wait for inFlightUnits to reach 0 before proceeding anyway. Default: 120000. */
     drainTimeoutMs?: number;
-    /**
-     * Informational override for the X-Internal-Origin header sent by the agent.
-     * The agent sets the real header value ('deploy'); this field is for documentation only.
-     */
-    originHeader?: string;
   };
   /**
    * Per-host configuration overrides.
