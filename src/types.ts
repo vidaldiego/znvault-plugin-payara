@@ -142,6 +142,10 @@ export interface PayaraPluginConfig {
    * - "alias:path/to/secret.field" - fetch specific field from JSON secret
    * - "api-key:keyname" - fetch API key value
    * - "literal:value" - use literal value (not recommended for secrets)
+   * - "file:<path>" - read a LOCAL file on the node, inject its trimmed contents.
+   *     Path must be under `fileSourceRoot` (default /etc/zn-agent/node/). A missing,
+   *     unreadable, or empty file omits the env var (app falls back to its default).
+   *     For per-node markers (scheduler role, zone) under a shared host-template.
    *
    * Example:
    * {
@@ -151,6 +155,13 @@ export interface PayaraPluginConfig {
    * }
    */
   secrets?: Record<string, string>;
+
+  /**
+   * Allowlist root for `file:` secret sources (default "/etc/zn-agent/node/").
+   * A `file:` path is resolved under this root; a path outside it is rejected
+   * and the env var is omitted. Bounds what a shared host-template can read.
+   */
+  fileSourceRoot?: string;
 }
 
 /**

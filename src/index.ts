@@ -93,7 +93,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
           count: Object.keys(config.secrets!).length,
           apiKeyFilePath: config.apiKeyFilePath,
         }, 'Fetching secrets for Payara environment');
-        secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user);
+        secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user, config.fileSourceRoot);
         pluginLogger.info({ count: Object.keys(secretsEnv).length }, 'Secrets loaded successfully');
       }
 
@@ -175,7 +175,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
 
       if (hasSecrets(config)) {
         pluginLogger.debug('Refreshing secrets before Payara start');
-        secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user);
+        secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user, config.fileSourceRoot);
         await payara.updateEnvironment(secretsEnv);
       }
 
@@ -236,7 +236,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         nextRotationAt: event.nextRotationAt,
       }, 'Managed API key rotated, updating key file');
 
-      secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user);
+      secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user, config.fileSourceRoot);
       await payara.updateEnvironment(secretsEnv);
 
       if (config.apiKeyFilePath) {
@@ -280,7 +280,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       }, 'Watched secret changed, refreshing secrets');
 
       if (hasSecrets(config)) {
-        secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user);
+        secretsEnv = await fetchSecrets(ctx, config.secrets!, pluginLogger, config.apiKeyFilePath, config.user, config.fileSourceRoot);
         await payara.updateEnvironment(secretsEnv);
       }
 

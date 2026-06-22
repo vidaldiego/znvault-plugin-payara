@@ -1,4 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { resolveUnderRoot } from '../src/secrets-handler.js';
 
@@ -20,5 +22,49 @@ describe('resolveUnderRoot', () => {
   });
   it('rejects the root\'s parent', () => {
     expect(resolveUnderRoot('/etc/zn-agent', ROOT)).toBeNull();
+  });
+});
+
+import { fetchSecrets, DEFAULT_FILE_SOURCE_ROOT } from '../src/secrets-handler.js';
+
+describe('file: secret source (fetchSecrets)', () => {
+  let root: string;
+  beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'znfsrc-')); });
+  afterEach(() => { fs.rmSync(root, { recursive: true, force: true }); });
+
+  // Minimal fake ctx — file: branch never calls ctx.getSecret
+  const ctx = { getSecret: async () => { throw new Error('not used'); } } as any;
+  // Minimal silent logger stub
+  const logger = {
+    debug: () => {},
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  } as any;
+
+  it('injects the trimmed file contents', async () => {
+    fs.writeFileSync(path.join(root, 'node-role'), '  worker\n');
+    const out = await fetchSecrets(ctx, { ZN_SCHEDULER_NODE_MODE: 'file:node-role' }, logger, undefined, undefined, root);
+    expect(out.ZN_SCHEDULER_NODE_MODE).toBe('worker');
+  });
+
+  it('omits the env var when the file is missing', async () => {
+    const out = await fetchSecrets(ctx, { ZN_SCHEDULER_NODE_MODE: 'file:node-role' }, logger, undefined, undefined, root);
+    expect('ZN_SCHEDULER_NODE_MODE' in out).toBe(false);
+  });
+
+  it('omits the env var when the file is empty (whitespace-only)', async () => {
+    fs.writeFileSync(path.join(root, 'node-role'), '   \n');
+    const out = await fetchSecrets(ctx, { ZN_SCHEDULER_NODE_MODE: 'file:node-role' }, logger, undefined, undefined, root);
+    expect('ZN_SCHEDULER_NODE_MODE' in out).toBe(false);
+  });
+
+  it('omits + does not throw when the path is outside the root', async () => {
+    const out = await fetchSecrets(ctx, { X: 'file:/etc/shadow' }, logger, undefined, undefined, root);
+    expect('X' in out).toBe(false);
+  });
+
+  it('defaults the root to /etc/zn-agent/node/ when fileSourceRoot is absent', () => {
+    expect(DEFAULT_FILE_SOURCE_ROOT).toBe('/etc/zn-agent/node/');
   });
 });
