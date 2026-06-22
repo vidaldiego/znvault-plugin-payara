@@ -152,6 +152,41 @@ describe('PayaraManager Integration', () => {
     });
   });
 
+  describe('stop — waits for JVM process to drain (memory-overlap race)', () => {
+    it('PM-08b: stop() does not return until the Payara JVM PIDs are gone, even after admin port is down', async () => {
+      const manager = new PayaraManager({
+        payaraHome: mockPayara.payaraHome,
+        domain: mockPayara.domain,
+        user: process.env.USER || 'test',
+        logger,
+      });
+
+      // stop()'s guard checks isRunning() once (true → proceed to stop), then
+      // the post-stop wait sees the admin port already down (false).
+      const isRunningSpy = vi.spyOn(manager, 'isRunning')
+        .mockResolvedValueOnce(true)      // guard: domain is running → proceed
+        .mockResolvedValue(false);        // wait: admin port closed by stop-domain
+      // asadmin stop-domain succeeds (no-op for the test).
+      vi.spyOn(manager as unknown as { asadminCommand: () => Promise<string> }, 'asadminCommand')
+        .mockResolvedValue('');
+
+      // ...but the JVM lingers for a few polls before its heap is released.
+      let pollCount = 0;
+      const pidSpy = vi.spyOn(manager, 'getPayaraProcessPids').mockImplementation(async () => {
+        pollCount += 1;
+        return pollCount < 3 ? [4242] : []; // resident for 2 polls, then gone
+      });
+
+      await manager.stop();
+
+      // stop() must have polled getPayaraProcessPids until it drained to empty.
+      expect(pidSpy).toHaveBeenCalled();
+      expect(pollCount).toBeGreaterThanOrEqual(3);
+      isRunningSpy.mockRestore();
+      pidSpy.mockRestore();
+    });
+  });
+
   describe('listApplications', () => {
     it('PM-09: should return array of applications', async () => {
       mockPayara.simulateStart();

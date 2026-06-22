@@ -530,15 +530,31 @@ export class PayaraManager {
   }
 
   /**
-   * Wait for Payara to stop
+   * Wait for Payara to stop.
+   *
+   * Waits for BOTH conditions:
+   *  1. `asadmin list-domains` reports the domain "not running" (admin port down).
+   *  2. No Payara JVM process remains for the domain user.
+   *
+   * Condition 2 is essential: `stop-domain` closes the admin port (so #1 passes)
+   * well BEFORE the JVM has fully exited and released its heap. Returning on #1
+   * alone means a subsequent start-domain spawns a new heap while the old one is
+   * still resident — a transient 2×heap overlap that fails as
+   * "Failed to commit memory ... Could not create the JVM" on memory-constrained
+   * or overcommit-limited hosts (INC-2026-06-22, payara-staging-worker-1). Waiting
+   * for the process to drain frees the memory before the new JVM starts.
    */
   private async waitForStopped(timeoutMs: number): Promise<void> {
     await waitFor(
-      async () => !(await this.isRunning()),
+      async () => {
+        if (await this.isRunning()) return false;
+        const pids = await this.getPayaraProcessPids();
+        return pids.length === 0;
+      },
       timeoutMs,
       {
         intervalMs: 1000,
-        timeoutMessage: `Payara did not stop within ${timeoutMs}ms`,
+        timeoutMessage: `Payara did not fully stop (process still resident) within ${timeoutMs}ms`,
       }
     );
   }
