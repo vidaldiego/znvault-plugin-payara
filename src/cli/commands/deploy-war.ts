@@ -7,10 +7,22 @@ import type { WarFileHashes } from '../../types.js';
 import { calculateWarHashes, calculateDiff } from '../../war-deployer.js';
 import { ProgressReporter } from '../progress.js';
 import { ANSI, parsePort } from '../constants.js';
-import { agentGet, buildPluginUrl } from '../http-client.js';
+import { agentGet, buildPluginUrl, setEndpointOverride, clearEndpointOverride } from '../http-client.js';
 import type { CLIPluginContext } from '../types.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { deployToHost } from './deploy.js';
+import { openTunnel, isLoopbackHost, type Tunnel } from '../ssh-tunnel.js';
+
+/**
+ * Extract the bare host (no scheme, no port, no path) from a target that may be
+ * a plain IP/hostname or a URL. Used as the SSH tunnel destination and the
+ * endpoint-override key.
+ */
+function bareHost(target: string): string {
+  let h = target.replace(/^[a-z]+:\/\//i, ''); // strip scheme
+  h = h.replace(/[/:].*$/, ''); // strip port/path
+  return h;
+}
 
 /**
  * Register deploy war command for single-host deployment
@@ -26,13 +38,38 @@ export function registerDeployWarCommand(
     .option('-p, --port <port>', 'Agent health port (default: 9100)', '9100')
     .option('-f, --force', 'Force full deployment (no diff)')
     .option('--dry-run', 'Show what would be deployed without deploying')
+    .option('--no-tunnel', 'Connect directly to the target instead of via an SSH-CA tunnel')
     .action(async (warFile: string, options: {
       target?: string;
       port: string;
       force?: boolean;
       dryRun?: boolean;
+      tunnel?: boolean;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
+      const port = parsePort(options.port);
+
+      // Build target URL
+      const target = options.target ?? ctx.getConfig().url;
+      const host = bareHost(target);
+
+      // Open an SSH-CA tunnel by default — production agents bind :9100 on
+      // loopback only. The override rewrites the URL buildPluginUrl() produces
+      // (for BOTH the /hashes fetch and the upload) to the local forward port.
+      // Skipped for --no-tunnel or a loopback target.
+      let tunnel: Tunnel | undefined;
+      const wantTunnel = options.tunnel !== false && !isLoopbackHost(host);
+      if (wantTunnel) {
+        try {
+          tunnel = await openTunnel(host, { remotePort: port });
+          setEndpointOverride(target, '127.0.0.1', tunnel.localPort);
+          ctx.output.info(`SSH tunnel: ${host} → 127.0.0.1:${tunnel.localPort}`);
+        } catch (err) {
+          ctx.output.error(`Failed to open SSH tunnel to ${host}: ${getErrorMessage(err)}`);
+          ctx.output.error('(use --no-tunnel if the agent is directly reachable)');
+          process.exit(1);
+        }
+      }
 
       try {
         // Verify WAR file exists
@@ -50,9 +87,7 @@ export function registerDeployWarCommand(
         const localHashes = await calculateWarHashes(warFile);
         progress.foundFiles(Object.keys(localHashes).length, warStats.size);
 
-        // Build target URL
-        const target = options.target ?? ctx.getConfig().url;
-        const pluginUrl = buildPluginUrl(target, parsePort(options.port));
+        const pluginUrl = buildPluginUrl(target, port);
 
         // Get remote hashes (for dry-run we need to fetch them separately)
         let remoteHashes: WarFileHashes = {};
@@ -120,7 +155,7 @@ export function registerDeployWarCommand(
         const result = await deployToHost(
           ctx,
           target,
-          parsePort(options.port),
+          port,
           warFile,
           localHashes,
           options.force ?? false,
@@ -136,6 +171,13 @@ export function registerDeployWarCommand(
       } catch (err) {
         ctx.output.error(`Deployment failed: ${getErrorMessage(err)}`);
         process.exit(1);
+      } finally {
+        // Tear down the tunnel + override on any non-exit path (e.g. dry-run
+        // return). process.exit() paths are reaped by the OS.
+        if (tunnel) {
+          clearEndpointOverride(target);
+          await tunnel.close();
+        }
       }
     });
 }

@@ -105,6 +105,8 @@ export function registerDeployRunCommand(
     .option('--skip-version-check', 'Skip plugin version check')
     .option('--skip-drain', 'Skip HAProxy drain/ready operations')
     .option('--update-plugins', 'Update plugins if updates are available')
+    .option('--host <host>', 'Deploy to only this host from the config (repeatable) — for canaries', collectHosts, [])
+    .option('--only <host>', 'Alias for --host', collectHosts, [])
     .option('-y, --yes', 'Skip confirmation prompts')
     .action(async (configName: string, options: {
       force?: boolean;
@@ -115,6 +117,8 @@ export function registerDeployRunCommand(
       skipVersionCheck?: boolean;
       skipDrain?: boolean;
       updatePlugins?: boolean;
+      host: string[];
+      only: string[];
       yes?: boolean;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
@@ -147,6 +151,21 @@ export function registerDeployRunCommand(
           ctx.output.error('No hosts configured for this deployment');
           ctx.output.info(`Use "znvault deploy config add-host ${configName} <host>" to add hosts`);
           process.exit(1);
+        }
+
+        // Single-host filter (--host / --only) — scope a config deploy to a
+        // subset (e.g. a canary) without redeploying every host. Filters into a
+        // COPY so the persisted store is never mutated.
+        const hostFilter = [...options.host, ...options.only];
+        if (hostFilter.length > 0) {
+          const unknown = hostFilter.filter(h => !config!.hosts.includes(h));
+          if (unknown.length > 0) {
+            ctx.output.error(`--host value(s) not in config '${configName}': ${unknown.join(', ')}`);
+            ctx.output.info(`Config hosts: ${config.hosts.join(', ')}`);
+            process.exit(1);
+          }
+          config = { ...config, hosts: config.hosts.filter(h => hostFilter.includes(h)) };
+          ctx.output.info(`Scoped to ${config.hosts.length} of host(s): ${config.hosts.join(', ')}`);
         }
 
         // Resolve WAR path and get detailed info
@@ -473,4 +492,11 @@ export function registerDeployRunCommand(
         process.removeListener('exit', killTunnelsSync);
       }
     });
+}
+
+/**
+ * Collector for the repeatable --host / --only options.
+ */
+function collectHosts(value: string, previous: string[]): string[] {
+  return previous.concat([value.trim()]);
 }

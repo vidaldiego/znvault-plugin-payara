@@ -129,3 +129,10 @@ export async function openTunnel(host: string, opts: OpenTunnelOptions = {}): Pr
   await close();
   throw new Error(`Tunnel to ${host} opened (port ${localPort}) but /health never answered: ${lastErr}`);
 }
+
+/**
+ * Whether a host is loopback (already locally reachable, no tunnel needed).
+ */
+export function isLoopbackHost(host: string): boolean {
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+}

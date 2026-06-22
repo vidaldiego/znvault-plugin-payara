@@ -22,12 +22,14 @@ export function registerConfigCommands(
     .option('-h, --hosts <hosts>', 'Comma-separated list of hosts')
     .option('-p, --port <port>', 'Agent port (default: 9100)', '9100')
     .option('--parallel', 'Deploy to hosts in parallel')
+    .option('--tunnel', 'Route deploys through an SSH-CA tunnel (for loopback-only agents)')
     .option('-d, --description <desc>', 'Configuration description')
     .action(async (name: string, options: {
       war?: string;
       hosts?: string;
       port: string;
       parallel?: boolean;
+      tunnel?: boolean;
       description?: string;
     }) => {
       await withErrorHandling(ctx, async () => {
@@ -44,6 +46,7 @@ export function registerConfigCommands(
           warPath: options.war ?? '',
           port: parsePort(options.port),
           parallel: options.parallel ?? false,
+          tunnel: options.tunnel ?? false,
           description: options.description,
         };
 
@@ -124,6 +127,7 @@ export function registerConfigCommands(
         // Display strategy (prefer explicit strategy over legacy parallel flag)
         const displayStrategy = config.strategy ?? (config.parallel ? 'parallel' : 'sequential');
         console.log(`  Strategy:    ${displayStrategy}`);
+        console.log(`  Tunnel:      ${config.tunnel ? ANSI.green + 'yes (SSH-CA)' + ANSI.reset : ANSI.dim + 'no (direct)' + ANSI.reset}`);
         console.log(`\n  Hosts (${config.hosts.length}):`);
         if (config.hosts.length === 0) {
           console.log(`    ${ANSI.dim}(none)${ANSI.reset}`);
@@ -258,7 +262,7 @@ export function registerConfigCommands(
   // deploy config set <name> <key> <value>
   configCmd
     .command('set <name> <key> <value>')
-    .description('Set a configuration value (war, port, strategy, parallel, description, tls, tls-port)')
+    .description('Set a configuration value (war, port, strategy, parallel, tunnel, description, tls, tls-port)')
     .action(async (name: string, key: string, value: string) => {
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
@@ -282,6 +286,10 @@ export function registerConfigCommands(
             break;
           case 'parallel':
             config.parallel = value.toLowerCase() === 'true' || value === '1';
+            break;
+          case 'tunnel':
+            // Route deploys through an SSH-CA tunnel (for loopback-only agents).
+            config.tunnel = value.toLowerCase() === 'true' || value === '1';
             break;
           case 'description':
           case 'desc':
@@ -325,7 +333,7 @@ export function registerConfigCommands(
             break;
           default:
             ctx.output.error(`Unknown config key: ${key}`);
-            ctx.output.info('Valid keys: war, port, strategy, parallel, description, tls, tls-port, tls-ca');
+            ctx.output.info('Valid keys: war, port, strategy, parallel, tunnel, description, tls, tls-port, tls-ca');
             process.exit(1);
         }
 
