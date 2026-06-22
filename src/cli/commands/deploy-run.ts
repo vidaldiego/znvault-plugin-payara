@@ -450,6 +450,8 @@ export function registerDeployRunCommand(
           healthCheck: config.healthCheck,
           useTLS,
           haproxy: haproxyConfig,
+          quiesce: config.quiesce,
+          hostConfigs: config.hostConfigs,
         });
 
         // Print final summary

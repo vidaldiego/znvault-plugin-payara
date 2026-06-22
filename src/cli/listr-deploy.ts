@@ -12,6 +12,7 @@ import { formatSize, formatDuration, formatTime } from './formatters.js';
 import type { ConnectionInfo } from './http-client.js';
 import { getTLSIndicator } from './http-client.js';
 import { drainServer, readyServer } from './haproxy.js';
+import { quiesceScheduler, pollUntilDrained, resumeScheduler } from '../scheduler-quiesce.js';
 
 /**
  * Context passed through Listr tasks
@@ -51,12 +52,27 @@ export interface ListrDeployOptions {
   connectionMap?: Map<string, ConnectionInfo>;
   /** HAProxy drain/ready configuration */
   haproxy?: HAProxyConfig;
+  /**
+   * Scheduler quiesce configuration (Part 5a).
+   * When absent or enabled is false, deployment is byte-identical to today.
+   */
+  quiesce?: {
+    enabled?: boolean;
+    pollMs?: number;
+    drainTimeoutMs?: number;
+  };
+  /**
+   * Per-host configuration overrides (Part 5a).
+   */
+  hostConfigs?: Record<string, {
+    quiesceTimeoutMs?: number;
+  }>;
 }
 
 /**
  * Create a deployment task for a single host
  */
-function createHostTask(
+export function createHostTask(
   host: string,
   options: ListrDeployOptions
 ): ListrTask<DeployContext> {
@@ -92,11 +108,15 @@ function createHostTask(
         });
         ctx.successful++;
         return;
+        // NOTE: The early-return above exits BEFORE the try block, so quiesce
+        // is never invoked for no-change hosts — correct by design.
       }
 
       // HAProxy drain/ready wrapping
       const shouldDrain = options.haproxy && options.haproxy.serverMap[host];
       let drained = false;
+      // quiesced must be declared BEFORE the try so the finally can always see it.
+      let quiesced = false;
 
       try {
         // --- Drain from HAProxy ---
@@ -111,6 +131,38 @@ function createHostTask(
           const waitSec = options.haproxy!.drainWaitSeconds ?? 5;
           task.output = `Drain wait (${waitSec}s)...`;
           await new Promise(resolve => setTimeout(resolve, waitSec * 1000));
+        }
+
+        // Hoist the tunnel-resolved connection params here so BOTH quiesce and
+        // deployToHost use the same host/port/useTLS (crucial when an SSH tunnel
+        // is active: connInfo.port is the loopback tunnel port, not options.port).
+        const useTLS = connInfo?.tls ?? options.useTLS ?? false;
+        const port = connInfo?.port ?? options.port;
+
+        // --- Quiesce scheduler (runs for every host when enabled) ---
+        if (options.quiesce?.enabled) {
+          try {
+            task.output = 'Quiescing scheduler...';
+            const q = await quiesceScheduler(host, port, useTLS);
+            if (q.available) {
+              quiesced = true;
+              const timeoutMs = options.hostConfigs?.[host]?.quiesceTimeoutMs ?? options.quiesce.drainTimeoutMs;
+              const pollMs = options.quiesce.pollMs;
+              task.output = `Draining ${q.inFlightUnits} in-flight unit(s)...`;
+              const poll = await pollUntilDrained(host, port, { pollMs, timeoutMs }, useTLS);
+              if (poll.timedOut) {
+                task.output = `Scheduler drain timed out — proceeding`;
+              }
+              // poll.available === false (mid-poll unavailable) → proceed silently
+            } else {
+              // Old znapi or agent error — proceed without quiescing (no resume needed)
+              task.output = `Scheduler quiesce unavailable (${q.reason ?? 'n/a'}) — proceeding`;
+            }
+          } catch {
+            // Defensive: quiesce* should never throw, but guard anyway so a bug
+            // here can NEVER fail a deploy. Degrades to today's behaviour.
+            task.output = 'Scheduler quiesce error — proceeding';
+          }
         }
 
         // --- Deploy ---
@@ -133,10 +185,6 @@ function createHostTask(
         });
 
         task.output = 'Starting deployment...';
-
-        // Use connection info if available, otherwise fall back to useTLS flag
-        const useTLS = connInfo?.tls ?? options.useTLS ?? false;
-        const port = connInfo?.port ?? options.port;
 
         const result = await deployToHost(
           options.ctx,
@@ -209,6 +257,14 @@ function createHostTask(
         // ALWAYS restore server to ready if we drained it, even on failure
         if (drained && options.haproxy) {
           try { await readyServer(options.haproxy, host); } catch { /* don't mask original error */ }
+        }
+        // ALWAYS resume the scheduler if we quiesced it, even on deploy failure.
+        // resumeScheduler is best-effort (swallows internally); the quiesceTtl
+        // auto-resume is the backstop if this call fails.
+        if (quiesced) {
+          const useTLSFinal = connInfo?.tls ?? options.useTLS ?? false;
+          const portFinal = connInfo?.port ?? options.port;
+          try { await resumeScheduler(host, portFinal, useTLSFinal); } catch { /* best-effort */ }
         }
       }
     },
@@ -292,6 +348,15 @@ export async function executeListrDeployment(
 
   // Determine concurrency based on strategy
   const isConcurrent = !strategy.isCanary && strategy.batches[0]?.count === 'rest';
+
+  // Warn once if quiesce is enabled with a concurrent (parallel) strategy.
+  // All nodes will be quiesced at once, fully pausing the scheduler cluster-wide.
+  if (options.quiesce?.enabled && isConcurrent) {
+    console.warn(
+      '[znvault-deploy] quiesce + concurrent strategy: all nodes quiesced at once — ' +
+      'scheduler fully paused during deploy'
+    );
+  }
 
   // Create and run Listr
   // Use type assertion for renderer since TypeScript has trouble with union inference
