@@ -5,7 +5,27 @@ import type { Logger } from 'pino';
 import type { PluginContext } from '@zincapp/zn-vault-agent/plugins';
 import { writeFile, readFile, mkdir } from 'fs/promises';
 import { dirname } from 'path';
+import path from 'node:path';
 import { getErrorMessage } from './utils/error.js';
+
+/**
+ * Resolve `raw` to an absolute path that is guaranteed to live under `root`.
+ * Returns null if the resolved path escapes the root (via `..`, absolute path,
+ * or normalization). This is the security boundary for the `file:` secret source:
+ * a compromised shared host-template cannot point `file:` at an arbitrary node file.
+ */
+export function resolveUnderRoot(raw: string, root: string): string | null {
+  const normalizedRoot = path.resolve(root);
+  const candidate = path.isAbsolute(raw)
+    ? path.resolve(raw)
+    : path.resolve(normalizedRoot, raw);
+  // Must equal the root or sit beneath it (with a separator boundary).
+  const rootWithSep = normalizedRoot.endsWith(path.sep) ? normalizedRoot : normalizedRoot + path.sep;
+  if (candidate === normalizedRoot || candidate.startsWith(rootWithSep)) {
+    return candidate;
+  }
+  return null;
+}
 
 /**
  * Extract string value from SecretValue data
