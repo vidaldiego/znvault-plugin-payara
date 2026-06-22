@@ -283,14 +283,16 @@ describe('(c) Poll until drained', () => {
     );
   });
 
-  it('also calls pollUntilDrained when inFlightUnits is 0', async () => {
-    // pollUntilDrained is always called when quiesce is available
+  it('does NOT call pollUntilDrained when inFlightUnits is 0 (nothing to drain)', async () => {
+    // poll is skipped when nothing is in flight — quiesced is still set so resume runs
     vi.mocked(schedulerMod.quiesceScheduler).mockResolvedValue({ available: true, inFlightUnits: 0 });
 
     await runTask(HOST_API, makeOptions(HOST_API));
 
-    expect(schedulerMod.pollUntilDrained).toHaveBeenCalledOnce();
+    expect(schedulerMod.pollUntilDrained).not.toHaveBeenCalled();
     expect(deployMod.deployToHost).toHaveBeenCalledOnce();
+    // quiesced = true → resume must still run
+    expect(schedulerMod.resumeScheduler).toHaveBeenCalledOnce();
   });
 
   it('uses per-host quiesceTimeoutMs when configured', async () => {
@@ -494,9 +496,7 @@ describe('(h) Quiesce disabled: byte-identical to original deploy', () => {
 // (i) Concurrent strategy + quiesce.enabled → warns once, proceeds
 // ---------------------------------------------------------------------------
 describe('(i) Concurrent (parallel) strategy + quiesce: warns once', () => {
-  it('emits a console.warn when strategy is parallel and quiesce is enabled', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
+  it('emits a ctx.output.warn when strategy is parallel and quiesce is enabled', async () => {
     const strategy = parseDeploymentStrategy('parallel');
     const ctx2 = makeCtx();
     const analysisMap = new Map([
@@ -513,17 +513,13 @@ describe('(i) Concurrent (parallel) strategy + quiesce: warns once', () => {
       quiesce: { enabled: true, pollMs: 1, drainTimeoutMs: 5000 },
     });
 
-    expect(warnSpy).toHaveBeenCalledWith(
+    expect(ctx2.output.warn).toHaveBeenCalledWith(
       expect.stringContaining('quiesce + concurrent strategy')
     );
-    expect(warnSpy).toHaveBeenCalledTimes(1);  // warn ONCE, not per-host
-
-    warnSpy.mockRestore();
+    expect(ctx2.output.warn).toHaveBeenCalledTimes(1);  // warn ONCE, not per-host
   });
 
   it('does NOT warn when strategy is sequential (not concurrent)', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
     const strategy = parseDeploymentStrategy('sequential');
     const ctx2 = makeCtx();
     const analysisMap = new Map([
@@ -540,13 +536,10 @@ describe('(i) Concurrent (parallel) strategy + quiesce: warns once', () => {
       quiesce: { enabled: true, pollMs: 1, drainTimeoutMs: 5000 },
     });
 
-    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('quiesce + concurrent'));
-    warnSpy.mockRestore();
+    expect(ctx2.output.warn).not.toHaveBeenCalledWith(expect.stringContaining('quiesce + concurrent'));
   });
 
   it('does NOT warn when quiesce is disabled (even with parallel strategy)', async () => {
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-
     const strategy = parseDeploymentStrategy('parallel');
     const ctx2 = makeCtx();
     const analysisMap = new Map([
@@ -563,8 +556,7 @@ describe('(i) Concurrent (parallel) strategy + quiesce: warns once', () => {
       quiesce: { enabled: false },
     });
 
-    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('quiesce + concurrent'));
-    warnSpy.mockRestore();
+    expect(ctx2.output.warn).not.toHaveBeenCalledWith(expect.stringContaining('quiesce + concurrent'));
   });
 });
 

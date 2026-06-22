@@ -117,6 +117,11 @@ export function createHostTask(
       let drained = false;
       // quiesced must be declared BEFORE the try so the finally can always see it.
       let quiesced = false;
+      // Tunnel-resolved connection params declared before the try so both the
+      // quiesce step and the finally (resume) share the ONE authoritative source.
+      // (const inside a try block is not visible in its finally block.)
+      const useTLS = connInfo?.tls ?? options.useTLS ?? false;
+      const port = connInfo?.port ?? options.port;
 
       try {
         // --- Drain from HAProxy ---
@@ -133,12 +138,6 @@ export function createHostTask(
           await new Promise(resolve => setTimeout(resolve, waitSec * 1000));
         }
 
-        // Hoist the tunnel-resolved connection params here so BOTH quiesce and
-        // deployToHost use the same host/port/useTLS (crucial when an SSH tunnel
-        // is active: connInfo.port is the loopback tunnel port, not options.port).
-        const useTLS = connInfo?.tls ?? options.useTLS ?? false;
-        const port = connInfo?.port ?? options.port;
-
         // --- Quiesce scheduler (runs for every host when enabled) ---
         if (options.quiesce?.enabled) {
           try {
@@ -148,10 +147,12 @@ export function createHostTask(
               quiesced = true;
               const timeoutMs = options.hostConfigs?.[host]?.quiesceTimeoutMs ?? options.quiesce.drainTimeoutMs;
               const pollMs = options.quiesce.pollMs;
-              task.output = `Draining ${q.inFlightUnits} in-flight unit(s)...`;
-              const poll = await pollUntilDrained(host, port, { pollMs, timeoutMs }, useTLS);
-              if (poll.timedOut) {
-                task.output = `Scheduler drain timed out — proceeding`;
+              if (q.inFlightUnits > 0) {
+                task.output = `Draining ${q.inFlightUnits} in-flight unit(s)...`;
+                const poll = await pollUntilDrained(host, port, { pollMs, timeoutMs }, useTLS);
+                if (poll.timedOut) {
+                  task.output = `Scheduler drain timed out — proceeding`;
+                }
               }
               // poll.available === false (mid-poll unavailable) → proceed silently
             } else {
@@ -262,9 +263,7 @@ export function createHostTask(
         // resumeScheduler is best-effort (swallows internally); the quiesceTtl
         // auto-resume is the backstop if this call fails.
         if (quiesced) {
-          const useTLSFinal = connInfo?.tls ?? options.useTLS ?? false;
-          const portFinal = connInfo?.port ?? options.port;
-          try { await resumeScheduler(host, portFinal, useTLSFinal); } catch { /* best-effort */ }
+          try { await resumeScheduler(host, port, useTLS); } catch { /* best-effort; auto-resume backstop */ }
         }
       }
     },
@@ -352,7 +351,7 @@ export async function executeListrDeployment(
   // Warn once if quiesce is enabled with a concurrent (parallel) strategy.
   // All nodes will be quiesced at once, fully pausing the scheduler cluster-wide.
   if (options.quiesce?.enabled && isConcurrent) {
-    console.warn(
+    options.ctx.output.warn(
       '[znvault-deploy] quiesce + concurrent strategy: all nodes quiesced at once — ' +
       'scheduler fully paused during deploy'
     );
