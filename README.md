@@ -58,6 +58,7 @@ Add the plugin to your agent's `config.json`:
 | `aggressiveMode` | boolean | No | Full restart cycle on deploy (undeploy→stop→kill→start→deploy) |
 | `apiKeyFilePath` | string | No | Path to write API key file (enables zero-downtime key rotation) |
 | `secrets` | object | No | Environment variables to write to `setenv.conf` |
+| `fileSourceRoot` | string | No | Allowlist root for `file:` secret sources (default `/etc/zn-agent/node/`). A `file:` path is resolved under this root; outside-root paths are rejected and the env var omitted. |
 | `watchSecrets` | string[] | No | Secret aliases to watch for changes |
 
 ### Secrets Configuration
@@ -79,8 +80,9 @@ Secrets are written to Payara's `setenv.conf` file, NOT passed via command line 
 
 Secret value prefixes:
 - `literal:` - Static value
-- `alias:` - Vault secret alias (with optional path)
+- `alias:` - Vault secret alias (with optional `.field` extraction)
 - `api-key:` - Managed API key value
+- `file:<path>` - Read a local file on the node and inject its trimmed contents. Path must be under `fileSourceRoot` (default `/etc/zn-agent/node/`). A missing, unreadable, empty, or outside-root file **omits** the env var so the application can fall back to its own default. Use this for per-node markers (scheduler role, zone) under a shared host-template.
 
 ## HTTP API
 
@@ -335,16 +337,24 @@ The secret file path is configured in znapi's `ZincConfiguration` via `scheduler
 
 #### Agent configuration
 
-The agent requires two new optional fields in its `config.json` plugin config (both have defaults that match a standard deployment):
+The agent requires two new optional top-level fields in its `config.json` (both have defaults that match a standard deployment). These are **agent-level** fields read directly by the agent — they belong alongside `vaultUrl` and `tenantId`, **not** inside the plugin's `config` block:
 
 ```json
 {
+  "vaultUrl": "https://vault.example.com",
+  "tenantId": "my-tenant",
+  "auth": { "apiKey": "znv_..." },
+  "znapiBaseUrl": "http://127.0.0.1:8080",
+  "internalSecretFile": "/etc/zincapi/scheduler-deploy-secret",
   "plugins": [
     {
       "package": "@zincapp/znvault-plugin-payara",
       "config": {
-        "znapiBaseUrl": "http://127.0.0.1:8080",
-        "internalSecretFile": "/etc/zincapi/scheduler-deploy-secret"
+        "payaraHome": "/opt/payara",
+        "domain": "domain1",
+        "user": "payara",
+        "warPath": "/opt/app/MyApp.war",
+        "appName": "MyApp"
       }
     }
   ]
@@ -353,8 +363,8 @@ The agent requires two new optional fields in its `config.json` plugin config (b
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `znapiBaseUrl` | `http://127.0.0.1:8080` | Base URL of the znapi instance on the same node |
-| `internalSecretFile` | `/etc/zincapi/scheduler-deploy-secret` | Path to the shared deploy secret file |
+| `znapiBaseUrl` | `http://127.0.0.1:8080` | Base URL of the local znapi instance. The agent uses this to forward `/scheduler/*` passthrough calls to znapi's loopback `/internal/scheduler/*` endpoints. |
+| `internalSecretFile` | `/etc/zincapi/scheduler-deploy-secret` | Path to the shared deploy secret file. The agent reads this file and sends its contents as `X-Internal-Secret` to znapi's `InternalSchedulerFilter`. Must be provisioned during agent setup. |
 
 If `internalSecretFile` does not exist at agent start, the agent logs a warning but does **not** crash. The missing secret causes quiesce calls to return `{ available: false }`, which degrades safely to a quiesce-less deploy.
 
@@ -376,7 +386,7 @@ Follow this sequence to activate quiesce deploys safely:
 2. **Ship the dormant znapi endpoints** (`InternalSchedulerEndpoint` + `SchedulerInternalFilter`) — these endpoints are unreachable until called and do not affect normal traffic.
 3. **Ship agent + plugin** with `quiesce.enabled` absent or `false` on all deploy configs — byte-identical to the current behaviour; no quiesce calls are made.
 4. **Enable on one deploy config** — set `quiesce.enabled: true` on a single non-critical config and run a real deploy.
-5. **Smoke the loopback seam** — confirm in the deploy output that the quiesce call succeeded (look for "Quiescing scheduler..." and "Scheduler drained" in the task log). This is the single integration point that cannot be covered by automated tests (see Known coverage gap below).
+5. **Smoke the loopback seam** — confirm in the deploy output that the quiesce call succeeded. Look for `"Quiescing scheduler..."` in the task output — it appears for every host when quiesce is enabled. If in-flight units were present you will also see `"Draining N in-flight unit(s)..."`, and on timeout `"Scheduler drain timed out — proceeding"`. The absence of any scheduler-related output means the call was skipped (check for `"Scheduler quiesce unavailable"` or `"Scheduler quiesce error"` lines). This smoke step is the single integration point that cannot be covered by automated tests (see Known coverage gap below).
 6. **Roll out** to remaining deploy configs once the smoke deploy is clean.
 
 **Prerequisite satisfied:** The Q5 daily-unit same-day recovery fix (units that miss their scheduled window due to a quiesce recover on the next poll cycle) is implemented and soak-validated. It is safe to proceed even if `drainTimeoutMs` elapses with units still in flight.
@@ -553,6 +563,10 @@ npm run lint
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v1.19.0
+- Added `file:<path>` secret source: reads a local node file and injects its trimmed contents, path must be under `fileSourceRoot` (default `/etc/zn-agent/node/`), omits env var on missing/unreadable/empty/outside-root — enables per-node env markers under a shared host-template.
+- Added opt-in scheduler-aware deploy quiesce (`quiesce.enabled: true` on deploy config): drains in-flight znapi scheduler units before WAR transfer, always resumes in `finally`. Off by default — no behaviour change for existing deploy configs. Requires `znapiBaseUrl` and `internalSecretFile` agent-level config fields (both have working defaults for standard deployments).
 
 ### v1.18.0
 - Added opt-in `tunnel: true` deploy-config flag (+ optional `ssh: {user?, readinessTimeoutMs?}`): route deploys through a per-host SSH-CA local port-forward so agents stay loopback-only and `:9100` is never on the wire. Requires `@zincapp/znvault-cli` >= 4.5.0. See the [Deployment Guide → Tunneled Deploys](../docs/DEPLOYMENT_GUIDE.md#tunneled-deploys).

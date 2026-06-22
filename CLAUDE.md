@@ -110,6 +110,7 @@ secrets: {
   "ENV_VAR": "alias:path/to/secret",    // Vault secret
   "ENV_VAR": "alias:path.fieldName",    // JSON field extraction
   "ENV_VAR": "api-key:managed-key-name" // Managed API key
+  "ENV_VAR": "file:node-role"           // read node-local file under fileSourceRoot, omit on failure
 }
 ```
 
