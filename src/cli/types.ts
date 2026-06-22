@@ -260,6 +260,31 @@ export interface DeployConfig {
   tunnel?: boolean;
   /** SSH tunnel settings (only used when tunnel is true). */
   ssh?: DeploySshConfig;
+  /**
+   * Optional scheduler quiesce-before-deploy (Part 5a).
+   * When absent or `enabled` is false, deployment is byte-identical to today.
+   */
+  quiesce?: {
+    /** Enable scheduler quiescing before deploy. Default: false. */
+    enabled?: boolean;
+    /** Status poll interval in ms while waiting for in-flight units to drain. Default: 2000. */
+    pollMs?: number;
+    /** Maximum ms to wait for inFlightUnits to reach 0 before proceeding anyway. Default: 120000. */
+    drainTimeoutMs?: number;
+    /**
+     * Informational override for the X-Internal-Origin header sent by the agent.
+     * The agent sets the real header value ('deploy'); this field is for documentation only.
+     */
+    originHeader?: string;
+  };
+  /**
+   * Per-host configuration overrides.
+   * A host NOT present in haproxy.serverMap is treated as a worker (no drain/ready).
+   */
+  hostConfigs?: Record<string, {
+    /** Per-host override for the maximum quiesce drain wait in ms. */
+    quiesceTimeoutMs?: number;
+  }>;
 }
 
 /**
