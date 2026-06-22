@@ -249,6 +249,148 @@ plugin >= 1.18.0. See the
 for the full how-it-works, version matrix, loopback cutover procedure, and the
 important caution about `deploy --force` with `aggressiveMode`.
 
+### Scheduler-aware deploy (quiesce)
+
+Scheduler-aware deploy is **opt-in and off by default**. A deploy config without a `quiesce` block (or with `quiesce.enabled: false`) is byte-identical to the current behaviour — no scheduler calls are made, no new secrets are required.
+
+When enabled, the deploy drains the HAProxy backend for the target node, then asks znapi's in-process scheduler to stop accepting new units and waits until all in-flight units finish before transferring the WAR. This prevents a mid-deploy unit run from using a partially-updated WAR. The scheduler is always resumed in `finally`, even if the deploy itself fails.
+
+#### Config block
+
+Add a `quiesce` block to a deploy config and, optionally, per-host timeout overrides in `hostConfigs`:
+
+```jsonc
+{
+  "name": "znapi-staging",
+  "war": "/path/to/znapi.war",
+  "hosts": ["172.16.220.55", "172.16.220.56", "172.16.220.57"],
+  "tunnel": true,
+  "ssh": { "user": "sysadmin" },
+  "haproxy": {
+    "hosts": ["172.16.220.20"],
+    "backend": "znapi",
+    "serverMap": {
+      "172.16.220.55": "znapi-01",
+      "172.16.220.56": "znapi-02"
+      // 172.16.220.57 is a worker — absent from serverMap, skips HAProxy drain
+    }
+  },
+  "quiesce": {
+    "enabled": true,          // required to activate; everything else is optional
+    "pollMs": 2000,           // how often to poll inFlightUnits (default: 2000)
+    "drainTimeoutMs": 30000,  // max wait for in-flight units to reach 0 (default: 30000)
+    "originHeader": "deploy"  // X-Internal-Origin value sent to znapi (default: "deploy")
+  },
+  "hostConfigs": {
+    "172.16.220.57": {
+      "quiesceTimeoutMs": 60000  // per-host override of drainTimeoutMs
+    }
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `quiesce.enabled` | boolean | `false` | Activate scheduler quiesce on this deploy config |
+| `quiesce.pollMs` | number | `2000` | Polling interval (ms) while waiting for in-flight units to drain |
+| `quiesce.drainTimeoutMs` | number | `30000` | Max time (ms) to wait for in-flight count to reach zero |
+| `quiesce.originHeader` | string | `"deploy"` | Value sent as `X-Internal-Origin` header to znapi |
+| `hostConfigs.<host>.quiesceTimeoutMs` | number | _(inherits `drainTimeoutMs`)_ | Per-host override for the drain timeout |
+
+There is no `role` field. A "worker node" is simply a host that is absent from `haproxy.serverMap` — it skips the HAProxy drain/ready cycle but still receives the quiesce call before the WAR transfer.
+
+#### How it works
+
+For each host, the deploy runs the following sequence:
+
+1. **HAProxy drain** — if the host is in `haproxy.serverMap`, set it to DRAIN and wait for active connections to clear (existing behaviour, unchanged).
+2. **Quiesce** — POST to the agent's `/scheduler/quiesce` passthrough endpoint, which calls znapi's loopback `/internal/scheduler/quiesce`. The scheduler stops accepting new units and returns the current in-flight count.
+3. **Poll until drained** — poll `/scheduler/status` every `pollMs` ms until `inFlightUnits === 0` or `drainTimeoutMs` elapses.
+4. **Deploy** — transfer the WAR diff and restart Payara (existing behaviour, unchanged).
+5. **Resume** (in `finally`) — POST to `/scheduler/resume` via the agent passthrough. This runs even if the deploy fails. A failed resume is logged but never throws — znapi's internal `quiesceTtlSeconds` auto-resume is the backstop.
+
+**Degradation guarantees** — every failure degrades to today's safe deploy and the deploy proceeds:
+
+- Agent cannot reach znapi loopback (connection refused) → log + skip quiesce → deploy.
+- znapi version does not have the endpoint (HTTP 404) → agent returns `{ available: false }` → log + skip quiesce → deploy.
+- `X-Internal-Secret` mismatch (401) → log + skip quiesce → deploy.
+- Drain timeout elapsed with in-flight units still > 0 → log warning + proceed to deploy (safe because the Q5 daily-unit same-day recovery fix is in place — a mid-deploy run will recover on the next poll).
+- Resume call fails → swallow + log; auto-resume TTL is the backstop.
+
+No failure path can abort a deploy that was otherwise ready to proceed.
+
+#### Provisioning: dedicated deploy secret
+
+The loopback call uses a **dedicated deploy secret** stored on each node — it is never part of the deploy config and never travels from the operator machine.
+
+On each znapi node, provision the secret file:
+
+```bash
+# On each znapi host (e.g. /etc/zincapi/scheduler-deploy-secret)
+openssl rand -hex 32 | sudo tee /etc/zincapi/scheduler-deploy-secret > /dev/null
+sudo chmod 640 /etc/zincapi/scheduler-deploy-secret
+sudo chown root:zn-vault-agent /etc/zincapi/scheduler-deploy-secret
+```
+
+The secret file path is configured in znapi's `ZincConfiguration` via `schedulerDeploySecretFile` (default: `/etc/zincapi/scheduler-deploy-secret`). The agent reads the same file via its `internalSecretFile` config field (default: `/etc/zincapi/scheduler-deploy-secret`).
+
+#### Agent configuration
+
+The agent requires two new optional fields in its `config.json` plugin config (both have defaults that match a standard deployment):
+
+```json
+{
+  "plugins": [
+    {
+      "package": "@zincapp/znvault-plugin-payara",
+      "config": {
+        "znapiBaseUrl": "http://127.0.0.1:8080",
+        "internalSecretFile": "/etc/zincapi/scheduler-deploy-secret"
+      }
+    }
+  ]
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `znapiBaseUrl` | `http://127.0.0.1:8080` | Base URL of the znapi instance on the same node |
+| `internalSecretFile` | `/etc/zincapi/scheduler-deploy-secret` | Path to the shared deploy secret file |
+
+If `internalSecretFile` does not exist at agent start, the agent logs a warning but does **not** crash. The missing secret causes quiesce calls to return `{ available: false }`, which degrades safely to a quiesce-less deploy.
+
+#### Loopback auth model
+
+znapi's `/internal/scheduler/*` endpoint is protected by `SchedulerInternalFilter`, which mirrors the house `TrackingInternalFilter` / `FaceInternalFilter` pattern:
+
+1. **Proxy-header absence** — any request carrying `X-Forwarded-For`, `X-Real-IP`, `Forwarded`, or `Via` is rejected (403). This is the loopback signal: HAProxy strips or blocks these headers on the internal path, so their presence means the call did not originate on-node.
+2. **`X-Internal-Origin: deploy`** — must be present and equal `"deploy"` exactly (403 otherwise).
+3. **`X-Internal-Secret: <secret>`** — must match the contents of `schedulerDeploySecretFile` on the znapi node (401 otherwise).
+
+The agent sends these three conditions and no proxy headers, satisfying all three gates.
+
+#### Rollout order
+
+Follow this sequence to activate quiesce deploys safely:
+
+1. **Provision the secret** on every znapi node (`/etc/zincapi/scheduler-deploy-secret` with the same value on all nodes in a cluster).
+2. **Ship the dormant znapi endpoints** (`InternalSchedulerEndpoint` + `SchedulerInternalFilter`) — these endpoints are unreachable until called and do not affect normal traffic.
+3. **Ship agent + plugin** with `quiesce.enabled` absent or `false` on all deploy configs — byte-identical to the current behaviour; no quiesce calls are made.
+4. **Enable on one deploy config** — set `quiesce.enabled: true` on a single non-critical config and run a real deploy.
+5. **Smoke the loopback seam** — confirm in the deploy output that the quiesce call succeeded (look for "Quiescing scheduler..." and "Scheduler drained" in the task log). This is the single integration point that cannot be covered by automated tests (see Known coverage gap below).
+6. **Roll out** to remaining deploy configs once the smoke deploy is clean.
+
+**Prerequisite satisfied:** The Q5 daily-unit same-day recovery fix (units that miss their scheduled window due to a quiesce recover on the next poll cycle) is implemented and soak-validated. It is safe to proceed even if `drainTimeoutMs` elapses with units still in flight.
+
+#### Known coverage gap
+
+The single untested integration seam is the **agent → znapi call over real loopback in production** and the znapi endpoint's HTTP response paths (including the 503-on-null-scheduler branch). The znapi endpoint class cannot be invoked through a real HTTP request in unit tests because `ZincApi` is a `final` singleton with no mockable seam for the Kotlin test runner. Coverage of these paths is provided by:
+
+- **Unit tests**: `SchedulerEngine` state-machine tests (quiesce/resume/inFlightUnits logic), `SchedulerInternalFilter` auth rejection tests.
+- **Smoke deploy** (step 5 above): the first real scheduler-aware deploy exercises the full agent↔znapi loopback path end-to-end. Watch for `X-Internal-Secret` mismatches (401 in znapi logs), connection-refused errors (agent cannot reach `znapiBaseUrl`), and unexpected 503s (scheduler not initialised on this node).
+
+---
+
 ### Single-Host Deployment
 
 ```bash
