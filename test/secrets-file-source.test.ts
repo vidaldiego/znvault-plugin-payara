@@ -67,4 +67,30 @@ describe('file: secret source (fetchSecrets)', () => {
   it('defaults the root to /etc/zn-agent/node/ when fileSourceRoot is absent', () => {
     expect(DEFAULT_FILE_SOURCE_ROOT).toBe('/etc/zn-agent/node/');
   });
+
+  it('back-compat: literal/alias unchanged; file:-omitted key absent in same call', async () => {
+    // Own ctx for this test: resolves alias by returning { data: { value: 'from-alias' } }
+    // which is what extractSecretValue picks up via the 'value' key (no field extraction).
+    const aliasCtx = {
+      getSecret: async (_ref: string) => ({ data: { value: 'from-alias' } }),
+    } as any;
+
+    // ROLE file is intentionally absent from `root` → should be omitted
+    const out = await fetchSecrets(
+      aliasCtx,
+      {
+        LIT: 'literal:hello',       // literal: branch
+        ROLE: 'file:node-role',     // file: branch — file missing → omit
+        DBPW: 'alias:db/prod',      // alias: branch
+      },
+      logger,
+      undefined,
+      undefined,
+      root,
+    );
+
+    expect(out.LIT).toBe('hello');          // literal: unchanged
+    expect('ROLE' in out).toBe(false);      // file: omitted (file missing)
+    expect(out.DBPW).toBe('from-alias');    // alias: resolved via ctx.getSecret
+  });
 });
