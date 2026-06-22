@@ -4,8 +4,31 @@
 import type { Logger } from 'pino';
 import type { PluginContext } from '@zincapp/zn-vault-agent/plugins';
 import { writeFile, readFile, mkdir } from 'fs/promises';
-import { dirname } from 'path';
+import { dirname } from 'node:path';
+import path from 'node:path';
+import fs from 'node:fs';
 import { getErrorMessage } from './utils/error.js';
+
+export const DEFAULT_FILE_SOURCE_ROOT = '/etc/zn-agent/node/';
+
+/**
+ * Resolve `raw` to an absolute path that is guaranteed to live under `root`.
+ * Returns null if the resolved path escapes the root (via `..`, absolute path,
+ * or normalization). This is the security boundary for the `file:` secret source:
+ * a compromised shared host-template cannot point `file:` at an arbitrary node file.
+ */
+export function resolveUnderRoot(raw: string, root: string): string | null {
+  const normalizedRoot = path.resolve(root);
+  const candidate = path.isAbsolute(raw)
+    ? path.resolve(raw)
+    : path.resolve(normalizedRoot, raw);
+  // Must equal the root or sit beneath it (with a separator boundary).
+  const rootWithSep = normalizedRoot.endsWith(path.sep) ? normalizedRoot : normalizedRoot + path.sep;
+  if (candidate === normalizedRoot || candidate.startsWith(rootWithSep)) {
+    return candidate;
+  }
+  return null;
+}
 
 /**
  * Extract string value from SecretValue data
@@ -153,7 +176,8 @@ export async function fetchSecrets(
   secretsConfig: Record<string, string>,
   logger: Logger,
   apiKeyFilePath?: string,
-  payaraUser?: string
+  payaraUser?: string,
+  fileSourceRoot?: string
 ): Promise<Record<string, string>> {
   const env: Record<string, string> = {};
 
@@ -211,6 +235,27 @@ export async function fetchSecrets(
 
         const secretValue = await ctx.getSecret(`alias:${basePath}`);
         value = extractSecretValue(secretValue.data, field);
+      } else if (source.startsWith('file:')) {
+        // Read a local node file; omit the env var on any failure so the app
+        // can fall back to its own default (missing/unreadable/empty/outside-root).
+        const raw = source.substring('file:'.length);
+        const root = fileSourceRoot ?? DEFAULT_FILE_SOURCE_ROOT;
+        const resolved = resolveUnderRoot(raw, root);
+        if (resolved === null) {
+          logger.warn(`file: source '${raw}' is outside fileSourceRoot — omitting ${envVar}`);
+          continue; // OMIT (outside allowlist root)
+        }
+        let fileContents: string;
+        try {
+          fileContents = fs.readFileSync(resolved, 'utf8').trim();
+        } catch {
+          logger.info(`file: source '${resolved}' not readable — omitting ${envVar} (app default applies)`);
+          continue; // OMIT (missing/unreadable)
+        }
+        if (fileContents === '') {
+          continue; // OMIT (empty ≠ a meaningful value)
+        }
+        value = fileContents;
       } else {
         // Default: treat as alias
         const secretValue = await ctx.getSecret(`alias:${source}`);
