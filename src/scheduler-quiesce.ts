@@ -195,8 +195,9 @@ export async function resumeScheduler(
   const url = `${buildAgentBaseUrl(host, port, useTLS)}/scheduler/resume`;
   try {
     await agentPost<AgentQuiesceResponse>(url, {});
-  } catch {
+  } catch (err) {
     // Intentionally swallowed — auto-resume is the backstop.
+    console.warn(`[scheduler-quiesce] resume failed for ${host}:${port} — relying on auto-resume backstop: ${err}`);
   }
 }
 

@@ -56,7 +56,6 @@ describe('quiesceScheduler', () => {
     const result = await quiesceScheduler(HOST, PORT);
 
     expect(result.available).toBe(false);
-    expect(() => { /* no throw */ }).not.toThrow();
   });
 
   it('returns available:false on agent 502 / network error (no throw)', async () => {
@@ -165,7 +164,7 @@ describe('pollUntilDrained', () => {
     expect(result.drained).toBe(false);
   });
 
-  it('resolves unavailable:true (no throw) when agent reports unavailable mid-poll', async () => {
+  it('resolves available:false (no throw) when agent reports unavailable mid-poll', async () => {
     vi.mocked(httpClient.agentGet).mockResolvedValue({
       available: false,
       reason: 'znapi-internal-scheduler-not-found',
