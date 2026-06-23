@@ -10,7 +10,7 @@
 // "quiesce UNAVAILABLE — caller should proceed without quiescing".
 // They NEVER throw for operational failures; they return a typed result.
 
-import { agentGet, agentPost } from './cli/http-client.js';
+import { agentGet, agentPost, resolveEndpoint } from './cli/http-client.js';
 
 // ---------------------------------------------------------------------------
 // Default config values
@@ -76,14 +76,23 @@ export interface PollResult {
 // ---------------------------------------------------------------------------
 
 function buildAgentBaseUrl(host: string, port: number, useTLS = false): string {
-  const protocol = useTLS ? 'https' : 'http';
-
   // If the host already has a protocol, use it as-is (strip trailing slash).
+  // No override is applied to a pre-formed full URL (matches existing behavior).
   if (host.startsWith('http://') || host.startsWith('https://')) {
     return host.replace(/\/$/, '');
   }
 
-  return `${protocol}://${host}:${port}`;
+  // Apply the SSH-tunnel endpoint override (if any) so quiesce/status/resume go
+  // through the same forward the WAR transfer uses via buildPluginUrl. When an
+  // override is active the request goes to a local plain-HTTP forward, so force
+  // http regardless of useTLS — mirroring buildPluginUrl, which sets
+  // useTLS=false when an override applies (the tunnel terminates at the
+  // loopback HTTP agent).
+  const ep = resolveEndpoint(host, port);
+  const overridden = ep.host !== host || ep.port !== port;
+  const protocol = !overridden && useTLS ? 'https' : 'http';
+
+  return `${protocol}://${ep.host}:${ep.port}`;
 }
 
 // ---------------------------------------------------------------------------

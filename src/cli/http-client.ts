@@ -339,6 +339,20 @@ export function clearAllEndpointOverrides(): void {
   endpointOverrides.clear();
 }
 
+/**
+ * Resolve a (host, port) through the tunnel endpoint-override map.
+ * When a deploy runs through SSH tunnels, the real host is mapped to a
+ * 127.0.0.1:<localPort> forward — return that so callers route through the
+ * tunnel instead of the (possibly loopback-only-bound) raw host. With no
+ * override, returns { host, port } unchanged. Used by buildPluginUrl (the WAR
+ * path) and buildAgentBaseUrl (the scheduler quiesce/status/resume path) so
+ * both go through the same forward.
+ */
+export function resolveEndpoint(host: string, port: number): { host: string; port: number } {
+  const override = endpointOverrides.get(host);
+  return override ? { host: override.host, port: override.port } : { host, port };
+}
+
 export function buildPluginUrl(host: string, defaultPort: number, useTLS = false): string {
   const override = endpointOverrides.get(host);
   if (override) {

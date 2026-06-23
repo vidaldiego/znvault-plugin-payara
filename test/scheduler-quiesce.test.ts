@@ -23,6 +23,8 @@ vi.mock('../src/cli/http-client.js', () => ({
   setEndpointOverride: vi.fn(),
   clearEndpointOverride: vi.fn(),
   clearAllEndpointOverrides: vi.fn(),
+  // No tunnel override in these tests → resolve to the host/port unchanged.
+  resolveEndpoint: vi.fn((host: string, port: number) => ({ host, port })),
   configureTLS: vi.fn(),
   getTLSConfig: vi.fn(() => ({ verify: true })),
 }));
