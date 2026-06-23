@@ -10,6 +10,12 @@ import {
   STATUS_POLL_MAX_WAIT_MS,
 } from './constants.js';
 import { getErrorMessage } from '../utils/error.js';
+import { createRequire } from 'node:module';
+
+// ESM-safe synchronous require, used only for the optional `undici` dispatcher
+// below (kept sync + try/catch so a missing undici degrades gracefully rather
+// than failing at module load).
+const nodeRequire = createRequire(import.meta.url);
 import { readFileSync } from 'node:fs';
 import { Agent as HttpsAgent } from 'node:https';
 
@@ -139,8 +145,8 @@ function getFetchOptions(url: string, baseOptions: RequestInit): RequestInit {
 
   // For Node.js, try undici dispatcher first (best approach for native fetch)
   try {
-    // Dynamic import to avoid issues if undici is not available
-    const { Agent } = require('undici') as { Agent: new (options: Record<string, unknown>) => unknown };
+    // Synchronous require (via createRequire) to avoid issues if undici is not available
+    const { Agent } = nodeRequire('undici') as { Agent: new (options: Record<string, unknown>) => unknown };
     const agentOptions: Record<string, unknown> = {};
 
     if (!globalTLSOptions.verify) {
@@ -490,7 +496,7 @@ export async function probeHosts(
       try {
         const info = await probeHost(host, httpPort, httpsPort, autoDetect);
         return { host, info };
-      } catch (err) {
+      } catch {
         // Return HTTP fallback on error
         return {
           host,

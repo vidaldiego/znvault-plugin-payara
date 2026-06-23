@@ -452,7 +452,7 @@ export async function executeListrDeployment(
   let servingAborted = false;
   try {
     await listr.run();
-  } catch (err) {
+  } catch {
     // Canary failure - mark remaining SERVING hosts as skipped.
     // (The strategy/canary applies to serving nodes only, so batch offsets and
     // skipped counts are computed against `serving`, not all hosts.)

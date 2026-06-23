@@ -428,7 +428,6 @@ export class UnifiedProgress {
   showAnalysisResult(analysis: HostAnalysis): void {
     if (this.isPlain) {
       if (analysis.success) {
-        const files = analysis.filesChanged + analysis.filesDeleted;
         const mode = analysis.isFullUpload ? 'full' : 'diff';
         console.log(`  ${analysis.host}: +${analysis.filesChanged} -${analysis.filesDeleted} (${formatSize(analysis.bytesToUpload)}, ${mode})`);
       } else {

@@ -3,13 +3,13 @@
 
 import type { Command } from 'commander';
 import type { CLIPluginContext } from '../types.js';
-import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
+import { loadDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
-import { agentGet, buildPluginUrl, configureTLS } from '../http-client.js';
+import { agentGet, configureTLS } from '../http-client.js';
 import { getErrorMessage } from '../../utils/error.js';
-import { withErrorHandling, getConfigOrExit } from './helpers.js';
+import { withErrorHandling } from './helpers.js';
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 
 /** Default directory for storing CA certificates */
@@ -69,7 +69,7 @@ export function registerTLSCommands(
     .command('setup')
     .description('Setup TLS for secure agent connections (fetches CA from vault)')
     .option('--ca-path <path>', 'Custom path to save CA certificate')
-    .action(async (options: { caPath?: string }) => {
+    .action(async (_options: { caPath?: string }) => {
       await withErrorHandling(ctx, async () => {
         // Fetch CA from vault
         const caPath = await fetchAndSaveCA(ctx);

@@ -23,7 +23,6 @@ import {
   buildPluginUrl,
 } from '../http-client.js';
 import { getErrorMessage } from '../../utils/error.js';
-import { formatSize } from '../formatters.js';
 
 // Re-export type for backwards compatibility
 export type { DeployOperationResult } from '../types.js';
@@ -81,7 +80,7 @@ export async function analyzeHost(
           isFullUpload = true;
         }
         break;
-      } catch (err) {
+      } catch {
         if (attempt < MAX_RETRIES) {
           await new Promise(r => setTimeout(r, getRetryDelay(attempt)));
           continue;

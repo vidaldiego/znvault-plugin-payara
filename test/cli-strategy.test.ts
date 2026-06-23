@@ -261,12 +261,10 @@ describe('Strategy Execution', () => {
     it('should handle 2+3+R strategy correctly', async () => {
       const strategy = parseDeploymentStrategy('2+3+R');
       const hosts = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7', 'h8'];
-      let batchNumber = 0;
       const batchSizes: number[] = [];
 
       const progress = {
         showBatchHeader: vi.fn((_, __, hostCount) => {
-          batchNumber++;
           batchSizes.push(hostCount);
         }),
         showBatchResult: vi.fn(),

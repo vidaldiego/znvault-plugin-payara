@@ -4,6 +4,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { HAProxyConfig } from '../src/cli/types.js';
 
+/** The node execFile callback shape used by the mocked child_process. */
+type ExecFileCb = (error: Error | null, stdout: string, stderr: string) => void;
+
 // Mock child_process.execFile
 const mockExecFile = vi.fn();
 vi.mock('node:child_process', () => ({
@@ -38,7 +41,7 @@ describe('sshExec', () => {
   });
 
   it('should execute SSH command and return success', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, 'ok\n', '');
       return { on: vi.fn() };
     });
@@ -51,7 +54,7 @@ describe('sshExec', () => {
   });
 
   it('should return error on SSH failure', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(new Error('Connection refused'), '', 'ssh: connect to host 1.2.3.4 port 22: Connection refused');
       return { on: vi.fn() };
     });
@@ -63,7 +66,7 @@ describe('sshExec', () => {
   });
 
   it('should pass correct SSH arguments', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, '', '');
       return { on: vi.fn() };
     });
@@ -85,7 +88,7 @@ describe('sshExec', () => {
   });
 
   it('should use stderr for error message when available', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(new Error('exit code 1'), '', 'Permission denied (publickey)');
       return { on: vi.fn() };
     });
@@ -103,7 +106,7 @@ describe('setServerState', () => {
   });
 
   it('should run drain command on all HAProxy hosts in parallel', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, '', '');
       return { on: vi.fn() };
     });
@@ -122,7 +125,7 @@ describe('setServerState', () => {
   });
 
   it('should use sudo by default', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, '', '');
       return { on: vi.fn() };
     });
@@ -136,7 +139,7 @@ describe('setServerState', () => {
   });
 
   it('should skip sudo when sudo is false', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, '', '');
       return { on: vi.fn() };
     });
@@ -160,7 +163,7 @@ describe('setServerState', () => {
 
   it('should return failure if any HAProxy host fails', async () => {
     let callIndex = 0;
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       callIndex++;
       if (callIndex === 2) {
         cb(new Error('timeout'), '', 'Connection timed out');
@@ -179,7 +182,7 @@ describe('setServerState', () => {
   });
 
   it('should use custom config values', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, '', '');
       return { on: vi.fn() };
     });
@@ -206,7 +209,7 @@ describe('setServerState', () => {
 describe('drainServer / readyServer', () => {
   beforeEach(() => {
     mockExecFile.mockReset();
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, '', '');
       return { on: vi.fn() };
     });
@@ -240,7 +243,7 @@ describe('testHAProxyConnectivity', () => {
   });
 
   it('should SSH to all HAProxy hosts and check connectivity', async () => {
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       cb(null, 'ok', '');
       return { on: vi.fn() };
     });
@@ -255,7 +258,7 @@ describe('testHAProxyConnectivity', () => {
 
   it('should report failure when a host is unreachable', async () => {
     let callIndex = 0;
-    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: Function) => {
+    mockExecFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, cb: ExecFileCb) => {
       callIndex++;
       if (callIndex === 3) {
         cb(new Error('timeout'), '', 'Connection timed out');
