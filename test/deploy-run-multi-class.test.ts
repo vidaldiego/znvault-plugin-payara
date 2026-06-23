@@ -1,6 +1,6 @@
 // Path: test/deploy-run-multi-class.test.ts
 import { describe, it, expect } from 'vitest';
-import { detectConfigShape, validateClassFlags, validateClassHostOverride } from '../src/cli/commands/deploy-run.js';
+import { detectConfigShape, validateClassFlags, validateClassHostOverride, resolveClassStrategy } from '../src/cli/commands/deploy-run.js';
 import type { DeployConfig } from '../src/cli/types.js';
 
 const multi: DeployConfig = { name: 'staging', warPath: '/a.war', port: 9100, classes: [
@@ -62,5 +62,37 @@ describe('validateClassHostOverride (FIX 1)', () => {
     // This test verifies the override-set membership check is order-insensitive.
     const { unknownHosts } = validateClassHostOverride(classHosts, ['host-c', 'host-a']);
     expect(unknownHosts).toEqual([]); // both in class — no unknowns, order doesn't matter for validation
+  });
+});
+
+describe('resolveClassStrategy (--sequential priority fix)', () => {
+  // Bug: previously rc.strategy (the config value) was passed as priority-1 `strategy:` to
+  // resolveStrategy(), which outranked `sequential:` (priority 2). The fix extracts this pure
+  // helper and passes the config strategy at priority 3 so --sequential correctly overrides it.
+
+  it('bug case: config strategy 1+R + --sequential resolves to sequential', () => {
+    // Before the fix this returned '1+R' because the config value beat --sequential.
+    expect(resolveClassStrategy('1+R', undefined, true)).toBe('sequential');
+  });
+
+  it('explicit scoped --strategy beats --sequential', () => {
+    // --class api --strategy 1+2 + --sequential: the explicit override must win.
+    expect(resolveClassStrategy('1+R', '1+2', true)).toBe('1+2');
+  });
+
+  it('config strategy is used when neither scoped override nor --sequential is set', () => {
+    expect(resolveClassStrategy('1+R', undefined, undefined)).toBe('1+R');
+  });
+
+  it('explicit scoped --strategy beats config strategy (no --sequential)', () => {
+    expect(resolveClassStrategy('1+R', 'parallel', undefined)).toBe('parallel');
+  });
+
+  it('no config strategy + --sequential resolves to sequential', () => {
+    expect(resolveClassStrategy(undefined, undefined, true)).toBe('sequential');
+  });
+
+  it('no overrides + no config strategy defaults to sequential', () => {
+    expect(resolveClassStrategy(undefined, undefined, undefined)).toBe('sequential');
   });
 });

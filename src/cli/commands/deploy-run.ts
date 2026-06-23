@@ -133,6 +133,29 @@ function configureTLSForDeployment(config: DeployConfig, ctx: CLIPluginContext):
 }
 
 /**
+ * Resolve the effective deployment strategy for one class in a multi-class config.
+ *
+ * Priority (highest → lowest):
+ *   1. `scopedStrategyOverride` — an explicit `--class X --strategy VALUE` flag (beats everything)
+ *   2. `sequential`             — the bare `--sequential` flag (beats the class config)
+ *   3. `configStrategy`         — the strategy declared for this class in the config file
+ *   4. Default: `'sequential'`
+ *
+ * This is a pure helper so it can be unit-tested independently of the CLI process loop.
+ */
+export function resolveClassStrategy(
+  configStrategy: string | undefined,
+  scopedStrategyOverride: string | undefined,
+  sequential: boolean | undefined,
+): string {
+  return resolveStrategy({
+    strategy: scopedStrategyOverride,  // priority 1: explicit --class X --strategy VALUE
+    sequential,                        // priority 2: bare --sequential flag
+    configStrategy,                    // priority 3: class's configured strategy
+  });
+}
+
+/**
  * Validate a per-class --host/--only override against the class's resolved host list.
  * Pure (zero I/O). Returns `{ unknownHosts }` on violation (non-empty array), `{ unknownHosts: [] }` on success.
  *
@@ -653,13 +676,19 @@ async function runMultiClassDeploy(
   const { selected: selectedClasses } = partitionSelectedClasses(config.classes!, options.class);
 
   // 2. Resolve the classes (inheriting config-level defaults).
-  const resolved = selectedClasses.map(cls => {
+  // We track each class's scoped strategy override SEPARATELY from rc.strategy (the
+  // config-file value) so that resolveClassStrategy() can apply the correct priority:
+  //   explicit --class X --strategy  >  --sequential  >  class config strategy
+  const resolvedWithOverrides = selectedClasses.map(cls => {
     let rc = resolveClass(config, cls);
+    let scopedStrategyOverride: string | undefined;
 
     // Scoped per-class override: single --class + --strategy/--host.
     if (options.class.length === 1 && options.class[0] === cls.name) {
       if (options.strategy) {
-        rc = { ...rc, strategy: options.strategy };
+        // Keep rc.strategy as the config value; store the scoped override separately
+        // so resolveClassStrategy() can rank it at priority 1 vs --sequential at 2.
+        scopedStrategyOverride = options.strategy;
       }
       const hostOverride = [...options.host, ...options.only];
       if (hostOverride.length > 0) {
@@ -675,16 +704,17 @@ async function runMultiClassDeploy(
         rc = { ...rc, hosts: rc.hosts.filter(h => hostOverride.includes(h)) };
       }
     }
-    return rc;
+    return { rc, scopedStrategyOverride };
   });
+  const resolved = resolvedWithOverrides.map(({ rc }) => rc);
 
   // 3. For --dry-run: print plan and return.
   if (options.dryRun) {
-    // Resolve the effective strategy for each class (mirrors the executor path)
-    // so the printed plan always matches what would run (e.g. --sequential overrides
-    // the class's configured strategy).
-    const effectiveStrategies = resolved.map(rc =>
-      resolveStrategy({ strategy: rc.strategy, sequential: options.sequential })
+    // Resolve the effective strategy for each class using the correct priority:
+    //   explicit --class X --strategy  >  --sequential  >  class config strategy
+    // (mirrors the executor path so the printed plan always matches what would run).
+    const effectiveStrategies = resolvedWithOverrides.map(({ rc, scopedStrategyOverride }) =>
+      resolveClassStrategy(rc.strategy, scopedStrategyOverride, options.sequential)
     );
     printMultiClassDryRun(resolved, effectiveStrategies, isPlain);
     return;
@@ -709,6 +739,11 @@ async function runMultiClassDeploy(
       if (selectedSet.has(cls.name)) break;
     }
   }
+
+  // Build a lookup from class name → scoped strategy override for the executor.
+  const scopedStrategyOverrideMap = new Map<string, string | undefined>(
+    resolvedWithOverrides.map(({ rc, scopedStrategyOverride }) => [rc.name, scopedStrategyOverride])
+  );
 
   // 5. Build runClass(rc) — per-class: tunnels + preflight + executeListrDeployment.
   const runClass = async (rc: typeof resolved[0]) => {
@@ -844,13 +879,13 @@ async function runMultiClassDeploy(
         }
       }
 
-      // Resolve the class-scoped strategy.
-      const classScopedStrategy = resolveStrategy({
-        strategy: rc.strategy,
-        sequential: options.sequential,
-        configStrategy: undefined, // already resolved into rc.strategy
-        configParallel: undefined,
-      });
+      // Resolve the class-scoped strategy using the correct priority:
+      //   explicit --class X --strategy  >  --sequential  >  class config strategy
+      const classScopedStrategy = resolveClassStrategy(
+        rc.strategy,                                     // priority 3: class config strategy
+        scopedStrategyOverrideMap.get(rc.name),          // priority 1: explicit scoped --strategy
+        options.sequential,                              // priority 2: bare --sequential flag
+      );
 
       let strategy;
       try {
