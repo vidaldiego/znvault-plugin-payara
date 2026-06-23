@@ -10,6 +10,10 @@ dist/
 *.swp
 *.swo
 
+# AI tooling scratch (Claude Code / superpowers)
+.claude/
+.superpowers/
+
 # OS
 .DS_Store
 Thumbs.db
