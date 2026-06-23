@@ -77,6 +77,47 @@ The plugin implements `@zincapp/zn-vault-agent/plugins` interface:
 - `PluginContext` provides vault client, logger, config
 - Events: `CertificateDeployedEvent`, `KeyRotatedEvent`, `SecretChangedEvent`
 
+### Deploy node classes (`deploy run`)
+
+A deploy config is **flat** (top-level `hosts`) or **multi-class** (an ordered
+`classes` array) — never both. `classes` absent ⇒ flat path runs byte-identically
+to v1.21.1. Two layers:
+
+1. **Within one host list (v1.21.1):** the strategy (`1+R`, …) applies to
+   **serving** nodes (in `haproxy.serverMap`); **worker** nodes (not in
+   `serverMap`) deploy in a separate final batch — parallel, no drain,
+   **non-blocking**. `partitionHostsByClass` (`listr-deploy.ts`) is the split.
+2. **Multi-class (v1.22.0):** an explicit `classes[]` so `deploy run <env>`
+   deploys every node class (api, worker, future) as **ordered phases**, each
+   self-describing (own `strategy`, `blocking`, `haproxy` drain, `quiesce`, and
+   overridable shared defaults incl. a per-class WAR). Classes deploy in array
+   order behind a **blocking gate**.
+
+**Key files** — `deploy-class.ts` (`resolveClass`, `partitionSelectedClasses`,
+`hasActiveServerMap`), `deploy-config-validate.ts` (`validateDeployConfig`),
+`multi-class-deploy.ts` (`executeMultiClassDeployment` + `classGateFailed` +
+dry-run/summary printers), wired in `commands/deploy-run.ts`.
+
+**The gate (load-bearing):** `classGateFailed = failed>0 || aborted ||
+healthCheckFailed>0` — includes `healthCheckFailed` (a parallel-strategy serving
+health-fail must gate downstream), **excludes** `workerFailed`. Same formula is
+also on the flat exit path. A blocking class must pass before the next runs; a
+non-blocking class warns on failure but never aborts; exit non-zero iff a
+blocking class fails (`result.abortedAt`).
+
+**Resolution:** class field wins over the config-level shared default; **objects
+replace wholesale** (no deep-merge). `quiesce`/`hostConfigs` are **per-class
+only** (never inherit; top-level on a multi-class config is a validation error).
+`blocking` defaults true iff resolved `haproxy` has a non-empty `serverMap`.
+
+**CLI:** `--class <name>` (repeatable, config order), `--dry-run` (per-class
+plan), class-scoped `--strategy`/`--host` (need exactly one `--class`),
+`deploy config validate <cfg>`. v1 authors `classes` by hand-editing
+`~/.znvault/deploy-configs.json` (no CLI authoring command yet).
+
+Guide: README → "Multi-class configs". Design:
+`../docs/superpowers/specs/2026-06-23-multi-class-deploy-design.md`.
+
 ## Testing
 
 Tests use **Vitest** with mocked Payara/agent dependencies.
