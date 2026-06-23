@@ -6,6 +6,7 @@ import type { CLIPluginContext, DeployConfig, HealthCheckConfig, HAProxyConfig }
 import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
 import { getConfigOrExit, confirmPrompt, withErrorHandling } from './helpers.js';
+import { validateDeployConfig } from '../deploy-config-validate.js';
 
 /**
  * Register deploy config commands
@@ -598,6 +599,24 @@ export function registerConfigCommands(
           ctx.output.info(`  ${mapping.substring(0, eqIndex)} → ${mapping.substring(eqIndex + 1)}`);
         }
       }, 'Failed to update HAProxy mappings');
+    });
+  // deploy config validate <name>
+  configCmd
+    .command('validate <name>')
+    .description('Validate a deployment config (flat or multi-class)')
+    .action(async (name: string) => {
+      await withErrorHandling(ctx, async () => {
+        const { config } = await getConfigOrExit(ctx, name);
+        const report = validateDeployConfig(config);
+        for (const i of report.info) ctx.output.info(`ℹ ${i}`);
+        for (const w of report.warnings) ctx.output.warn(`⚠ ${w}`);
+        for (const e of report.errors) ctx.output.error(`✗ ${e}`);
+        if (report.errors.length > 0) {
+          ctx.output.error(`Config '${name}' has ${report.errors.length} error(s).`);
+          process.exit(1);
+        }
+        ctx.output.success(`Config '${name}' is valid${report.warnings.length ? ` (${report.warnings.length} warning(s))` : ''}.`);
+      }, 'Failed to validate config');
     });
 }
 
