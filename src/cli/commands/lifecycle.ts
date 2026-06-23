@@ -34,10 +34,10 @@ export function registerLifecycleCommands(
             process.exit(1);
           }
 
-          ctx.output.info(`Restarting Payara on ${config.hosts.length} host(s)...`);
+          ctx.output.info(`Restarting Payara on ${(config.hosts ?? []).length} host(s)...`);
 
-          for (const host of config.hosts) {
-            const pluginUrl = buildPluginUrl(host, config.port);
+          for (const host of (config.hosts ?? [])) {
+            const pluginUrl = buildPluginUrl(host, config.port ?? 9100);
             try {
               await agentPost(`${pluginUrl}/restart`, {});
               console.log(`  ${ANSI.green}✓${ANSI.reset} ${host} restarted`);
@@ -77,8 +77,8 @@ export function registerLifecycleCommands(
 
           console.log(`\n${ANSI.bold}Status for ${configName}:${ANSI.reset}\n`);
 
-          for (const host of config.hosts) {
-            const pluginUrl = buildPluginUrl(host, config.port);
+          for (const host of (config.hosts ?? [])) {
+            const pluginUrl = buildPluginUrl(host, config.port ?? 9100);
             try {
               const status = await agentGet<{
                 healthy: boolean;

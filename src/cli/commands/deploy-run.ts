@@ -55,7 +55,7 @@ function configureTLSForDeployment(config: DeployConfig, ctx: CLIPluginContext):
       configureTLS({ verify: false });
       return { port: tlsConfig.httpsPort ?? 9443, useTLS: true };
     }
-    return { port: config.port, useTLS: false };
+    return { port: config.port ?? 9100, useTLS: false };
   }
 
   // TLS enabled - determine CA certificate path
@@ -74,7 +74,7 @@ function configureTLSForDeployment(config: DeployConfig, ctx: CLIPluginContext):
     ctx.output.warn(`CA certificate not found at ${caCertPath}`);
     ctx.output.info('Run "znvault deploy tls setup" to fetch CA from vault');
     ctx.output.info('Falling back to HTTP (insecure)');
-    return { port: config.port, useTLS: false };
+    return { port: config.port ?? 9100, useTLS: false };
   }
 
   // Configure TLS
@@ -147,7 +147,7 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
-        if (config.hosts.length === 0) {
+        if ((config.hosts ?? []).length === 0) {
           ctx.output.error('No hosts configured for this deployment');
           ctx.output.info(`Use "znvault deploy config add-host ${configName} <host>" to add hosts`);
           process.exit(1);
@@ -158,18 +158,18 @@ export function registerDeployRunCommand(
         // COPY so the persisted store is never mutated.
         const hostFilter = [...options.host, ...options.only];
         if (hostFilter.length > 0) {
-          const unknown = hostFilter.filter(h => !config!.hosts.includes(h));
+          const unknown = hostFilter.filter(h => !config!.hosts!.includes(h));
           if (unknown.length > 0) {
             ctx.output.error(`--host value(s) not in config '${configName}': ${unknown.join(', ')}`);
-            ctx.output.info(`Config hosts: ${config.hosts.join(', ')}`);
+            ctx.output.info(`Config hosts: ${config.hosts!.join(', ')}`);
             process.exit(1);
           }
-          config = { ...config, hosts: config.hosts.filter(h => hostFilter.includes(h)) };
-          ctx.output.info(`Scoped to ${config.hosts.length} of host(s): ${config.hosts.join(', ')}`);
+          config = { ...config, hosts: config.hosts!.filter(h => hostFilter.includes(h)) };
+          ctx.output.info(`Scoped to ${config.hosts!.length} of host(s): ${config.hosts!.join(', ')}`);
         }
 
         // Resolve WAR path and get detailed info
-        const warPath = resolve(config.warPath);
+        const warPath = resolve(config.warPath!);
         let warInfo: WarInfo;
         try {
           warInfo = await getWarInfo(warPath);
@@ -213,10 +213,10 @@ export function registerDeployRunCommand(
         }
 
         if (!isPlain) {
-          console.log(`${ANSI.dim}  Hosts:    ${ANSI.reset}${config.hosts.length}`);
+          console.log(`${ANSI.dim}  Hosts:    ${ANSI.reset}${config.hosts!.length}`);
           progress.showStrategy(getStrategyDisplayName(strategy), strategy.isCanary);
         } else {
-          ctx.output.info(`  Hosts: ${config.hosts.length}`);
+          ctx.output.info(`  Hosts: ${config.hosts!.length}`);
           ctx.output.info(`  Strategy: ${getStrategyDisplayName(strategy)}`);
         }
 
@@ -229,8 +229,8 @@ export function registerDeployRunCommand(
             ctx.output.info('  HAProxy: skipped (--skip-drain)');
           }
         } else if (haproxyConfig) {
-          const mappedCount = config.hosts.filter(h => haproxyConfig.serverMap[h]).length;
-          const unmapped = getUnmappedHosts(haproxyConfig, config.hosts);
+          const mappedCount = config.hosts!.filter(h => haproxyConfig.serverMap[h]).length;
+          const unmapped = getUnmappedHosts(haproxyConfig, config.hosts!);
           if (!isPlain) {
             console.log(`${ANSI.dim}  HAProxy:  ${ANSI.reset}${ANSI.green}enabled${ANSI.reset} (${haproxyConfig.hosts.length} LB, ${mappedCount} mapped)`);
           } else {
@@ -259,11 +259,11 @@ export function registerDeployRunCommand(
         // ═══════════════════════════════════════════════════════════════════
         if (config.tunnel) {
           if (!isPlain) {
-            console.log(`${ANSI.bold}Opening SSH tunnels (${config.hosts.length} hosts)...${ANSI.reset}`);
+            console.log(`${ANSI.bold}Opening SSH tunnels (${config.hosts!.length} hosts)...${ANSI.reset}`);
           } else {
-            console.log(`Opening SSH tunnels (${config.hosts.length} hosts)...`);
+            console.log(`Opening SSH tunnels (${config.hosts!.length} hosts)...`);
           }
-          for (const host of config.hosts) {
+          for (const host of config.hosts!) {
             try {
               const t = await openTunnel(host, {
                 user: config.ssh?.user,
@@ -286,13 +286,13 @@ export function registerDeployRunCommand(
 
         // Run parallel preflight checks
         if (!isPlain) {
-          console.log(`${ANSI.bold}Checking ${config.hosts.length} hosts...${ANSI.reset}`);
+          console.log(`${ANSI.bold}Checking ${config.hosts!.length} hosts...${ANSI.reset}`);
         } else {
-          console.log(`Checking ${config.hosts.length} hosts...`);
+          console.log(`Checking ${config.hosts!.length} hosts...`);
         }
 
         const preflightResult = await executePreflightChecks({
-          hosts: config.hosts,
+          hosts: config.hosts!,
           port: effectivePort,
           localHashes,
           force: options.force ?? false,
@@ -302,10 +302,10 @@ export function registerDeployRunCommand(
         });
 
         // Print summary
-        printPreflightSummary(preflightResult, config.hosts.length, isPlain);
+        printPreflightSummary(preflightResult, config.hosts!.length, isPlain);
 
         // Handle unreachable hosts
-        const unreachableHosts = config.hosts.filter(h => !preflightResult.reachableHosts.includes(h));
+        const unreachableHosts = config.hosts!.filter(h => !preflightResult.reachableHosts.includes(h));
         if (unreachableHosts.length > 0 && !options.yes) {
           console.log('');
           ctx.output.warn(`Unreachable hosts will be skipped: ${unreachableHosts.join(', ')}`);

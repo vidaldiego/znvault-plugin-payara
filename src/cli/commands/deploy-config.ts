@@ -54,8 +54,8 @@ export function registerConfigCommands(
         await saveDeployConfigs(store);
 
         ctx.output.success(`Created deployment config: ${name}`);
-        if (config.hosts.length > 0) {
-          ctx.output.info(`  Hosts: ${config.hosts.join(', ')}`);
+        if ((config.hosts ?? []).length > 0) {
+          ctx.output.info(`  Hosts: ${(config.hosts ?? []).join(', ')}`);
         }
         if (config.warPath) {
           ctx.output.info(`  WAR: ${config.warPath}`);
@@ -95,7 +95,7 @@ export function registerConfigCommands(
           if (config.description) {
             console.log(`    ${ANSI.dim}${config.description}${ANSI.reset}`);
           }
-          console.log(`    Hosts: ${config.hosts.length > 0 ? config.hosts.join(', ') : ANSI.dim + '(none)' + ANSI.reset}`);
+          console.log(`    Hosts: ${(config.hosts ?? []).length > 0 ? (config.hosts ?? []).join(', ') : ANSI.dim + '(none)' + ANSI.reset}`);
           console.log(`    WAR:   ${config.warPath || ANSI.dim + '(not set)' + ANSI.reset}`);
           const displayStrategy = config.strategy ?? (config.parallel ? 'parallel' : 'sequential');
           console.log(`    Strategy: ${displayStrategy}`);
@@ -128,11 +128,11 @@ export function registerConfigCommands(
         const displayStrategy = config.strategy ?? (config.parallel ? 'parallel' : 'sequential');
         console.log(`  Strategy:    ${displayStrategy}`);
         console.log(`  Tunnel:      ${config.tunnel ? ANSI.green + 'yes (SSH-CA)' + ANSI.reset : ANSI.dim + 'no (direct)' + ANSI.reset}`);
-        console.log(`\n  Hosts (${config.hosts.length}):`);
-        if (config.hosts.length === 0) {
+        console.log(`\n  Hosts (${(config.hosts ?? []).length}):`);
+        if ((config.hosts ?? []).length === 0) {
           console.log(`    ${ANSI.dim}(none)${ANSI.reset}`);
         } else {
-          for (const host of config.hosts) {
+          for (const host of (config.hosts ?? [])) {
             console.log(`    - ${host}`);
           }
         }
@@ -224,11 +224,12 @@ export function registerConfigCommands(
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
 
-        if (config.hosts.includes(host)) {
+        if ((config.hosts ?? []).includes(host)) {
           ctx.output.warn(`Host '${host}' already in config`);
           return;
         }
 
+        if (!config.hosts) config.hosts = [];
         config.hosts.push(host);
         await saveDeployConfigs(store);
 
@@ -245,17 +246,17 @@ export function registerConfigCommands(
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
 
-        const index = config.hosts.indexOf(host);
+        const index = (config.hosts ?? []).indexOf(host);
         if (index === -1) {
           ctx.output.error(`Host '${host}' not found in config`);
           process.exit(1);
         }
 
-        config.hosts.splice(index, 1);
+        config.hosts!.splice(index, 1);
         await saveDeployConfigs(store);
 
         ctx.output.success(`Removed host: ${host}`);
-        ctx.output.info(`Config '${name}' now has ${config.hosts.length} host(s)`);
+        ctx.output.info(`Config '${name}' now has ${config.hosts!.length} host(s)`);
       }, 'Failed to remove host');
     });
 

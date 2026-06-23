@@ -3,7 +3,7 @@
 
 import { Listr, ListrTask, PRESET_TIMER } from 'listr2';
 import type { WarFileHashes } from '../types.js';
-import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult, HealthCheckConfig, HAProxyConfig } from './types.js';
+import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult, HealthCheckConfig, HAProxyConfig, QuiesceConfig } from './types.js';
 import type { HostAnalysis } from './unified-progress.js';
 import { deployToHost } from './commands/deploy.js';
 import { performHealthCheck } from './host-checks.js';
@@ -62,11 +62,7 @@ export interface ListrDeployOptions {
    * Scheduler quiesce configuration (Part 5a).
    * When absent or enabled is false, deployment is byte-identical to today.
    */
-  quiesce?: {
-    enabled?: boolean;
-    pollMs?: number;
-    drainTimeoutMs?: number;
-  };
+  quiesce?: QuiesceConfig;
   /**
    * Per-host configuration overrides (Part 5a).
    */

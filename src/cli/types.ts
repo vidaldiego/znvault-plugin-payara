@@ -227,15 +227,66 @@ export interface DeploySshConfig {
 }
 
 /**
+ * Scheduler quiesce-before-deploy configuration (Part 5a).
+ * Extracted from the previously-inline literal so it can be reused on
+ * DeployConfig, DeployClass, and ListrDeployOptions.
+ */
+export interface QuiesceConfig {
+  /** Enable scheduler quiescing before deploy. Default: false. */
+  enabled?: boolean;
+  /** Status poll interval in ms while waiting for in-flight units to drain. Default: 2000. */
+  pollMs?: number;
+  /** Maximum ms to wait for inFlightUnits to reach 0 before proceeding anyway. Default: 120000. */
+  drainTimeoutMs?: number;
+}
+
+/**
+ * Fields with a deployment-wide default that a node class may override.
+ * Adding a field here automatically makes it per-class overridable.
+ * NOTE: quiesce and hostConfigs are deliberately NOT here — per-class only.
+ */
+export interface SharedDeployDefaults {
+  warPath?: string;
+  port?: number;
+  tunnel?: boolean;
+  ssh?: DeploySshConfig;
+  tls?: DeployTLSConfig;
+  healthCheck?: HealthCheckConfig;
+  haproxy?: HAProxyConfig;
+  strategy?: string;
+}
+
+/**
+ * One node class within a multi-class deploy. IS a SharedDeployDefaults (every
+ * field overridable) plus the fields intrinsic to a class.
+ */
+export type DeployClass = SharedDeployDefaults & {
+  /** 'api' | 'worker' | 'ai' — unique within the config. */
+  name: string;
+  /** Hosts in this class. No host may appear in two classes. */
+  hosts: string[];
+  /**
+   * Whether this class must fully succeed before the next class starts.
+   * Default: true if the resolved haproxy is present AND has a non-empty
+   * serverMap, else false. Explicit value overrides.
+   */
+  blocking?: boolean;
+  /** Scheduler quiesce — PER-CLASS ONLY (does not inherit from the base). */
+  quiesce?: QuiesceConfig;
+  /** Per-host quiesce-timeout overrides. Author on the SAME class as quiesce. */
+  hostConfigs?: Record<string, { quiesceTimeoutMs?: number }>;
+};
+
+/**
  * Deployment configuration
  */
 export interface DeployConfig {
   name: string;
-  hosts: string[];
-  warPath: string;
-  port: number;
+  hosts?: string[];                 // optional: absent on multi-class configs
+  warPath?: string;                 // optional: may live per-class
+  port?: number;                    // optional: may live per-class
   /** @deprecated Use strategy instead. Kept for backwards compatibility. */
-  parallel: boolean;
+  parallel?: boolean;
   /**
    * Deployment strategy
    * - "sequential" - deploy one host at a time
@@ -264,14 +315,7 @@ export interface DeployConfig {
    * Optional scheduler quiesce-before-deploy (Part 5a).
    * When absent or `enabled` is false, deployment is byte-identical to today.
    */
-  quiesce?: {
-    /** Enable scheduler quiescing before deploy. Default: false. */
-    enabled?: boolean;
-    /** Status poll interval in ms while waiting for in-flight units to drain. Default: 2000. */
-    pollMs?: number;
-    /** Maximum ms to wait for inFlightUnits to reach 0 before proceeding anyway. Default: 120000. */
-    drainTimeoutMs?: number;
-  };
+  quiesce?: QuiesceConfig;
   /**
    * Per-host configuration overrides.
    * A host NOT present in haproxy.serverMap is treated as a worker (no drain/ready).
@@ -280,6 +324,8 @@ export interface DeployConfig {
     /** Per-host override for the maximum quiesce drain wait in ms. */
     quiesceTimeoutMs?: number;
   }>;
+  /** ORDERED array — array order IS deploy order. Mutually exclusive with top-level `hosts`. */
+  classes?: DeployClass[];
 }
 
 /**
