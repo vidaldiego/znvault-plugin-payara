@@ -5,6 +5,7 @@
 
 import type { DeployContext } from './listr-deploy.js';
 import type { ResolvedClass } from './deploy-class.js';
+import { ANSI } from './constants.js';
 
 export interface ClassOutcome {
   name: string;
@@ -22,6 +23,74 @@ export interface MultiClassResult {
 /** The blocking gate: a class "failed" iff failed>0 || aborted || healthCheckFailed>0. NOT workerFailed. */
 export function classGateFailed(ctx: DeployContext): boolean {
   return ctx.failed > 0 || ctx.aborted || ctx.healthCheckFailed > 0;
+}
+
+/**
+ * Print the dry-run plan for a multi-class deploy.
+ * Shows each resolved class in config order: name, blocking, strategy, drain, hosts.
+ */
+export function printMultiClassDryRun(resolved: ResolvedClass[], isPlain: boolean): void {
+  if (isPlain) {
+    console.log('Dry run - multi-class deploy plan:');
+  } else {
+    console.log(`\n${ANSI.bold}Dry run — multi-class deploy plan:${ANSI.reset}`);
+  }
+  resolved.forEach((rc, i) => {
+    const blockLabel = rc.blocking ? 'blocking' : 'non-blocking';
+    const strategyLabel = rc.strategy ?? 'sequential';
+    const drainLabel = rc.haproxy && rc.haproxy.serverMap && Object.keys(rc.haproxy.serverMap).length > 0
+      ? 'drain'
+      : 'no-drain';
+    const hostsLabel = rc.hosts.length > 0 ? rc.hosts.join(', ') : '(no hosts)';
+    if (isPlain) {
+      console.log(`  ${i + 1}. ${rc.name} [${blockLabel}] strategy=${strategyLabel} ${drainLabel} hosts=${hostsLabel}`);
+    } else {
+      console.log(`  ${ANSI.bold}${i + 1}. ${rc.name}${ANSI.reset} [${blockLabel}] strategy=${strategyLabel} ${drainLabel} hosts=${hostsLabel}`);
+    }
+  });
+}
+
+/**
+ * Print a summary of a completed multi-class deploy.
+ */
+export function printMultiClassSummary(result: MultiClassResult, isPlain: boolean): void {
+  console.log('');
+  if (result.abortedAt) {
+    if (isPlain) {
+      console.log(`Multi-class deploy ABORTED at class '${result.abortedAt}'.`);
+    } else {
+      console.log(`${ANSI.red}${ANSI.bold}Multi-class deploy ABORTED${ANSI.reset} at class '${result.abortedAt}'.`);
+    }
+  }
+  for (const outcome of result.classes) {
+    let statusLabel: string;
+    if (!outcome.ran) {
+      statusLabel = outcome.skippedReason === 'upstream-abort'
+        ? 'not run (upstream-abort)'
+        : outcome.skippedReason === 'no-hosts'
+          ? 'skipped (no hosts)'
+          : `skipped (${outcome.skippedReason ?? 'unknown'})`;
+    } else if (outcome.ctx) {
+      const c = outcome.ctx;
+      const parts: string[] = [`${c.successful} succeeded`];
+      if (c.failed > 0) parts.push(`${c.failed} failed`);
+      if (c.healthCheckFailed > 0) parts.push(`${c.healthCheckFailed} unhealthy`);
+      if (c.workerFailed > 0) parts.push(`${c.workerFailed} worker(s) failed`);
+      if (c.skipped > 0) parts.push(`${c.skipped} skipped`);
+      statusLabel = parts.join(', ');
+    } else {
+      statusLabel = 'ran';
+    }
+    const blockLabel = outcome.blocking ? '[blocking]' : '[non-blocking]';
+    if (isPlain) {
+      console.log(`  ${outcome.name} ${blockLabel}: ${statusLabel}`);
+    } else {
+      const color = (!outcome.ran && outcome.skippedReason === 'upstream-abort') || (outcome.ctx && (outcome.ctx.failed > 0 || outcome.ctx.healthCheckFailed > 0))
+        ? ANSI.red
+        : outcome.ran ? ANSI.green : ANSI.yellow;
+      console.log(`  ${color}${outcome.name}${ANSI.reset} ${blockLabel}: ${statusLabel}`);
+    }
+  }
 }
 
 export async function executeMultiClassDeployment(
