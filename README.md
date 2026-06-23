@@ -329,6 +329,141 @@ If you would rather deploy a worker on its own schedule, give it a **separate de
 
 > **Guard — single class:** with no `haproxy` block (or an empty `serverMap`) there is no serving/worker distinction; **all** hosts are treated as one class and the strategy runs over them unchanged. A worker-only config (a `serverMap` that matches none of the listed hosts) simply deploys every host as a non-blocking worker batch — it does not error, because there is no serving node to protect.
 
+#### Multi-class configs
+
+The implicit two-class model above (serving nodes in `serverMap`, worker nodes absent) handles most environments. When you need a **third class**, **per-class strategies**, **per-class quiesce**, or **per-class WARs**, use an explicit `classes` array instead of a flat `hosts` list.
+
+A config is either **flat** (top-level `hosts`, no `classes`) or **multi-class** (`classes`, no top-level `hosts`) — never both. Flat configs are **fully unchanged** — adding the `classes` field is always opt-in.
+
+##### The `classes` block
+
+```jsonc
+{
+  "name": "staging",
+  "description": "ZincAPI staging — api + scheduler worker",
+  // Shared defaults — inherited by every class unless a class overrides them:
+  "warPath": "/path/to/zincapi-staging.war",
+  "port": 9100,
+  "tunnel": true,
+  "ssh": { "user": "sysadmin" },
+  "healthCheck": {
+    "path": "/service-status", "port": 8080, "expectedStatus": 200,
+    "timeout": 5000, "retries": 5, "retryDelay": 3000
+  },
+  "classes": [
+    {
+      "name": "api",
+      "hosts": ["172.16.220.55", "172.16.220.56", "172.16.220.57"],
+      "strategy": "1+R",
+      "haproxy": {
+        "hosts": ["172.16.220.20", "172.16.220.21", "172.16.220.22"],
+        "backend": "packleader_api_backend",
+        "serverMap": {
+          "172.16.220.55": "server1",
+          "172.16.220.56": "server2",
+          "172.16.220.57": "server3"
+        },
+        "socketPath": "/run/haproxy/admin.sock",
+        "drainWaitSeconds": 10
+      }
+      // `blocking` defaults true (resolved haproxy has a non-empty serverMap).
+      // Inherits warPath / port / tunnel / ssh / healthCheck from the top level.
+    },
+    {
+      "name": "worker",
+      "hosts": ["172.16.220.58"],
+      "strategy": "parallel",
+      "blocking": false,
+      "quiesce": { "enabled": true, "pollMs": 2000, "drainTimeoutMs": 120000 }
+      // No haproxy → no drain. quiesce lives ONLY on the scheduler class.
+      // Inherits warPath / port / tunnel / ssh / healthCheck from the top level.
+    }
+  ]
+}
+```
+
+`deploy run staging` deploys the `api` class first (`1+R`, drain) and, only if it succeeds, deploys the `worker` class (parallel, no drain, quiesce, non-blocking).
+
+##### Per-class fields and shared defaults
+
+Each class inherits the following fields from the config level unless the class declares its own value: `warPath`, `port`, `tunnel`, `ssh`, `tls`, `healthCheck`, `haproxy`, `strategy`. **Objects replace wholesale** — a class's `haproxy` fully replaces the base `haproxy`; there is no deep-merge.
+
+`quiesce` and `hostConfigs` are **per-class only** — they do not inherit from the config level and must not appear at the top level of a multi-class config (that is a hard validation error). This is intentional: a shared top-level `quiesce` would cause api nodes to quiesce pointlessly.
+
+| Field | Per-class only? | Inherits from config? | Notes |
+|-------|-----------------|-----------------------|-------|
+| `name` | yes | — | Unique within the config |
+| `hosts` | yes | — | No host may appear in two classes |
+| `blocking` | yes | — | Defaults from drain presence (see below) |
+| `quiesce` | yes | no | Set only on the class(es) that run the scheduler |
+| `hostConfigs` | yes | no | Per-host `quiesceTimeoutMs` override; same class as `quiesce` |
+| `warPath` | — | yes | Class value wins if present |
+| `port` | — | yes | Class value wins if present |
+| `tunnel` | — | yes | Class value wins if present |
+| `ssh` | — | yes | Class value wins if present |
+| `tls` | — | yes | Class value wins if present |
+| `healthCheck` | — | yes | Class value wins if present |
+| `haproxy` | — | yes | Class value wins if present (replaces wholesale) |
+| `strategy` | — | yes | Class value wins if present |
+
+##### Blocking gate and deploy ordering
+
+Classes deploy in **array order** — the order you list them in `classes` is the deploy order. A `blocking` class must fully succeed (all nodes healthy) before the next class starts. A **non-blocking** class's failure is recorded as a warning but never aborts the run.
+
+`blocking` defaults:
+- **`true`** — if the resolved `haproxy` is present and has a non-empty `serverMap` (the class drains, so failures matter).
+- **`false`** — if there is no `haproxy` or the `serverMap` is empty (e.g. a worker class).
+- An explicit `blocking: true` or `blocking: false` on the class overrides either default.
+
+When a blocking class fails, all downstream classes are skipped and recorded as `upstream-abort` in the summary. The process exits non-zero.
+
+##### CLI: `deploy run` with multi-class configs
+
+```bash
+# Deploy all classes in config order
+znvault deploy run staging
+
+# Deploy a single class (replaces the separate-config workaround)
+znvault deploy run staging --class worker
+
+# Deploy a subset (config order preserved, gating applies)
+znvault deploy run staging --class api --class worker
+
+# Override the roll strategy for one class
+znvault deploy run staging --class api --strategy 1+2
+
+# Scope to a specific host within one class
+znvault deploy run staging --class api --host 172.16.220.55
+
+# Dry run — print the ordered plan without deploying
+znvault deploy run staging --dry-run
+znvault deploy run staging --class worker --dry-run
+```
+
+`--dry-run` output example:
+
+```
+Dry run — staging (2 classes, ordered):
+ 1. api     [blocking]      1+R       drain     172.16.220.55, .56, .57
+ 2. worker  [non-blocking]  parallel  no-drain  172.16.220.58
+```
+
+`--strategy` and `--host` are **per-class** on multi-class configs. Using them without `--class` (or with more than one `--class`) is an error.
+
+Deploying a subset that omits an upstream blocking class (e.g. `--class worker` alone) prints a notice — "deploying 'worker' without its upstream 'api' gate (api not selected)" — but is allowed (useful for targeted re-deploys).
+
+##### Validating a multi-class config
+
+```bash
+znvault deploy config validate staging
+```
+
+Runs all structural checks — duplicate hosts, class names, `serverMap` integrity, resolvable `warPath`/`port` — and exits non-zero on any hard violation. Run this after hand-editing a config before deploying. It makes zero network calls.
+
+##### Authoring multi-class configs
+
+Multi-class configs are authored by **editing `~/.znvault/deploy-configs.json` directly**. There is no CLI command to create or modify a `classes` block in v1 — use `deploy config validate <name>` as the safety net after each edit. The worked example above is the canonical starting point for a two-class api + worker environment.
+
 #### How it works (per host)
 
 Within the serving batch (and within the final worker batch), each host runs the following sequence:
