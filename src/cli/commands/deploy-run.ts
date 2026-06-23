@@ -133,6 +133,19 @@ function configureTLSForDeployment(config: DeployConfig, ctx: CLIPluginContext):
 }
 
 /**
+ * Validate a per-class --host/--only override against the class's resolved host list.
+ * Pure (zero I/O). Returns `{ unknownHosts }` on violation (non-empty array), `{ unknownHosts: [] }` on success.
+ *
+ * The caller must still filter `classHosts` to the override set — this function only validates membership.
+ */
+export function validateClassHostOverride(
+  classHosts: string[],
+  hostOverride: string[],
+): { unknownHosts: string[] } {
+  return { unknownHosts: hostOverride.filter(h => !classHosts.includes(h)) };
+}
+
+/**
  * Register deploy run command for multi-host deployment
  */
 export function registerDeployRunCommand(
@@ -650,7 +663,16 @@ async function runMultiClassDeploy(
       }
       const hostOverride = [...options.host, ...options.only];
       if (hostOverride.length > 0) {
-        rc = { ...rc, hosts: hostOverride };
+        // Validate: every override value must be a member of this class's hosts.
+        const { unknownHosts } = validateClassHostOverride(rc.hosts, hostOverride);
+        if (unknownHosts.length > 0) {
+          ctx.output.error(
+            `--host value(s) not in class '${rc.name}': ${unknownHosts.join(', ')}. Class hosts: ${rc.hosts.join(', ')}`
+          );
+          process.exit(1);
+        }
+        // Filter (preserving class order) instead of replacing with the raw array.
+        rc = { ...rc, hosts: rc.hosts.filter(h => hostOverride.includes(h)) };
       }
     }
     return rc;
@@ -658,7 +680,13 @@ async function runMultiClassDeploy(
 
   // 3. For --dry-run: print plan and return.
   if (options.dryRun) {
-    printMultiClassDryRun(resolved, isPlain);
+    // Resolve the effective strategy for each class (mirrors the executor path)
+    // so the printed plan always matches what would run (e.g. --sequential overrides
+    // the class's configured strategy).
+    const effectiveStrategies = resolved.map(rc =>
+      resolveStrategy({ strategy: rc.strategy, sequential: options.sequential })
+    );
+    printMultiClassDryRun(resolved, effectiveStrategies, isPlain);
     return;
   }
 

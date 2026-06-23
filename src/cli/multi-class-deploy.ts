@@ -5,6 +5,7 @@
 
 import type { DeployContext } from './listr-deploy.js';
 import type { ResolvedClass } from './deploy-class.js';
+import { hasActiveServerMap } from './deploy-class.js';
 import { ANSI } from './constants.js';
 
 export interface ClassOutcome {
@@ -28,8 +29,19 @@ export function classGateFailed(ctx: DeployContext): boolean {
 /**
  * Print the dry-run plan for a multi-class deploy.
  * Shows each resolved class in config order: name, blocking, strategy, drain, hosts.
+ *
+ * @param resolved - Resolved class configs in config order.
+ * @param effectiveStrategies - Pre-resolved effective strategy string per class (same
+ *   index as `resolved`). Computed by the caller via `resolveStrategy({ strategy:
+ *   rc.strategy, sequential: options.sequential })` so that `--dry-run --sequential`
+ *   prints the strategy that would actually run, not just the class-configured one.
+ * @param isPlain - Plain output mode (no ANSI).
  */
-export function printMultiClassDryRun(resolved: ResolvedClass[], isPlain: boolean): void {
+export function printMultiClassDryRun(
+  resolved: ResolvedClass[],
+  effectiveStrategies: string[],
+  isPlain: boolean,
+): void {
   if (isPlain) {
     console.log('Dry run - multi-class deploy plan:');
   } else {
@@ -37,10 +49,8 @@ export function printMultiClassDryRun(resolved: ResolvedClass[], isPlain: boolea
   }
   resolved.forEach((rc, i) => {
     const blockLabel = rc.blocking ? 'blocking' : 'non-blocking';
-    const strategyLabel = rc.strategy ?? 'sequential';
-    const drainLabel = rc.haproxy && rc.haproxy.serverMap && Object.keys(rc.haproxy.serverMap).length > 0
-      ? 'drain'
-      : 'no-drain';
+    const strategyLabel = effectiveStrategies[i] ?? 'sequential';
+    const drainLabel = hasActiveServerMap(rc.haproxy) ? 'drain' : 'no-drain';
     const hostsLabel = rc.hosts.length > 0 ? rc.hosts.join(', ') : '(no hosts)';
     if (isPlain) {
       console.log(`  ${i + 1}. ${rc.name} [${blockLabel}] strategy=${strategyLabel} ${drainLabel} hosts=${hostsLabel}`);
