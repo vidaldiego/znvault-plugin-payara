@@ -1,6 +1,6 @@
 // Path: test/deploy-class-resolve.test.ts
 import { describe, it, expect } from 'vitest';
-import { resolveClass } from '../src/cli/deploy-class.js';
+import { resolveClass, partitionSelectedClasses } from '../src/cli/deploy-class.js';
 import type { DeployConfig } from '../src/cli/types.js';
 
 const base: DeployConfig = {
@@ -58,5 +58,34 @@ describe('resolveClass', () => {
     const baseWithQuiesce: DeployConfig = { ...base, quiesce: { enabled: true } } as DeployConfig;
     const r = resolveClass(baseWithQuiesce, { name: 'api', hosts: ['.55'] });
     expect(r.quiesce).toBeUndefined();
+  });
+});
+
+describe('partitionSelectedClasses', () => {
+  const classes = [
+    { name: 'api', hosts: ['.55'] },
+    { name: 'worker', hosts: ['.58'] },
+  ];
+
+  it('returns all classes in config order when no selection', () => {
+    const r = partitionSelectedClasses(classes, undefined);
+    expect(r.selected.map(c => c.name)).toEqual(['api', 'worker']);
+    expect(r.unknown).toEqual([]);
+  });
+
+  it('filters to the selected subset, preserving CONFIG order (not flag order)', () => {
+    const r = partitionSelectedClasses(classes, ['worker', 'api']);
+    expect(r.selected.map(c => c.name)).toEqual(['api', 'worker']);
+  });
+
+  it('reports unknown class names', () => {
+    const r = partitionSelectedClasses(classes, ['bogus']);
+    expect(r.selected).toEqual([]);
+    expect(r.unknown).toEqual(['bogus']);
+  });
+
+  it('selects a single class', () => {
+    const r = partitionSelectedClasses(classes, ['worker']);
+    expect(r.selected.map(c => c.name)).toEqual(['worker']);
   });
 });

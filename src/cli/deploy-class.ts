@@ -45,3 +45,21 @@ export function resolveClass(base: DeployConfig, cls: DeployClass): ResolvedClas
 
   return resolved;
 }
+
+/**
+ * Filter classes to a --class selection, PRESERVING CONFIG ORDER (not flag
+ * order). Returns the selected classes and any unknown names from the selection.
+ * No selection (undefined) ⇒ all classes.
+ */
+export function partitionSelectedClasses(
+  classes: DeployClass[],
+  selected?: string[],
+): { selected: DeployClass[]; unknown: string[] } {
+  if (!selected || selected.length === 0) {
+    return { selected: [...classes], unknown: [] };
+  }
+  const known = new Set(classes.map(c => c.name));
+  const unknown = selected.filter(n => !known.has(n));
+  const wanted = new Set(selected);
+  return { selected: classes.filter(c => wanted.has(c.name)), unknown };
+}
