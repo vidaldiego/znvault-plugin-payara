@@ -28,10 +28,16 @@ export interface DeployContext {
   skipped: number;
   /** Successful count */
   successful: number;
-  /** Failed count */
+  /** Failed count (serving nodes only — drives process exit code) */
   failed: number;
   /** Health check failures */
   healthCheckFailed: number;
+  /**
+   * Worker-node deploy failures (hosts NOT in haproxy.serverMap).
+   * Tracked separately from `failed` because a worker failure is non-blocking:
+   * it is logged + warned but must NOT fail or abort the serving roll.
+   */
+  workerFailed: number;
 }
 
 /**
@@ -70,11 +76,48 @@ export interface ListrDeployOptions {
 }
 
 /**
- * Create a deployment task for a single host
+ * Partition hosts into node classes by HAProxy serverMap membership.
+ *
+ * - **serving**: host IS in `haproxy.serverMap` — routed, user traffic, needs
+ *   drain, canary-meaningful. The operator's strategy applies to these only.
+ * - **workers**: host is NOT in `haproxy.serverMap` — unrouted, no drain,
+ *   canary-meaningless. These deploy in a separate, final, non-blocking batch.
+ *
+ * Guard: with no serverMap (no HAProxy config, or an empty map) there is no
+ * class distinction — ALL hosts are treated as serving (one class), preserving
+ * the pre-node-class behavior for non-HAProxy and worker-only configs.
+ *
+ * This is the single source of truth for the split, shared by the deployer and
+ * the `--dry-run` plan so they can never diverge.
+ */
+export function partitionHostsByClass(
+  hosts: string[],
+  haproxy: HAProxyConfig | undefined
+): { serving: string[]; workers: string[] } {
+  const serverMap = haproxy?.serverMap;
+  const hasServerMap = !!serverMap && Object.keys(serverMap).length > 0;
+  if (!hasServerMap) {
+    return { serving: [...hosts], workers: [] };
+  }
+  return {
+    serving: hosts.filter(h => serverMap![h]),
+    workers: hosts.filter(h => !serverMap![h]),
+  };
+}
+
+/**
+ * Create a deployment task for a single host.
+ *
+ * @param isWorker When true, the host is a worker node (not in
+ *   haproxy.serverMap). Its deploy is NON-BLOCKING: a failure is recorded in
+ *   `ctx.workerFailed` (not `ctx.failed`) and is NOT rethrown, so it can never
+ *   abort or fail the serving roll. Worker nodes are unrouted, so a failure
+ *   there is non-urgent.
  */
 export function createHostTask(
   host: string,
-  options: ListrDeployOptions
+  options: ListrDeployOptions,
+  isWorker = false
 ): ListrTask<DeployContext> {
   const analysis = options.analysisMap.get(host);
   const connInfo = options.connectionMap?.get(host);
@@ -201,8 +244,14 @@ export function createHostTask(
         ctx.results.set(host, result);
 
         if (!result.success) {
-          ctx.failed++;
           const errorMsg = result.error?.substring(0, 50) ?? 'Unknown error';
+          if (isWorker) {
+            // Worker failure is non-blocking: record + surface, never abort.
+            ctx.workerFailed++;
+            task.title = `${host}${tlsIndicator} - worker FAILED (non-blocking): ${errorMsg}`;
+            return;
+          }
+          ctx.failed++;
           task.title = `${host}${tlsIndicator} - FAILED: ${errorMsg}`;
           throw new Error(result.error ?? 'Deployment failed');
         }
@@ -233,8 +282,14 @@ export function createHostTask(
             ctx.successful++;
             task.title = `${host}${tlsIndicator} - deployed + healthy (${elapsed})${timeStr}`;
           } else {
-            ctx.healthCheckFailed++;
             const errorMsg = healthResult.error ?? `HTTP ${healthResult.status}`;
+            if (isWorker) {
+              // Worker health failure is non-blocking: record + surface, never abort.
+              ctx.workerFailed++;
+              task.title = `${host}${tlsIndicator} - worker UNHEALTHY (non-blocking): ${errorMsg}`;
+              return;
+            }
+            ctx.healthCheckFailed++;
             task.title = `${host}${tlsIndicator} - deployed but UNHEALTHY: ${errorMsg}`;
             // In canary mode, health check failure should stop deployment
             throw new Error(`Health check failed: ${errorMsg}`);
@@ -292,21 +347,38 @@ export async function executeListrDeployment(
     successful: 0,
     failed: 0,
     healthCheckFailed: 0,
+    workerFailed: 0,
   };
 
-  // Build tasks based on strategy
+  // --- Partition hosts by node class (serving vs worker) ---
+  // The operator's strategy applies to serving nodes only; workers deploy in a
+  // separate, final, non-blocking batch. See partitionHostsByClass for the rule.
+  const { serving, workers } = partitionHostsByClass(hosts, options.haproxy);
+
+  // Warn on a mixed config: the strategy governs serving nodes only; workers
+  // deploy last (parallel, non-blocking).
+  if (serving.length > 0 && workers.length > 0) {
+    options.ctx.output.warn(
+      `[znvault-deploy] config mixes serving (${serving.join(', ')}) and ` +
+      `worker (${workers.join(', ')}) nodes; the strategy applies to serving ` +
+      `nodes only — workers deploy last (parallel, non-blocking). Consider a ` +
+      `separate config / 'deploy war --target' for workers.`
+    );
+  }
+
+  // Build tasks based on strategy, over SERVING nodes only.
   const tasks: ListrTask<DeployContext>[] = [];
   let hostIndex = 0;
 
-  for (let batchIndex = 0; batchIndex < strategy.batches.length && hostIndex < hosts.length; batchIndex++) {
+  for (let batchIndex = 0; batchIndex < strategy.batches.length && hostIndex < serving.length; batchIndex++) {
     const batch = strategy.batches[batchIndex]!;
     const batchSize = batch.count === 'rest'
-      ? hosts.length - hostIndex
-      : Math.min(batch.count, hosts.length - hostIndex);
+      ? serving.length - hostIndex
+      : Math.min(batch.count, serving.length - hostIndex);
 
     if (batchSize <= 0) break;
 
-    const batchHosts = hosts.slice(hostIndex, hostIndex + batchSize);
+    const batchHosts = serving.slice(hostIndex, hostIndex + batchSize);
     hostIndex += batchSize;
 
     // Create batch task with subtasks for each host
@@ -375,22 +447,26 @@ export async function executeListrDeployment(
     ? new Listr<DeployContext, 'simple'>(tasks, { ...listrOptions, renderer: 'simple' })
     : new Listr<DeployContext, 'default'>(tasks, { ...listrOptions, renderer: 'default' });
 
+  let servingAborted = false;
   try {
     await listr.run();
   } catch (err) {
-    // Canary failure - mark remaining hosts as skipped
+    // Canary failure - mark remaining SERVING hosts as skipped.
+    // (The strategy/canary applies to serving nodes only, so batch offsets and
+    // skipped counts are computed against `serving`, not all hosts.)
     if (strategy.isCanary) {
       ctx.aborted = true;
+      servingAborted = true;
       // Find which batch failed
       for (let i = 0; i < strategy.batches.length; i++) {
         let batchStart = 0;
         for (let j = 0; j < i; j++) {
           const b = strategy.batches[j]!;
-          batchStart += b.count === 'rest' ? hosts.length : b.count;
+          batchStart += b.count === 'rest' ? serving.length : b.count;
         }
         const batch = strategy.batches[i]!;
-        const batchSize = batch.count === 'rest' ? hosts.length - batchStart : batch.count;
-        const batchHosts = hosts.slice(batchStart, batchStart + batchSize);
+        const batchSize = batch.count === 'rest' ? serving.length - batchStart : batch.count;
+        const batchHosts = serving.slice(batchStart, batchStart + batchSize);
 
         // Check if any host in this batch failed
         for (const h of batchHosts) {
@@ -403,8 +479,39 @@ export async function executeListrDeployment(
         if (ctx.failedBatch) break;
       }
 
-      // Count skipped hosts
-      ctx.skipped = hosts.filter(h => !ctx.results.has(h)).length;
+      // Count skipped serving hosts
+      ctx.skipped = serving.filter(h => !ctx.results.has(h)).length;
+    }
+  }
+
+  // --- Worker batch (final, parallel, no drain, NON-BLOCKING) ---
+  // Workers deploy LAST, only if the serving roll did not abort. A worker
+  // failure is recorded in ctx.workerFailed (not ctx.failed) and never aborts.
+  // Don't touch workers if serving is broken (servingAborted short-circuits).
+  if (workers.length > 0 && !servingAborted) {
+    const workerTasks = workers.map(host => createHostTask(host, options, /* isWorker */ true));
+    const workerListrOptions = {
+      concurrent: workers.length > 1,
+      // Non-blocking: never throw out of the worker batch. createHostTask also
+      // swallows worker failures (records to workerFailed + returns), so this is
+      // belt-and-suspenders.
+      exitOnError: false,
+      collectErrors: 'minimal' as const,
+      rendererOptions: {
+        collapseSubtasks: false,
+        collapseErrors: false,
+        timer: PRESET_TIMER,
+      },
+      ctx,
+    };
+    const workerListr = isPlain
+      ? new Listr<DeployContext, 'simple'>(workerTasks, { ...workerListrOptions, renderer: 'simple' })
+      : new Listr<DeployContext, 'default'>(workerTasks, { ...workerListrOptions, renderer: 'default' });
+    try {
+      await workerListr.run();
+    } catch {
+      // Defensive: worker batch is best-effort. A worker failure must never
+      // fail or abort the (already-successful) serving deploy.
     }
   }
 
@@ -474,14 +581,17 @@ export function printDeploymentSummary(
   const skippedText = ctx.skipped > 0 ? `, ${ctx.skipped} skipped` : '';
   const failedText = ctx.failed > 0 ? `, ${ctx.failed} failed` : '';
   const unhealthyText = ctx.healthCheckFailed > 0 ? `, ${ctx.healthCheckFailed} unhealthy` : '';
+  // Worker failures are non-blocking: surfaced here but excluded from the
+  // success/exit logic below (they never make the deploy "fail").
+  const workerText = ctx.workerFailed > 0 ? `, ${ctx.workerFailed} worker(s) failed (non-blocking)` : '';
 
   if (isPlain) {
-    console.log(`Deployment complete: ${ctx.successful}/${totalHosts} hosts successful${failedText}${unhealthyText}${skippedText}`);
+    console.log(`Deployment complete: ${ctx.successful}/${totalHosts} hosts successful${failedText}${unhealthyText}${skippedText}${workerText}`);
   } else {
-    if (ctx.failed === 0 && ctx.skipped === 0 && ctx.healthCheckFailed === 0) {
+    if (ctx.failed === 0 && ctx.skipped === 0 && ctx.healthCheckFailed === 0 && ctx.workerFailed === 0) {
       console.log(`\x1b[32m\x1b[1m✓ Deployment complete\x1b[0m: ${ctx.successful}/${totalHosts} hosts successful`);
     } else {
-      console.log(`\x1b[33m\x1b[1m⚠ Deployment complete\x1b[0m: ${ctx.successful}/${totalHosts} hosts successful${failedText}${unhealthyText}${skippedText}`);
+      console.log(`\x1b[33m\x1b[1m⚠ Deployment complete\x1b[0m: ${ctx.successful}/${totalHosts} hosts successful${failedText}${unhealthyText}${skippedText}${workerText}`);
     }
   }
 }

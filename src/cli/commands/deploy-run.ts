@@ -23,7 +23,7 @@ import {
 import { getErrorMessage } from '../../utils/error.js';
 import { resolveStrategy } from '../strategy-executor.js';
 import { formatSize } from '../formatters.js';
-import { executeListrDeployment, printDeploymentSummary } from '../listr-deploy.js';
+import { executeListrDeployment, printDeploymentSummary, partitionHostsByClass } from '../listr-deploy.js';
 import {
   executePreflightChecks,
   executePluginUpdates,
@@ -420,10 +420,33 @@ export function registerDeployRunCommand(
         if (options.dryRun) {
           console.log('');
           ctx.output.info(`Dry run - would deploy to ${hostsWithChanges.length} host(s):`);
-          for (const host of hostsWithChanges) {
+
+          // Show the per-node-class plan: the strategy (1+R, …) applies to
+          // serving nodes only; workers deploy last (parallel, no drain,
+          // non-blocking). Mirrors executeListrDeployment via the shared helper.
+          const { serving, workers } = partitionHostsByClass(hostsWithChanges, haproxyConfig);
+
+          const describeHost = (host: string): string => {
             const analysis = analysisMap.get(host)!;
             const mode = analysis.isFullUpload ? 'full' : 'diff';
-            ctx.output.info(`  ${host}: +${analysis.filesChanged} -${analysis.filesDeleted} (${formatSize(analysis.bytesToUpload)}, ${mode})`);
+            return `+${analysis.filesChanged} -${analysis.filesDeleted} (${formatSize(analysis.bytesToUpload)}, ${mode})`;
+          };
+
+          if (workers.length > 0 && serving.length > 0) {
+            ctx.output.info(`  Strategy '${strategy.name}' applies to serving nodes; workers deploy last (parallel, no drain, non-blocking).`);
+            ctx.output.info(`  Serving (${serving.length}, strategy ${strategy.name}):`);
+            for (const host of serving) {
+              ctx.output.info(`    ${host}: ${describeHost(host)}  [drain]`);
+            }
+            ctx.output.info(`  Workers (${workers.length}, final batch):`);
+            for (const host of workers) {
+              ctx.output.info(`    ${host}: ${describeHost(host)}  [no drain, non-blocking]`);
+            }
+          } else {
+            // Single class (all serving / all worker / no serverMap): flat list.
+            for (const host of hostsWithChanges) {
+              ctx.output.info(`  ${host}: ${describeHost(host)}`);
+            }
           }
           return;
         }

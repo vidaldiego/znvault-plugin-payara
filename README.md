@@ -274,7 +274,11 @@ Add a `quiesce` block to a deploy config and, optionally, per-host timeout overr
     "serverMap": {
       "172.16.220.55": "znapi-01",
       "172.16.220.56": "znapi-02"
-      // 172.16.220.57 is a worker — absent from serverMap, skips HAProxy drain
+      // 172.16.220.57 is absent from serverMap → treated as a WORKER:
+      //   - deploys in the final, parallel, non-blocking batch (after .55/.56)
+      //   - skips HAProxy drain
+      //   - never the canary; its failure does not abort the serving roll
+      // Mixing it in here triggers a one-line "serving + worker" warning on deploy.
     }
   },
   "quiesce": {
@@ -298,11 +302,36 @@ Add a `quiesce` block to a deploy config and, optionally, per-host timeout overr
 | `quiesce.drainTimeoutMs` | number | `120000` | Max time (ms) to wait for in-flight count to reach zero |
 | `hostConfigs.<host>.quiesceTimeoutMs` | number | _(inherits `drainTimeoutMs`)_ | Per-host override for the drain timeout |
 
-There is no `role` field. A "worker node" is simply a host that is absent from `haproxy.serverMap` — it skips the HAProxy drain/ready cycle but still receives the quiesce call before the WAR transfer.
+There is no `role` field. A "worker node" is simply a host that is absent from `haproxy.serverMap`. Worker nodes are deployed differently from serving nodes — see [Node classes & deploy ordering](#node-classes--deploy-ordering) below — and they skip the HAProxy drain/ready cycle (they still receive the quiesce call when quiesce is enabled).
 
-#### How it works
+#### Node classes & deploy ordering
 
-For each host, the deploy runs the following sequence:
+The deployer recognises **two node classes**, distinguished solely by `haproxy.serverMap` membership — there is no config flag:
+
+| Class | Signal | Routed? | Drain? | Canary-meaningful? |
+|-------|--------|---------|--------|--------------------|
+| **Serving** | host **is** in `haproxy.serverMap` | yes (user traffic) | yes | yes |
+| **Worker** | host is **not** in `serverMap` | no (e.g. a scheduler worker) | no | no |
+
+**The deploy strategy (`1+R`, `sequential`, `1+2`, …) applies to serving nodes only.** Worker nodes deploy in a separate, **final** batch that is:
+
+- **parallel** — all workers at once (they are unrouted, so no rolling constraint);
+- **no drain** — they are not in HAProxy;
+- **non-blocking** — a worker deploy/health failure is reported as a warning but does **not** abort or fail the serving roll, and does not change the process exit code.
+
+This guarantees the canary "1" in a `1+R` (or any first batch) is **always a serving node**, never a worker — a worker canary is meaningless because a worker serves no user traffic. A serving-canary failure aborts as usual and workers are then **never deployed** (don't touch workers if serving is broken).
+
+> **Why this exists:** before this rule, the deployer filled strategy batches in plain config order with no notion of node class. A scheduler worker placed first in a `1+R` config became the canary; its "green" was worthless (it serves no traffic), and the serving nodes then rolled unsafely — a production outage (2026-06-23). Partitioning by `serverMap` membership makes that configuration impossible.
+
+When a config **mixes** serving and worker hosts, the deploy prints a one-line warning that the strategy applies to serving nodes only and workers deploy last. To see the resolved plan without deploying, run `znvault deploy run <config> --dry-run` — it lists the serving batch (under the strategy) and the final worker batch separately.
+
+If you would rather deploy a worker on its own schedule, give it a **separate deploy config** (or use `deploy war --target`) instead of mixing it into a serving config.
+
+> **Guard — single class:** with no `haproxy` block (or an empty `serverMap`) there is no serving/worker distinction; **all** hosts are treated as one class and the strategy runs over them unchanged. A worker-only config (a `serverMap` that matches none of the listed hosts) simply deploys every host as a non-blocking worker batch — it does not error, because there is no serving node to protect.
+
+#### How it works (per host)
+
+Within the serving batch (and within the final worker batch), each host runs the following sequence:
 
 1. **HAProxy drain** — if the host is in `haproxy.serverMap`, set it to DRAIN and wait for active connections to clear (existing behaviour, unchanged).
 2. **Quiesce** — POST to the agent's `/scheduler/quiesce` passthrough endpoint, which calls znapi's loopback `/internal/scheduler/quiesce`. The scheduler stops accepting new units and returns the current in-flight count.
@@ -563,6 +592,9 @@ npm run lint
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v1.21.1
+- **Deploy safety: per-node-class strategy.** The deploy strategy (`1+R`, `sequential`, …) now applies to **serving** nodes only (hosts in `haproxy.serverMap`); **worker** nodes (not in `serverMap`) deploy in a separate, final batch — parallel, no drain, and **non-blocking** (a worker failure is warned, never aborts/fails the serving roll). This guarantees the canary is always a serving node and isolates an unrouted scheduler worker that previously could become a meaningless canary (production outage 2026-06-23). No new config fields — `serverMap` membership is the class signal. A mixed serving+worker config now prints a warning, and `--dry-run` shows the serving batch and the final worker batch separately. With no `serverMap`, behaviour is unchanged (one class). See [Node classes & deploy ordering](#node-classes--deploy-ordering).
 
 ### v1.19.0
 - Added `file:<path>` secret source: reads a local node file and injects its trimmed contents, path must be under `fileSourceRoot` (default `/etc/zn-agent/node/`), omits env var on missing/unreadable/empty/outside-root — enables per-node env markers under a shared host-template.
