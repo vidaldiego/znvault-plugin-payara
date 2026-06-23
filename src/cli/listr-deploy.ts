@@ -69,6 +69,12 @@ export interface ListrDeployOptions {
   hostConfigs?: Record<string, {
     quiesceTimeoutMs?: number;
   }>;
+  /**
+   * When true, suppress the "config mixes serving and worker nodes" warning.
+   * Set by the multi-class orchestrator: it drives ONE node class per run, so
+   * the in-class partition is expected to be homogeneous and the warning is noise.
+   */
+  suppressMixedClassWarning?: boolean;
 }
 
 /**
@@ -353,7 +359,7 @@ export async function executeListrDeployment(
 
   // Warn on a mixed config: the strategy governs serving nodes only; workers
   // deploy last (parallel, non-blocking).
-  if (serving.length > 0 && workers.length > 0) {
+  if (serving.length > 0 && workers.length > 0 && !options.suppressMixedClassWarning) {
     options.ctx.output.warn(
       `[znvault-deploy] config mixes serving (${serving.join(', ')}) and ` +
       `worker (${workers.join(', ')}) nodes; the strategy applies to serving ` +

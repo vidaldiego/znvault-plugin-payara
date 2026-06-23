@@ -518,3 +518,25 @@ describe('6. Serving canary failure aborts before workers', () => {
     expect(result.aborted).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 9. suppressMixedClassWarning option
+// ---------------------------------------------------------------------------
+describe('9. suppressMixedClassWarning option', () => {
+  // A mixed serving+worker host list normally warns; with the suppress flag it must not.
+  const HOSTS = [SERVING_1, WORKER];
+
+  it('suppresses the mixed-config warning when suppressMixedClassWarning is true', async () => {
+    const options = makeOptions(HOSTS, { suppressMixedClassWarning: true });
+    const strategy = parseDeploymentStrategy('1+R');
+    await executeListrDeployment(strategy, HOSTS, options);
+    expect(options.ctx.output.warn).not.toHaveBeenCalledWith(expect.stringContaining('serving'));
+  });
+
+  it('still warns when the flag is absent', async () => {
+    const options = makeOptions(HOSTS);
+    const strategy = parseDeploymentStrategy('1+R');
+    await executeListrDeployment(strategy, HOSTS, options);
+    expect(options.ctx.output.warn).toHaveBeenCalledWith(expect.stringContaining('serving'));
+  });
+});
