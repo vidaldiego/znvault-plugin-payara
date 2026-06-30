@@ -333,10 +333,9 @@ export interface DeployConfig {
    * rollout begins, so a migration failure aborts the deploy before any host
    * is touched. When absent, the migration phase is skipped entirely.
    *
-   * TODO(T9): wire the real production values for roleId/host/port/database
-   * into the config store and validate them in deploy-config-validate.ts.
-   * Until then, production values are defaults applied inside deploy-run.ts
-   * when this block is present but fields are omitted.
+   * TODO(T9): add a `znvault deploy config set-migration` CLI path + validate
+   * roleId/migrationsDir in deploy-config-validate.ts. host/port/database come
+   * from the Vault connection via the lease, not from this config.
    */
   migration?: MigrationConfig;
 }
@@ -346,16 +345,21 @@ export interface DeployConfig {
  *
  * Credentials are NOT stored here — they are dynamically issued from the
  * vault dynamic-secrets role identified by `roleId`.
+ *
+ * host/port/database are provided by the Vault dynamic-secrets connection
+ * (referenced by roleId) and returned with the lease — the deploy config
+ * only names the role + the migrations dir. `database` is an optional
+ * override for when the Vault connection does not pin a database name.
  */
 export interface MigrationConfig {
   /** Dynamic-secrets role ID for the migration DB user (write role). */
   roleId: string;
-  /** MySQL hostname/IP for the migration connection. */
-  host: string;
-  /** MySQL port for the migration connection. */
-  port: number;
-  /** MySQL database name. */
-  database: string;
+  /**
+   * Optional database name override.
+   * If omitted, the database name from the Vault dynamic-secrets lease is used.
+   * If neither the lease nor this field provides a name, the migration phase will abort.
+   */
+  database?: string;
   /** Absolute path to the migrations directory (the flat `docs/migrations` folder). */
   migrationsDir: string;
 }

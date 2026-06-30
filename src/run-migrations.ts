@@ -30,9 +30,15 @@ import { MigrationRunner } from './migrate/migration-runner.js';
 export interface RunMigrationsOpts {
   env: string;
   roleId: string;
-  host: string;
-  port: number;
-  database: string;
+  /**
+   * Optional database name override.
+   *
+   * host/port/database are provided by the Vault dynamic-secrets connection
+   * (referenced by roleId) and returned with the lease — the deploy config
+   * only names the role + the migrations dir. This field lets the caller
+   * override the database name when the lease does not pin one.
+   */
+  database?: string;
   migrationsDir: string;
 }
 
@@ -183,7 +189,8 @@ function withTimeout(p: Promise<void>, ms: number): Promise<void> {
  * 5. In finally: close DB + revokeOnce + remove signal handlers.
  *
  * @param ctx    - CLI plugin context (used for logging; pass {} as `any` in tests).
- * @param opts   - env, roleId, host, port, database, migrationsDir.
+ * @param opts   - env, roleId, migrationsDir, and an optional database override.
+ *                 host/port/database come from the Vault dynamic-secrets lease.
  * @param deps   - Injectable deps (real = defaultDeps(ctx.client); tests pass mocks).
  */
 export async function runMigrations(
@@ -231,10 +238,21 @@ export async function runMigrations(
   // ── Step 4: Open DB + run engine ──────────────────────────────────────────
   let db: DbHandle | undefined;
   try {
+    // Resolve the database name: prefer the lease's value (from the Vault connection),
+    // fall back to the opts override, and error if neither is available.
+    // This check is INSIDE the try so that revokeOnce fires in finally even on validation failure.
+    const database = lease.database ?? opts.database;
+    if (!database) {
+      throw new Error(
+        '[run-migrations] No database name: the Vault dynamic-secrets connection did not return a ' +
+        'database name and no database override was provided in the migration config.',
+      );
+    }
+
     db = await deps.openDb({
-      host: opts.host,
-      port: opts.port,
-      database: opts.database,
+      host: lease.host,
+      port: lease.port,
+      database,
       user: lease.username,
       password: lease.password,
       ssl: true,

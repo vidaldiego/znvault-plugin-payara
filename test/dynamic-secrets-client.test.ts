@@ -6,7 +6,7 @@ describe('dynamic-secrets client', () => {
     const http = {
       post: vi.fn().mockResolvedValue({
         status: 200,
-        body: { leaseId: 'L', username: 'u', password: 'p' },
+        body: { leaseId: 'L', username: 'u', password: 'p', host: 'db.example.com', port: 3306, database: 'zincdb' },
       }),
     };
     const c = makeDynamicSecretsClient(http as any);
@@ -15,7 +15,65 @@ describe('dynamic-secrets client', () => {
       '/v1/dynamic-secrets/roles/dbr_bc3546e8729d4727/credentials',
       { ttlSeconds: 14400 },
     );
-    expect(lease).toEqual({ leaseId: 'L', username: 'u', password: 'p' });
+    expect(lease).toEqual({
+      leaseId: 'L',
+      username: 'u',
+      password: 'p',
+      host: 'db.example.com',
+      port: 3306,
+      database: 'zincdb',
+    });
+  });
+
+  it('issueCredential returns lease without database when connection does not pin one', async () => {
+    const http = {
+      post: vi.fn().mockResolvedValue({
+        status: 200,
+        body: { leaseId: 'L2', username: 'u2', password: 'p2', host: '172.16.220.40', port: 6446 },
+      }),
+    };
+    const c = makeDynamicSecretsClient(http as any);
+    const lease = await c.issueCredential('dbr_nodb', { ttlSeconds: 300 });
+    expect(lease.host).toBe('172.16.220.40');
+    expect(lease.port).toBe(6446);
+    expect(lease.database).toBeUndefined();
+  });
+
+  it('issueCredential rejects and attempts revoke when host is missing', async () => {
+    // First call = issueCredential POST (returns body without host), second = revoke POST
+    const post = vi.fn()
+      .mockResolvedValueOnce({
+        status: 200,
+        body: { leaseId: 'ORPHAN', username: 'u', password: 'p' }, // no host / port
+      })
+      .mockResolvedValueOnce({ status: 200, body: {} }); // revoke
+
+    const c = makeDynamicSecretsClient({ post } as any);
+    await expect(c.issueCredential('roleX', { ttlSeconds: 300 })).rejects.toThrow(
+      "Vault did not return host/port in the credential for role 'roleX'",
+    );
+
+    // The revoke endpoint should have been called for the orphaned lease
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post).toHaveBeenLastCalledWith(
+      '/v1/dynamic-secrets/leases/ORPHAN/revoke',
+      { reason: 'incomplete credential' },
+    );
+  });
+
+  it('issueCredential rejects even when the best-effort revoke also fails', async () => {
+    const post = vi.fn()
+      .mockResolvedValueOnce({
+        status: 200,
+        body: { leaseId: 'ORPHAN2', username: 'u', password: 'p' }, // no host / port
+      })
+      .mockRejectedValueOnce(new Error('revoke network error')); // revoke fails
+
+    const c = makeDynamicSecretsClient({ post } as any);
+    // Validation error must surface; revoke failure must NOT mask it
+    await expect(c.issueCredential('roleY', { ttlSeconds: 300 })).rejects.toThrow(
+      "Vault did not return host/port in the credential for role 'roleY'",
+    );
   });
 
   it('revokeCredential posts to the lease revoke endpoint', async () => {

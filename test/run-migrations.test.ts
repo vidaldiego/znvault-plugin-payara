@@ -9,6 +9,7 @@
  *  - revokeOnce called exactly once on success
  *  - revokeOnce called exactly once when run() throws (deploy fails, revoke still fires)
  *  - Transient revoke failures are retried; a 3× failure logs rather than throwing
+ *  - openDb is called with the LEASE's host/port/database (not from opts)
  *  - Signal handler registration/cleanup (hard to test process.exit path safely)
  */
 
@@ -31,7 +32,14 @@ function harness(overrides: HarnessOverrides = {}): {
   deps: RunMigrationsDeps;
   opts: RunMigrationsOpts;
 } {
-  const issue = vi.fn().mockResolvedValue({ leaseId: 'L', username: 'u', password: 'p' });
+  const issue = vi.fn().mockResolvedValue({
+    leaseId: 'L',
+    username: 'u',
+    password: 'p',
+    host: 'vault-host.example.com',
+    port: 6446,
+    database: 'zincdb',
+  });
   const revoke = overrides.revoke ?? vi.fn().mockResolvedValue(undefined);
   const run = overrides.run ?? vi.fn().mockResolvedValue({
     seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0,
@@ -49,9 +57,8 @@ function harness(overrides: HarnessOverrides = {}): {
   const opts: RunMigrationsOpts = {
     env: 'production',
     roleId: 'dbr_bc3546e8729d4727',
-    host: 'h',
-    port: 6446,
-    database: 'zincdb',
+    // NOTE: no host/port here — those come from the lease
+    database: 'zincdb', // optional override (matches the lease's database in this harness)
     migrationsDir: '/migrations',
   };
 
@@ -103,8 +110,53 @@ describe('runMigrations', () => {
     expect(revoke).toHaveBeenCalledWith('L', { reason: 'migration complete' });
   });
 
-  it('opens DB with the lease credentials (ssl: true)', async () => {
-    const issue = vi.fn().mockResolvedValue({ leaseId: 'L', username: 'dynUser', password: 'dynPass' });
+  it('opens DB with the LEASE host/port/database (not from opts), ssl: true', async () => {
+    const issue = vi.fn().mockResolvedValue({
+      leaseId: 'L',
+      username: 'dynUser',
+      password: 'dynPass',
+      host: '172.16.220.40',   // host comes from the lease
+      port: 6446,              // port comes from the lease
+      database: 'zincdb',     // database comes from the lease
+    });
+    const mockDbHandle = { end: vi.fn().mockResolvedValue(undefined) };
+    const openDb = vi.fn().mockResolvedValue(mockDbHandle);
+
+    const deps: RunMigrationsDeps = {
+      client: { issueCredential: issue, revokeCredential: vi.fn().mockResolvedValue(undefined) },
+      openDb: openDb as RunMigrationsDeps['openDb'],
+      makeRunner: () => ({ run: vi.fn().mockResolvedValue({}) }),
+    };
+    // NOTE: opts does NOT carry host/port — those come from the lease
+    const opts: RunMigrationsOpts = {
+      env: 'production',
+      roleId: 'r',
+      migrationsDir: '/m',
+    };
+    const ctx = makeCtx();
+
+    await runMigrations(ctx, opts, deps);
+
+    // openDb must receive the LEASE's host/port/database, not the opts
+    expect(openDb).toHaveBeenCalledWith({
+      host: '172.16.220.40',
+      port: 6446,
+      database: 'zincdb',
+      user: 'dynUser',
+      password: 'dynPass',
+      ssl: true,
+    });
+  });
+
+  it('uses opts.database override when lease does not provide a database name', async () => {
+    const issue = vi.fn().mockResolvedValue({
+      leaseId: 'L',
+      username: 'u',
+      password: 'p',
+      host: '10.0.0.1',
+      port: 3306,
+      // no database in lease
+    });
     const mockDbHandle = { end: vi.fn().mockResolvedValue(undefined) };
     const openDb = vi.fn().mockResolvedValue(mockDbHandle);
 
@@ -116,23 +168,48 @@ describe('runMigrations', () => {
     const opts: RunMigrationsOpts = {
       env: 'production',
       roleId: 'r',
-      host: '172.16.220.40',
-      port: 6446,
-      database: 'zincdb',
       migrationsDir: '/m',
+      database: 'override_db', // caller-supplied fallback
     };
     const ctx = makeCtx();
 
     await runMigrations(ctx, opts, deps);
 
-    expect(openDb).toHaveBeenCalledWith({
-      host: '172.16.220.40',
-      port: 6446,
-      database: 'zincdb',
-      user: 'dynUser',
-      password: 'dynPass',
-      ssl: true,
+    expect(openDb).toHaveBeenCalledWith(expect.objectContaining({
+      host: '10.0.0.1',
+      port: 3306,
+      database: 'override_db',
+    }));
+  });
+
+  it('throws when neither lease nor opts provide a database name', async () => {
+    const issue = vi.fn().mockResolvedValue({
+      leaseId: 'L',
+      username: 'u',
+      password: 'p',
+      host: '10.0.0.1',
+      port: 3306,
+      // no database
     });
+    const revoke = vi.fn().mockResolvedValue(undefined);
+    const deps: RunMigrationsDeps = {
+      client: { issueCredential: issue, revokeCredential: revoke },
+      openDb: vi.fn() as RunMigrationsDeps['openDb'],
+      makeRunner: () => ({ run: vi.fn() }),
+    };
+    const opts: RunMigrationsOpts = {
+      env: 'production',
+      roleId: 'r',
+      migrationsDir: '/m',
+      // no database override
+    };
+    const ctx = makeCtx();
+
+    await expect(runMigrations(ctx, opts, deps)).rejects.toThrow(
+      '[run-migrations] No database name',
+    );
+    // Lease should still be revoked in finally
+    expect(revoke).toHaveBeenCalledTimes(1);
   });
 
   it('revokes exactly once even when runner.run() throws (migration failure)', async () => {
@@ -166,7 +243,7 @@ describe('runMigrations', () => {
     const ctx = makeCtx();
 
     await expect(
-      runMigrations(ctx, { env: 'production', roleId: 'r', host: 'h', port: 1, database: 'd', migrationsDir: '/m' }, deps)
+      runMigrations(ctx, { env: 'production', roleId: 'r', migrationsDir: '/m' }, deps)
     ).rejects.toThrow('vault down');
 
     // revokeOnce never set up (lease never minted) — no revoke call
@@ -272,7 +349,14 @@ describe('runMigrations', () => {
 
     const deps: RunMigrationsDeps = {
       client: {
-        issueCredential: vi.fn().mockResolvedValue({ leaseId: 'L', username: 'u', password: SECRET }),
+        issueCredential: vi.fn().mockResolvedValue({
+          leaseId: 'L',
+          username: 'u',
+          password: SECRET,
+          host: 'h',
+          port: 3306,
+          database: 'd',
+        }),
         revokeCredential: revoke,
       },
       openDb: openDb as RunMigrationsDeps['openDb'],
@@ -282,9 +366,6 @@ describe('runMigrations', () => {
     const opts: RunMigrationsOpts = {
       env: 'production',
       roleId: 'r',
-      host: 'h',
-      port: 1,
-      database: 'd',
       migrationsDir: '/m',
     };
 

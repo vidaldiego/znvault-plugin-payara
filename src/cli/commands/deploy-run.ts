@@ -606,10 +606,8 @@ export function registerDeployRunCommand(
           await runMigrations(ctx, {
             env: configName,
             roleId: config.migration.roleId,
-            host: config.migration.host,
-            port: config.migration.port,
-            database: config.migration.database,
             migrationsDir: config.migration.migrationsDir,
+            database: config.migration.database,
           }, migrationDefaultDeps(ctx.client));
           ctx.output.info('[deploy] Migrations complete — proceeding with rollout.');
         }

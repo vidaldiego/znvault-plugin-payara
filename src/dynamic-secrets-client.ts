@@ -15,6 +15,12 @@ export interface Lease {
   leaseId: string;
   username: string;
   password: string;
+  /** MySQL hostname returned by the Vault dynamic-secrets connection. */
+  host: string;
+  /** MySQL port returned by the Vault dynamic-secrets connection. */
+  port: number;
+  /** MySQL database name returned by the Vault dynamic-secrets connection (may be undefined if the connection doesn't pin a database). */
+  database?: string;
 }
 
 export interface VaultHttp {
@@ -68,13 +74,43 @@ export function makeDynamicSecretsClient(http: VaultHttp): {
      * Issue a new dynamic-secrets credential for the given role.
      *
      * POST /v1/dynamic-secrets/roles/:roleId/credentials
-     * → { leaseId, username, password }
+     * → { leaseId, username, password, host, port, database? }
+     *
+     * CRITICAL: validates that host and port are present in the response.
+     * If missing, the just-minted lease is revoked (best-effort) before
+     * throwing so the orphaned credential is not left to expire passively.
+     * Mirrors the znvault-cli mysql broker pattern (spec F2).
      */
     async issueCredential(roleId: string, opts: { ttlSeconds: number }): Promise<Lease> {
       const path = `/v1/dynamic-secrets/roles/${roleId}/credentials`;
       const res = await http.post(path, { ttlSeconds: opts.ttlSeconds });
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-return
-      return res.body as Lease;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const body = res.body as any;
+
+      // Validate that the server returned host and port (spec F2 — no --host fallback).
+      if (!body.host || body.port === undefined) {
+        // Best-effort revoke of the just-minted partial lease before throwing.
+        // Wrap in try/catch so a revoke failure does not mask the validation error.
+        try {
+          const revokePath = `/v1/dynamic-secrets/leases/${body.leaseId as string}/revoke`;
+          await http.post(revokePath, { reason: 'incomplete credential' });
+        } catch {
+          // Intentionally swallowed — cleanup job + TTL will expire the lease.
+        }
+        throw new Error(
+          `Vault did not return host/port in the credential for role '${roleId}'. ` +
+          `Please upgrade vault to a version that returns host/port in dynamic-secret credentials.`,
+        );
+      }
+
+      return {
+        leaseId: body.leaseId as string,
+        username: body.username as string,
+        password: body.password as string,
+        host: body.host as string,
+        port: body.port as number,
+        database: body.database as string | undefined,
+      };
     },
 
     /**
