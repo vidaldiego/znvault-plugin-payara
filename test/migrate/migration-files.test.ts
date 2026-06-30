@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 describe('parsePrefix', () => {
-  it('parses helper', () => expect(parsePrefix('0000_migration-helpers.sql')).toBe('0000_'));
+  it('parses helper', () => expect(parsePrefix('0000_migration-helpers.sql')).toBe('0000'));
   it('parses dated', () => expect(parsePrefix('2026-06-27_001_address.sql')).toBe('2026-06-27_001'));
   it('throws on garbage', () => expect(() => parsePrefix('nope.sql')).toThrow());
 });
@@ -16,7 +16,7 @@ describe('discover', () => {
     writeFileSync(join(d, '2026-06-27_001_b.sql'), 'x'); writeFileSync(join(d, '0000_h.sql'), 'x');
     mkdirSync(join(d, 'baseline')); writeFileSync(join(d, 'baseline', '00-baseline-schema.sql'), 'x');
     const out = discover(d).map(f => f.prefix);
-    expect(out).toEqual(['0000_', '2026-06-27_001']);   // baseline/ excluded; sorted
+    expect(out).toEqual(['0000', '2026-06-27_001']);   // baseline/ excluded; sorted
   });
   it('throws on duplicate prefix', () => {
     const d = mkdtempSync(join(tmpdir(), 'mig-'));

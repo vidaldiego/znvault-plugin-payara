@@ -1,7 +1,7 @@
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
-const HELPER_RE = /^(0000_)[^/]*\.sql$/;
+const HELPER_RE = /^(0000)_[^/]*\.sql$/;
 const PREFIX_RE = /^(\d{4}-\d{2}-\d{2}_\d{3})_[^/]*\.sql$/;
 
 export interface MigrationFile { version: string; prefix: string; path: string; }
