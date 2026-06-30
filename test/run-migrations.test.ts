@@ -254,4 +254,47 @@ describe('runMigrations', () => {
     expect(removedEvents).toContain('SIGINT');
     expect(removedEvents).toContain('SIGTERM');
   });
+
+  it('does not log the DB password when openDb fails', async () => {
+    const SECRET = 'super-secret-lease-password-xyz';
+    const revoke = vi.fn().mockResolvedValue(undefined);
+    const openDb = vi.fn().mockRejectedValue(new Error('connection refused to 172.16.220.40'));
+
+    // Capture ALL log output (info, warn, error)
+    const logged: string[] = [];
+    const ctx = {
+      output: {
+        info: (...args: unknown[]) => { logged.push(args.map(String).join(' ')); },
+        warn: (...args: unknown[]) => { logged.push(args.map(String).join(' ')); },
+        error: (...args: unknown[]) => { logged.push(args.map(String).join(' ')); },
+      },
+    };
+
+    const deps: RunMigrationsDeps = {
+      client: {
+        issueCredential: vi.fn().mockResolvedValue({ leaseId: 'L', username: 'u', password: SECRET }),
+        revokeCredential: revoke,
+      },
+      openDb: openDb as RunMigrationsDeps['openDb'],
+      makeRunner: () => ({ run: vi.fn() }),
+    };
+
+    const opts: RunMigrationsOpts = {
+      env: 'production',
+      roleId: 'r',
+      host: 'h',
+      port: 1,
+      database: 'd',
+      migrationsDir: '/m',
+    };
+
+    await expect(runMigrations(ctx as any, opts, deps)).rejects.toThrow('connection refused');
+
+    // The password must NEVER appear in any log line
+    const allLogs = logged.join('\n');
+    expect(allLogs).not.toContain(SECRET);
+
+    // Verify the lease was still revoked (cleanup ran)
+    expect(revoke).toHaveBeenCalledTimes(1);
+  });
 });
