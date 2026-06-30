@@ -19,7 +19,7 @@ const __dirname = dirname(__filename);
 
 const REPO = join(__dirname, '../../');
 const ENTRYPOINT = join(REPO, 'dist/migrate/local-entrypoint.js');
-const MIGRATIONS_DIR = '/Users/diegovidal/Drive/zincapi-parent/docs/migrations';
+const MIGRATIONS_DIR = process.env['MIGRATIONS_DIR'] ?? '/Users/diegovidal/Drive/zincapi-parent/docs/migrations';
 
 // Skip all tests unless ZINC_DB_HOST is provided (set by the e2e runner)
 const HAVE_DB = !!process.env['ZINC_DB_HOST'];

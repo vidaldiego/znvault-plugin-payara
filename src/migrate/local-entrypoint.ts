@@ -15,7 +15,7 @@
 
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
-import { openDb, preflight } from './db.js';
+import { openDb } from './db.js';
 import { MigrationRunner } from './migration-runner.js';
 
 /**
@@ -68,7 +68,6 @@ export async function main(argv: string[]): Promise<void> {
       );
     } else {
       // cmd === 'migrate'
-      await preflight(db, true);
       const r = await runner.run();
       // HARD CONTRACT: this exact format is grepped by verify-idempotent.sh
       process.stdout.write(
