@@ -101,6 +101,43 @@ export async function openDb(cfg: DbConfig): Promise<Db> {
 }
 
 /**
+ * Pre-migration safety checks against the LIVE connection. Ports
+ * ConnectionFactory.preflight: requires MySQL 8+, and (when requireWritePrimary)
+ * refuses to run against a read-only replica (SELECT @@read_only === 1).
+ *
+ * Call with requireWritePrimary=true for `migrate`, false for `status`.
+ */
+export async function preflight(db: Db, requireWritePrimary: boolean): Promise<void> {
+  // 1. MySQL >= 8.0.0
+  //    SELECT VERSION() → e.g. "8.4.10" or "8.4.10-mysql": take the part before '-',
+  //    split on '.', compare major/minor/patch as the Kotlin does.
+  const versionRows = await db.query('SELECT VERSION() AS v');
+  const versionValue = (versionRows as { v: unknown }[])[0]?.v;
+  const versionStr = String(versionValue).split('-')[0] ?? '';
+  const parts = versionStr.split('.').map((p) => Number(p) || 0);
+  const major = parts[0] ?? 0;
+  const minor = parts[1] ?? 0;
+  const patch = parts[2] ?? 0;
+
+  // Replicate the Kotlin three-way compare: major>8 || (major==8 && minor>0) || (major==8 && minor==0 && patch>=0)
+  // which simplifies to: major > 8 || major === 8 (i.e. major >= 8).
+  const atLeast8 =
+    major > 8 || (major === 8 && (minor > 0 || (minor === 0 && patch >= 0)));
+  if (!atLeast8) {
+    throw new Error('MySQL 8+ required');
+  }
+
+  // 2. Refuse to run DDL against a read-only replica.
+  if (requireWritePrimary) {
+    const roRows = await db.query('SELECT @@read_only AS ro');
+    const roValue = (roRows as { ro: unknown }[])[0]?.ro;
+    if (Number(roValue) === 1) {
+      throw new Error('Target is read-only (not the write primary). Refusing to migrate.');
+    }
+  }
+}
+
+/**
  * Redact the password from any error message so it never leaks in logs/traces.
  */
 function redact(e: unknown): Error {
