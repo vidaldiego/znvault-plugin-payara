@@ -10,13 +10,20 @@
  * Test coverage:
  *  1. Full run against real corpus → seeded=0, reconciled=0, applied=0.
  *  2. Double-run idempotency → second run identical counts.
- *  3. No-asserts reconcile fixture → body re-run (claim row success=0 with no zn_assert_*).
+ *  3. No-asserts reconcile: a success=0 row for a temp migration with NO zn_assert_*
+ *     calls causes the runner to re-run the body (satisfied=false with 0 asserts) and
+ *     flip the row to success=1.
+ *  3b. Reconcile with asserts: flip an existing corpus migration to success=0, run,
+ *      confirm it reconciles back to success=1.
  *  4. Helper refresh on nothing-pending → 0000_ procs exist after a run with 0 pending.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { writeFileSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { openDb, type Db } from '../../src/migrate/db.js';
 import { MigrationRunner } from '../../src/migrate/migration-runner.js';
+import { canonicalChecksumFile } from '../../src/migrate/checksum.js';
 
 const HAVE_DB = !!process.env.MYSQL_TEST_HOST;
 const cfg = {
@@ -75,45 +82,72 @@ describe.skipIf(!HAVE_DB)('MigrationRunner integration', () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────────
-  // 3. No-asserts reconcile fixture
-  //    Insert a success=0 row with no CALL zn_assert_* in the file body.
-  //    The runner must re-run the body (since satisfied=false with 0 asserts).
+  // 3. No-asserts reconcile (the Codex-F4.2 correctness case)
+  //    A success=0 row for a migration with ZERO CALL zn_assert_* postconditions
+  //    must trigger a full body re-run (satisfied = asserts.length>0 && allPassed
+  //    → with 0 asserts, satisfied=false → always re-run). We prove re-run by
+  //    observing an idempotent side-effect written by the body.
   // ──────────────────────────────────────────────────────────────────────────
   it('no-asserts reconcile: body is re-run and row flipped to success=1', async () => {
-    // We use an existing migration file that has NO zn_assert_ calls.
-    // Check that the first migration file has no asserts, otherwise pick a simpler check.
-    const testVersion = '_zzz_test_no_asserts_reconcile.sql';
+    const migrationVersion = '2099-01-01_001_no-asserts-probe.sql';
+    const migrationPath = join(MIGRATIONS_DIR, migrationVersion);
 
-    // Clean up any leftover from a prior failed run
-    await db.query('DELETE FROM schema_migrations WHERE version = ?', [testVersion]);
-
-    // Insert a claim row with success=0 (simulates a crash mid-migration)
-    await db.query(
-      "INSERT INTO schema_migrations (version, checksum, checksum_algo, applied_at, applied_by, execution_ms, success, baselined) VALUES (?, 'fakechecksum', 'sha256-lf-v1', NOW(3), 'test', 0, 0, 0)",
-      [testVersion],
+    // Migration body: idempotent probe table + REPLACE so re-run is observable.
+    // No CALL zn_assert_* → satisfied=false → runner always re-runs body on reconcile.
+    writeFileSync(
+      migrationPath,
+      [
+        'CREATE TABLE IF NOT EXISTS _reconcile_probe (id INT PRIMARY KEY, marker VARCHAR(32)) ENGINE=InnoDB;',
+        "REPLACE INTO _reconcile_probe VALUES (1, 'reran');",
+      ].join('\n'),
     );
 
-    // Confirm the row is there with success=0
-    const rowsBefore = (await db.query(
-      'SELECT success FROM schema_migrations WHERE version = ?',
-      [testVersion],
-    )) as { success: unknown }[];
-    expect(rowsBefore[0]?.success).toBeDefined();
-    expect(Number(rowsBefore[0]?.success)).toBe(0);
+    // Compute the real checksum so the planner routes this row to reconcile (not pending).
+    const checksum = canonicalChecksumFile(migrationPath);
 
-    // Now delete it for cleanup (we only tested reconcile logic via the checksum mismatch path)
-    // Actually: the runner would pick it up as reconcile since it's a file-less row.
-    // But our runner requires the file to exist on disk (and reconcile() reads it).
-    // So we test the reconcile scenario at unit level via the test below.
-    // For now, just clean up.
-    await db.query('DELETE FROM schema_migrations WHERE version = ?', [testVersion]);
+    try {
+      // Clean up any leftover rows/table from a prior failed run.
+      await db.query('DELETE FROM schema_migrations WHERE version = ?', [migrationVersion]);
+      await db.query('DROP TABLE IF EXISTS _reconcile_probe');
 
-    // Confirm cleanup
-    const rowsAfter = (await db.query(
-      'SELECT count(*) AS c FROM schema_migrations WHERE version = ?',
-      [testVersion],
-    )) as { c: unknown }[];
-    expect(Number(rowsAfter[0]?.c)).toBe(0);
+      // Insert a success=0 claim row with the correct checksum — simulates a crash mid-run.
+      await db.query(
+        'INSERT INTO schema_migrations (version, checksum, checksum_algo, applied_at, applied_by, execution_ms, success, baselined) VALUES (?, ?, ?, NOW(3), ?, 0, 0, 0)',
+        [migrationVersion, checksum, 'sha256-lf-v1', 'test-no-asserts'],
+      );
+
+      const dbTemp = await openDb(cfg);
+      try {
+        const runnerTemp = new MigrationRunner(dbTemp, MIGRATIONS_DIR, 'test-no-asserts');
+        const result = await runnerTemp.run();
+
+        // The runner must have reconciled exactly 1 migration (the no-asserts one).
+        expect(result.reconciled).toBe(1);
+        expect(result.applied).toBe(0);
+        expect(result.seeded).toBe(0);
+      } finally {
+        await dbTemp.end();
+      }
+
+      // Verify the row was flipped to success=1 (reconcile completed).
+      const rowsAfter = (await db.query(
+        'SELECT success FROM schema_migrations WHERE version = ?',
+        [migrationVersion],
+      )) as { success: unknown }[];
+      expect(Number(rowsAfter[0]?.success)).toBe(1);
+
+      // Verify the body actually RE-RAN: the probe table must have the marker row.
+      // This is the observable proof that reconcile re-ran the body (not just flipped success).
+      const probe = (await db.query(
+        "SELECT marker FROM _reconcile_probe WHERE id = 1",
+      )) as { marker: string }[];
+      expect(probe[0]?.marker).toBe('reran');
+    } finally {
+      // Always clean up the temp migration file and DB rows/table.
+      try { unlinkSync(migrationPath); } catch { /* best-effort */ }
+      await db.query('DELETE FROM schema_migrations WHERE version = ?', [migrationVersion]);
+      await db.query('DROP TABLE IF EXISTS _reconcile_probe');
+    }
   });
 
   // ──────────────────────────────────────────────────────────────────────────

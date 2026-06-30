@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { plan, ChecksumMismatchError } from '../../src/migrate/migration-planner.js';
+import { plan, ChecksumMismatchError, OrphanTrackedRowError } from '../../src/migrate/migration-planner.js';
 
 const f = (prefix: string) => ({ version: prefix + '_x.sql', prefix, path: '/x' });
 const row = (version: string, success: boolean, baselined = false, checksum = 'c') =>
@@ -45,6 +45,25 @@ describe('plan', () => {
 
   it('empty files + empty rows → all empty', () => {
     const p = plan([], [], () => 'x');
+    expect(p.applied).toHaveLength(0);
+    expect(p.reconcile).toHaveLength(0);
+    expect(p.pending).toHaveLength(0);
+  });
+
+  it('tracked row with no matching file on disk → throws OrphanTrackedRowError', () => {
+    // A DB row (success=true) exists for a version that has no file in `files`.
+    // This simulates a migration file being renamed or deleted after it was applied.
+    const files: ReturnType<typeof f>[] = []; // no files on disk
+    const rows = [row('2026-01-01_001_x.sql', true)];
+    expect(() => plan(files, rows, () => 'c')).toThrow(OrphanTrackedRowError);
+  });
+
+  it('0000_ tracked row with no matching file does NOT throw OrphanTrackedRowError', () => {
+    // 0000_ rows are never tracked — the orphan check must skip them.
+    const files: ReturnType<typeof f>[] = [];
+    const rows = [row('0000_migration-helpers.sql', true)];
+    // Should not throw — just returns empty buckets.
+    const p = plan(files, rows, () => 'c');
     expect(p.applied).toHaveLength(0);
     expect(p.reconcile).toHaveLength(0);
     expect(p.pending).toHaveLength(0);
