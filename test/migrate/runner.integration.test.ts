@@ -159,37 +159,46 @@ describe.skipIf(!HAVE_DB)('MigrationRunner integration', () => {
     // We'll temporarily reset its success to 0, then run, and confirm it's back to 1.
     const targetVersion = '2026-06-30_001_residual-historial-state-metadata.sql';
 
-    // Flip success=0 to simulate a crash
-    await db.query(
-      'UPDATE schema_migrations SET success = 0 WHERE version = ?',
-      [targetVersion],
-    );
-
-    const rowsBefore = (await db.query(
-      'SELECT success FROM schema_migrations WHERE version = ?',
-      [targetVersion],
-    )) as { success: unknown }[];
-    expect(Number(rowsBefore[0]?.success)).toBe(0);
-
-    // Open a fresh connection for this run (prior db may still have lock state)
-    const db3 = await openDb(cfg);
     try {
-      const runner3 = new MigrationRunner(db3, MIGRATIONS_DIR, 'test-runner-3');
-      const result = await runner3.run();
+      // Flip success=0 to simulate a crash
+      await db.query(
+        'UPDATE schema_migrations SET success = 0 WHERE version = ?',
+        [targetVersion],
+      );
 
-      // Should reconcile exactly 1 file (the one we flipped)
-      expect(result.reconciled).toBe(1);
-      expect(result.applied).toBe(0);
+      const rowsBefore = (await db.query(
+        'SELECT success FROM schema_migrations WHERE version = ?',
+        [targetVersion],
+      )) as { success: unknown }[];
+      expect(Number(rowsBefore[0]?.success)).toBe(0);
+
+      // Open a fresh connection for this run (prior db may still have lock state)
+      const db3 = await openDb(cfg);
+      try {
+        const runner3 = new MigrationRunner(db3, MIGRATIONS_DIR, 'test-runner-3');
+        const result = await runner3.run();
+
+        // Should reconcile exactly 1 file (the one we flipped)
+        expect(result.reconciled).toBe(1);
+        expect(result.applied).toBe(0);
+      } finally {
+        await db3.end();
+      }
+
+      // Confirm the row is back to success=1
+      const rowsAfter = (await db.query(
+        'SELECT success FROM schema_migrations WHERE version = ?',
+        [targetVersion],
+      )) as { success: unknown }[];
+      expect(Number(rowsAfter[0]?.success)).toBe(1);
     } finally {
-      await db3.end();
+      // Always restore the row to success=1 so other tests see a clean baseline,
+      // even if an assertion above throws.
+      await db.query(
+        'UPDATE schema_migrations SET success = 1 WHERE version = ?',
+        [targetVersion],
+      );
     }
-
-    // Confirm the row is back to success=1
-    const rowsAfter = (await db.query(
-      'SELECT success FROM schema_migrations WHERE version = ?',
-      [targetVersion],
-    )) as { success: unknown }[];
-    expect(Number(rowsAfter[0]?.success)).toBe(1);
   });
 
   // ──────────────────────────────────────────────────────────────────────────
