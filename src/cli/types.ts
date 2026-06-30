@@ -326,6 +326,38 @@ export interface DeployConfig {
   }>;
   /** ORDERED array — array order IS deploy order. Mutually exclusive with top-level `hosts`. */
   classes?: DeployClass[];
+  /**
+   * Optional migration phase configuration (Task 8 / spec §run-migrations.ts).
+   *
+   * When present, schema migrations are applied ONCE, BEFORE the rolling WAR
+   * rollout begins, so a migration failure aborts the deploy before any host
+   * is touched. When absent, the migration phase is skipped entirely.
+   *
+   * TODO(T9): wire the real production values for roleId/host/port/database
+   * into the config store and validate them in deploy-config-validate.ts.
+   * Until then, production values are defaults applied inside deploy-run.ts
+   * when this block is present but fields are omitted.
+   */
+  migration?: MigrationConfig;
+}
+
+/**
+ * Schema migration configuration for the deploy-run migration phase.
+ *
+ * Credentials are NOT stored here — they are dynamically issued from the
+ * vault dynamic-secrets role identified by `roleId`.
+ */
+export interface MigrationConfig {
+  /** Dynamic-secrets role ID for the migration DB user (write role). */
+  roleId: string;
+  /** MySQL hostname/IP for the migration connection. */
+  host: string;
+  /** MySQL port for the migration connection. */
+  port: number;
+  /** MySQL database name. */
+  database: string;
+  /** Absolute path to the migrations directory (the flat `docs/migrations` folder). */
+  migrationsDir: string;
 }
 
 /**

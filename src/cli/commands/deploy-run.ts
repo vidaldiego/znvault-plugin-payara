@@ -2,6 +2,7 @@
 // Deploy run command - multi-host deployment using saved configurations
 
 import type { Command } from 'commander';
+import { runMigrations, defaultDeps as migrationDefaultDeps } from '../../run-migrations.js';
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -583,6 +584,34 @@ export function registerDeployRunCommand(
           } else {
             console.log(`All ${haproxyConfig.hosts.length} HAProxy hosts reachable`);
           }
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // MIGRATION PHASE (Task 8 — guarded, runs once before any WAR swap)
+        //
+        // When `config.migration` is present, schema migrations are applied
+        // to the database BEFORE the rolling WAR rollout begins. This means:
+        //   - A migration failure aborts the deploy BEFORE any host is touched.
+        //   - The new schema serves the old WAR during the rolling window
+        //     (expand/contract forward-compat required — see spec §Forward-compat).
+        //
+        // When `config.migration` is absent, this block is skipped entirely
+        // so existing deploy configs without migration settings are unaffected.
+        // ═══════════════════════════════════════════════════════════════════
+        if (config.migration) {
+          ctx.output.info('[deploy] Running schema migrations before rollout...');
+          // Build the ctx.client-backed VaultHttp adapter and run migrations.
+          // defaultDeps() wires the real dynamic-secrets client + openDb + MigrationRunner.
+          // TODO(T9): validate migration config fields in deploy-config-validate.ts.
+          await runMigrations(ctx, {
+            env: configName,
+            roleId: config.migration.roleId,
+            host: config.migration.host,
+            port: config.migration.port,
+            database: config.migration.database,
+            migrationsDir: config.migration.migrationsDir,
+          }, migrationDefaultDeps(ctx.client));
+          ctx.output.info('[deploy] Migrations complete — proceeding with rollout.');
         }
 
         // Execute deployment using Listr2
