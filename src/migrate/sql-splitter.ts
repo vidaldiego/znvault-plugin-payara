@@ -43,7 +43,7 @@ export function splitStatements(sql: string): string[] {
 
   const regionMatches = (idx: number, word: string, ci: boolean): boolean => {
     if (idx + word.length > n) return false;
-    const seg = sql.substr(idx, word.length);
+    const seg = sql.substring(idx, idx + word.length);
     return ci ? seg.toUpperCase() === word.toUpperCase() : seg === word;
   };
 
