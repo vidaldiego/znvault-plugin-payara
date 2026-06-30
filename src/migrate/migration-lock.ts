@@ -29,8 +29,6 @@ export class MigrationLockError extends Error {
  */
 export async function acquire(db: Db, timeoutSeconds = 30): Promise<void> {
   const rows = await db.query('SELECT GET_LOCK(?, ?)', [LOCK_KEY, timeoutSeconds]);
-  const v = (rows[0] as Record<string, unknown>)['GET_LOCK(?, ?)'] ??
-            (rows[0] as Record<string, unknown>)[`GET_LOCK('${LOCK_KEY}', ${timeoutSeconds})`];
   // mysql2 returns the result column by its expression text; extract robustly
   const cell = Object.values(rows[0] as Record<string, unknown>)[0];
   if (cell === null || cell === undefined) {
@@ -39,7 +37,6 @@ export async function acquire(db: Db, timeoutSeconds = 30): Promise<void> {
   if (Number(cell) !== 1) {
     throw new MigrationLockBusyError(`Another migration runner holds '${LOCK_KEY}' (GET_LOCK returned 0)`);
   }
-  void v; // suppress unused-variable warning
 }
 
 /**
