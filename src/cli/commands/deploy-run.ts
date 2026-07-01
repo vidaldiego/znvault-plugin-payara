@@ -170,6 +170,33 @@ export function validateClassHostOverride(
 }
 
 /**
+ * Run the schema-migration phase if the deploy config requests it. Called ONCE,
+ * BEFORE the rolling WAR rollout, so a migration failure aborts the deploy before
+ * any host is touched. No-op when config.migration is absent.
+ *
+ * @param config     - The resolved deploy config (may or may not have .migration).
+ * @param configName - The config name, used as the `env` label in runMigrations.
+ * @param ctx        - The CLI plugin context (output + client).
+ * @param deps       - Injectable deps (defaults to production wiring via migrationDefaultDeps).
+ */
+export async function runMigrationPhase(
+  config: DeployConfig,
+  configName: string,
+  ctx: CLIPluginContext,
+  deps = migrationDefaultDeps(ctx.client),
+): Promise<void> {
+  if (!config.migration) return;
+  ctx.output.info('[deploy] Running schema migrations before rollout...');
+  await runMigrations(ctx, {
+    env: configName,
+    roleId: config.migration.roleId,
+    migrationsDir: config.migration.migrationsDir,
+    database: config.migration.database,
+  }, deps);
+  ctx.output.info('[deploy] Migrations complete — proceeding with rollout.');
+}
+
+/**
  * Register deploy run command for multi-host deployment
  */
 export function registerDeployRunCommand(
@@ -597,20 +624,9 @@ export function registerDeployRunCommand(
         //
         // When `config.migration` is absent, this block is skipped entirely
         // so existing deploy configs without migration settings are unaffected.
+        // TODO(T9): validate migration config fields in deploy-config-validate.ts.
         // ═══════════════════════════════════════════════════════════════════
-        if (config.migration) {
-          ctx.output.info('[deploy] Running schema migrations before rollout...');
-          // Build the ctx.client-backed VaultHttp adapter and run migrations.
-          // defaultDeps() wires the real dynamic-secrets client + openDb + MigrationRunner.
-          // TODO(T9): validate migration config fields in deploy-config-validate.ts.
-          await runMigrations(ctx, {
-            env: configName,
-            roleId: config.migration.roleId,
-            migrationsDir: config.migration.migrationsDir,
-            database: config.migration.database,
-          }, migrationDefaultDeps(ctx.client));
-          ctx.output.info('[deploy] Migrations complete — proceeding with rollout.');
-        }
+        await runMigrationPhase(config, configName, ctx);
 
         // Execute deployment using Listr2
         const deployResult = await executeListrDeployment(strategy, deployableHosts, {

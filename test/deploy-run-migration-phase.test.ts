@@ -1,0 +1,151 @@
+// Path: test/deploy-run-migration-phase.test.ts
+/**
+ * Tests for the deploy-run migration-phase wiring hook.
+ *
+ * The `runMigrationPhase` function was extracted from the `.action()` closure
+ * in `registerDeployRunCommand` so this conditional branch can be tested in
+ * isolation without invoking the full heavy action (config load, TLS, listr).
+ *
+ * Verifies:
+ *  - Skips runMigrations when config.migration is absent (no-op).
+ *  - Calls runMigrations with the correct args when config.migration is present.
+ *  - Propagates runMigrations failures (migration failure aborts the deploy before rollout).
+ */
+import { describe, it, expect, vi } from 'vitest';
+import { runMigrationPhase } from '../src/cli/commands/deploy-run.js';
+import type { RunMigrationsDeps } from '../src/run-migrations.js';
+import type { DeployConfig, CLIPluginContext } from '../src/cli/types.js';
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function makeMockDeps(overrides: {
+  run?: ReturnType<typeof vi.fn>;
+  revoke?: ReturnType<typeof vi.fn>;
+} = {}): RunMigrationsDeps {
+  const issue = vi.fn().mockResolvedValue({
+    leaseId: 'L1',
+    username: 'mig_user',
+    password: 'mig_pass',
+    host: '172.16.220.40',
+    port: 6446,
+    database: 'zincdb',
+  });
+  const revoke = overrides.revoke ?? vi.fn().mockResolvedValue(undefined);
+  const run = overrides.run ?? vi.fn().mockResolvedValue({
+    seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0,
+  });
+  const mockDbHandle = { end: vi.fn().mockResolvedValue(undefined) };
+  return {
+    client: { issueCredential: issue, revokeCredential: revoke },
+    openDb: vi.fn().mockResolvedValue(mockDbHandle) as RunMigrationsDeps['openDb'],
+    makeRunner: () => ({ run }),
+  };
+}
+
+function makeMockCtx(): CLIPluginContext & { output: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> } } {
+  return {
+    output: {
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    },
+    client: {} as CLIPluginContext['client'],
+  } as unknown as CLIPluginContext & { output: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> } };
+}
+
+// ─── Suite ────────────────────────────────────────────────────────────────────
+
+describe('runMigrationPhase', () => {
+  it('is a no-op when config.migration is absent', async () => {
+    const config: DeployConfig = {
+      name: 'test-config',
+      hosts: ['10.0.0.1'],
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await runMigrationPhase(config, 'test-config', ctx, deps);
+
+    // runMigrations should NOT have been called (deps.client.issueCredential is the
+    // first thing runMigrations calls — if it wasn't called, runMigrations was skipped)
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+    expect(ctx.output.info).not.toHaveBeenCalled();
+  });
+
+  it('calls runMigrations with the correct roleId and migrationsDir when config.migration is present', async () => {
+    const config: DeployConfig = {
+      name: 'production',
+      hosts: ['10.0.0.1'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await runMigrationPhase(config, 'production', ctx, deps);
+
+    // The lease must have been minted — runMigrations ran
+    expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
+    expect(deps.client.issueCredential).toHaveBeenCalledTimes(1);
+
+    // Verify via output messages — both info lines must have fired (before + after),
+    // which proves the full runMigrations call completed successfully.
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Running schema migrations before rollout...');
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+  });
+
+  it('runs with correct runner invocation (runner.run is called once)', async () => {
+    const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 3, pendingRemaining: 0 });
+    const config: DeployConfig = {
+      name: 'staging',
+      hosts: ['10.0.0.2'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps({ run });
+
+    await runMigrationPhase(config, 'staging', ctx, deps);
+
+    // runner.run() must be called exactly once (no short-circuit)
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // Lease must be revoked after success
+    expect(deps.client.revokeCredential).toHaveBeenCalledTimes(1);
+    expect(deps.client.revokeCredential).toHaveBeenCalledWith('L1', { reason: 'migration complete' });
+  });
+
+  it('propagates runMigrations failure and still revokes the lease (aborts deploy before rollout)', async () => {
+    const migrationError = new Error('migration failed: duplicate column "foo"');
+    const run = vi.fn().mockRejectedValue(migrationError);
+    const revoke = vi.fn().mockResolvedValue(undefined);
+
+    const config: DeployConfig = {
+      name: 'production',
+      hosts: ['10.0.0.1'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps({ run, revoke });
+
+    // runMigrationPhase must REJECT — proving the caller (the action) sees the error
+    // and cannot proceed to executeListrDeployment
+    await expect(runMigrationPhase(config, 'production', ctx, deps)).rejects.toThrow(
+      'migration failed: duplicate column "foo"',
+    );
+
+    // The lease must still be revoked even on failure (run-migrations finally block)
+    expect(revoke).toHaveBeenCalledTimes(1);
+  });
+});
