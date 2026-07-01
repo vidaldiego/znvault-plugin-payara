@@ -326,6 +326,42 @@ export interface DeployConfig {
   }>;
   /** ORDERED array — array order IS deploy order. Mutually exclusive with top-level `hosts`. */
   classes?: DeployClass[];
+  /**
+   * Optional migration phase configuration (Task 8 / spec §run-migrations.ts).
+   *
+   * When present, schema migrations are applied ONCE, BEFORE the rolling WAR
+   * rollout begins, so a migration failure aborts the deploy before any host
+   * is touched. When absent, the migration phase is skipped entirely.
+   *
+   * TODO(T9): add a `znvault deploy config set-migration` CLI path + validate
+   * roleId/migrationsDir in deploy-config-validate.ts. host/port/database come
+   * from the Vault connection via the lease, not from this config.
+   */
+  migration?: MigrationConfig;
+}
+
+/**
+ * Schema migration configuration for the deploy-run migration phase.
+ *
+ * Credentials are NOT stored here — they are dynamically issued from the
+ * vault dynamic-secrets role identified by `roleId`.
+ *
+ * host/port/database are provided by the Vault dynamic-secrets connection
+ * (referenced by roleId) and returned with the lease — the deploy config
+ * only names the role + the migrations dir. `database` is an optional
+ * override for when the Vault connection does not pin a database name.
+ */
+export interface MigrationConfig {
+  /** Dynamic-secrets role ID for the migration DB user (write role). */
+  roleId: string;
+  /**
+   * Optional database name override.
+   * If omitted, the database name from the Vault dynamic-secrets lease is used.
+   * If neither the lease nor this field provides a name, the migration phase will abort.
+   */
+  database?: string;
+  /** Absolute path to the migrations directory (the flat `docs/migrations` folder). */
+  migrationsDir: string;
 }
 
 /**

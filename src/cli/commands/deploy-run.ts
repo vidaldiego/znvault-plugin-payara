@@ -2,6 +2,7 @@
 // Deploy run command - multi-host deployment using saved configurations
 
 import type { Command } from 'commander';
+import { runMigrations, defaultDeps as migrationDefaultDeps } from '../../run-migrations.js';
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -166,6 +167,33 @@ export function validateClassHostOverride(
   hostOverride: string[],
 ): { unknownHosts: string[] } {
   return { unknownHosts: hostOverride.filter(h => !classHosts.includes(h)) };
+}
+
+/**
+ * Run the schema-migration phase if the deploy config requests it. Called ONCE,
+ * BEFORE the rolling WAR rollout, so a migration failure aborts the deploy before
+ * any host is touched. No-op when config.migration is absent.
+ *
+ * @param config     - The resolved deploy config (may or may not have .migration).
+ * @param configName - The config name, used as the `env` label in runMigrations.
+ * @param ctx        - The CLI plugin context (output + client).
+ * @param deps       - Injectable deps (defaults to production wiring via migrationDefaultDeps).
+ */
+export async function runMigrationPhase(
+  config: DeployConfig,
+  configName: string,
+  ctx: CLIPluginContext,
+  deps = migrationDefaultDeps(ctx.client),
+): Promise<void> {
+  if (!config.migration) return;
+  ctx.output.info('[deploy] Running schema migrations before rollout...');
+  await runMigrations(ctx, {
+    env: configName,
+    roleId: config.migration.roleId,
+    migrationsDir: config.migration.migrationsDir,
+    database: config.migration.database,
+  }, deps);
+  ctx.output.info('[deploy] Migrations complete — proceeding with rollout.');
 }
 
 /**
@@ -584,6 +612,21 @@ export function registerDeployRunCommand(
             console.log(`All ${haproxyConfig.hosts.length} HAProxy hosts reachable`);
           }
         }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // MIGRATION PHASE (Task 8 — guarded, runs once before any WAR swap)
+        //
+        // When `config.migration` is present, schema migrations are applied
+        // to the database BEFORE the rolling WAR rollout begins. This means:
+        //   - A migration failure aborts the deploy BEFORE any host is touched.
+        //   - The new schema serves the old WAR during the rolling window
+        //     (expand/contract forward-compat required — see spec §Forward-compat).
+        //
+        // When `config.migration` is absent, this block is skipped entirely
+        // so existing deploy configs without migration settings are unaffected.
+        // TODO(T9): validate migration config fields in deploy-config-validate.ts.
+        // ═══════════════════════════════════════════════════════════════════
+        await runMigrationPhase(config, configName, ctx);
 
         // Execute deployment using Listr2
         const deployResult = await executeListrDeployment(strategy, deployableHosts, {

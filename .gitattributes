@@ -1,0 +1,2 @@
+# Test fixtures with controlled line endings — treat as binary to preserve exact bytes
+test/migrate/golden/synthetic/*.sql binary

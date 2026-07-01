@@ -1,0 +1,14 @@
+{
+  "checksums": {
+    "bare-cr.sql": "3c1eb32769b87b2f58a3e43ea4341a5205c99430c4b3ea66f4fb246423063b94",
+    "bom.sql": "b4e0497804e46e0a0b0b8c31975b062152d551bac49c3c2e80932567b4085dcd",
+    "crlf.sql": "82efb67f3010c6eb7ead02e4f6d9550633dbc1407f99aa487468e7b2567aebbc",
+    "non-ascii.sql": "137859737a270bcb79fb890125142723b512a444a030c0b9edb4be6b9c4bb23f"
+  },
+  "splits": {
+    "bare-cr.sql": ["SELECT 1","SELECT 2"],
+    "bom.sql": ["﻿SELECT 1"],
+    "crlf.sql": ["SELECT 1","SELECT 2"],
+    "non-ascii.sql": ["SELECT \"ñ\""]
+  }
+}

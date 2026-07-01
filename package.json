@@ -67,6 +67,7 @@
     "adm-zip": "^0.5.16",
     "inquirer": "^13.2.1",
     "listr2": "^10.0.0",
+    "mysql2": "^3.16.1",
     "pino": "^10.2.1"
   },
   "devDependencies": {
