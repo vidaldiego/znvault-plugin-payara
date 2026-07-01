@@ -333,9 +333,11 @@ export interface DeployConfig {
    * rollout begins, so a migration failure aborts the deploy before any host
    * is touched. When absent, the migration phase is skipped entirely.
    *
-   * TODO(T9): add a `znvault deploy config set-migration` CLI path + validate
-   * roleId/migrationsDir in deploy-config-validate.ts. host/port/database come
-   * from the Vault connection via the lease, not from this config.
+   * Set via `znvault deploy config set-migration <name> --role <roleId> --dir <path>`;
+   * clear via `--clear`. Validated by `validateDeployConfig` (errors on missing
+   * roleId or migrationsDir). host/port/database come from the Vault
+   * dynamic-secrets connection referenced by roleId via the lease, not from
+   * this config (database may optionally be overridden here).
    */
   migration?: MigrationConfig;
 }
