@@ -125,16 +125,23 @@ export function registerConfigCommands(
         }
         console.log(`  WAR Path:    ${config.warPath || ANSI.dim + '(not set)' + ANSI.reset}`);
         console.log(`  Port:        ${config.port}`);
+        // A multi-class config carries hosts/strategy/haproxy PER CLASS; the flat
+        // top-level fields are defaults (often unset), so present them accordingly.
+        const isMultiClass = !!(config.classes && config.classes.length > 0);
         // Display strategy (prefer explicit strategy over legacy parallel flag)
         const displayStrategy = config.strategy ?? (config.parallel ? 'parallel' : 'sequential');
-        console.log(`  Strategy:    ${displayStrategy}`);
+        console.log(`  Strategy:    ${isMultiClass ? `${displayStrategy} ${ANSI.dim}(default; per-class below)${ANSI.reset}` : displayStrategy}`);
         console.log(`  Tunnel:      ${config.tunnel ? ANSI.green + 'yes (SSH-CA)' + ANSI.reset : ANSI.dim + 'no (direct)' + ANSI.reset}`);
-        console.log(`\n  Hosts (${(config.hosts ?? []).length}):`);
-        if ((config.hosts ?? []).length === 0) {
-          console.log(`    ${ANSI.dim}(none)${ANSI.reset}`);
+        if (isMultiClass) {
+          console.log(`\n  Hosts:       ${ANSI.dim}(per node class — see below)${ANSI.reset}`);
         } else {
-          for (const host of (config.hosts ?? [])) {
-            console.log(`    - ${host}`);
+          console.log(`\n  Hosts (${(config.hosts ?? []).length}):`);
+          if ((config.hosts ?? []).length === 0) {
+            console.log(`    ${ANSI.dim}(none)${ANSI.reset}`);
+          } else {
+            for (const host of (config.hosts ?? [])) {
+              console.log(`    - ${host}`);
+            }
           }
         }
         if (config.healthCheck) {
@@ -180,6 +187,8 @@ export function registerConfigCommands(
           } else {
             console.log(`    Server map: ${ANSI.dim}(empty)${ANSI.reset}`);
           }
+        } else if (isMultiClass) {
+          console.log(`\n  HAProxy: ${ANSI.dim}(per node class — see below)${ANSI.reset}`);
         } else {
           console.log(`\n  HAProxy: ${ANSI.dim}(not configured)${ANSI.reset}`);
         }
@@ -194,8 +203,39 @@ export function registerConfigCommands(
           } else {
             console.log(`    Database: ${ANSI.dim}(from Vault dynamic-secrets connection)${ANSI.reset}`);
           }
+          if (mg.routines) {
+            console.log(`    Routines: ${mg.routines.bundle} v${mg.routines.version} (applied before migrations)`);
+          } else {
+            console.log(`    Routines: ${ANSI.dim}(none — migration engine assumes helpers already exist)${ANSI.reset}`);
+          }
         } else {
           console.log(`\n  Migration: ${ANSI.dim}(not configured — schema migrations will be skipped)${ANSI.reset}`);
+        }
+
+        // Node classes (multi-class configs). A multi-class config carries its
+        // hosts/strategy/haproxy PER CLASS, so the flat "Hosts"/"HAProxy" sections
+        // above show nothing for it — render the classes here so `show` is not
+        // silently blank for a multi-class config.
+        if (config.classes && config.classes.length > 0) {
+          console.log(`\n  Node classes (${config.classes.length}):`);
+          for (const cls of config.classes) {
+            const strat = cls.strategy ?? config.strategy ?? (config.parallel ? 'parallel' : 'sequential');
+            const hasServerMap = !!cls.haproxy && Object.keys(cls.haproxy.serverMap ?? {}).length > 0;
+            const blocking = cls.blocking ?? hasServerMap; // mirrors resolveClass default
+            console.log(`\n    ${ANSI.bold}${cls.name}${ANSI.reset} (${cls.hosts.length} host${cls.hosts.length === 1 ? '' : 's'})`);
+            console.log(`      Hosts:    ${cls.hosts.join(', ')}`);
+            console.log(`      Strategy: ${strat}`);
+            console.log(`      Blocking: ${blocking ? 'yes (must finish before next class)' : 'no (non-blocking)'}`);
+            if (cls.haproxy) {
+              const map = Object.entries(cls.haproxy.serverMap ?? {});
+              console.log(`      HAProxy:  backend ${cls.haproxy.backend}, drain ${cls.haproxy.drainWaitSeconds ?? 5}s, ${map.length} server-map ${map.length === 1 ? 'entry' : 'entries'}`);
+            } else {
+              console.log(`      HAProxy:  ${ANSI.dim}(none — no drain/ready)${ANSI.reset}`);
+            }
+            if (cls.quiesce?.enabled) {
+              console.log(`      Quiesce:  enabled (drain timeout ${cls.quiesce.drainTimeoutMs ?? 120000}ms)`);
+            }
+          }
         }
         console.log();
       }, 'Failed to show config');
