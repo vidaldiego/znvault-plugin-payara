@@ -7,6 +7,8 @@ import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
 import { getConfigOrExit, confirmPrompt, withErrorHandling } from './helpers.js';
 import { validateDeployConfig } from '../deploy-config-validate.js';
+import { resolveClass, hasActiveServerMap } from '../deploy-class.js';
+import { parseDeploymentStrategy } from '../types.js';
 
 /**
  * Register deploy config commands
@@ -237,6 +239,68 @@ export function registerConfigCommands(
             }
           }
         }
+
+        // ── Execution plan ─────────────────────────────────────────────────
+        // Describe, in order, what `znvault deploy run` would actually do with
+        // this config: the migration phase first (if configured), then each node
+        // class as an ordered phase with its strategy batches and blocking gate.
+        // Reuses the same resolution the deploy path uses, so the plan is accurate.
+        console.log(`\n  ${ANSI.bold}Execution plan${ANSI.reset} ${ANSI.dim}(what 'deploy run ${config.name}' does, in order)${ANSI.reset}:`);
+        let step = 1;
+        if (config.migration) {
+          if (config.migration.routines) {
+            console.log(`    ${step++}. Apply routine bundle ${config.migration.routines.bundle} v${config.migration.routines.version} (before any host is touched; aborts the deploy on failure)`);
+          }
+          console.log(`    ${step++}. Run schema migrations (role ${config.migration.roleId}; aborts the deploy on failure)`);
+        }
+
+        // Build the ordered list of phases: multi-class → each class; flat → one phase.
+        const phases: Array<{ name: string; hosts: string[]; strategy: string; blocking: boolean; drain: boolean }> = [];
+        if (config.classes && config.classes.length > 0) {
+          for (const cls of config.classes) {
+            const rc = resolveClass(config, cls);
+            phases.push({
+              name: rc.name,
+              hosts: rc.hosts,
+              strategy: rc.strategy ?? 'sequential',
+              blocking: rc.blocking,
+              drain: hasActiveServerMap(rc.haproxy),
+            });
+          }
+        } else if ((config.hosts ?? []).length > 0) {
+          phases.push({
+            name: 'hosts',
+            hosts: config.hosts ?? [],
+            strategy: config.strategy ?? (config.parallel ? 'parallel' : 'sequential'),
+            blocking: true,
+            drain: hasActiveServerMap(config.haproxy),
+          });
+        }
+
+        if (phases.length === 0) {
+          console.log(`    ${step}. ${ANSI.dim}(no hosts to roll out — migration-only or empty config)${ANSI.reset}`);
+        }
+        phases.forEach((ph, i) => {
+          const gate = i < phases.length - 1
+            ? (ph.blocking ? ' — must fully succeed before the next phase' : ' — non-blocking (next phase starts regardless)')
+            : '';
+          const drainNote = ph.drain ? ', HAProxy drain/ready per host' : '';
+          console.log(`    ${step++}. Roll out ${ANSI.bold}${ph.name}${ANSI.reset} (${ph.hosts.length} host${ph.hosts.length === 1 ? '' : 's'})${gate}`);
+          // Batch breakdown from the strategy (e.g. 1+R → "1 host, then the rest in parallel").
+          try {
+            const parsed = parseDeploymentStrategy(ph.strategy);
+            const batchDesc = parsed.batches
+              .map((b, bi) => {
+                if (b.count === 'rest') return bi === 0 ? 'all hosts at once' : 'then the rest in parallel';
+                return bi === 0 ? `${b.count} host${b.count === 1 ? '' : 's'} first` : `then ${b.count} in parallel`;
+              })
+              .join(', ');
+            console.log(`         strategy ${ph.strategy}: ${batchDesc}${drainNote}`);
+          } catch {
+            console.log(`         strategy ${ph.strategy}${drainNote}`);
+          }
+        });
+
         console.log();
       }, 'Failed to show config');
     });
