@@ -68,6 +68,7 @@ function isAlreadyGone(e: unknown): boolean {
 export function makeDynamicSecretsClient(http: VaultHttp): {
   issueCredential(roleId: string, opts: { ttlSeconds: number }): Promise<Lease>;
   revokeCredential(leaseId: string, opts: { reason: string }): Promise<void>;
+  applyRoutines(roleId: string, opts: { bundle: string; version: number }): Promise<void>;
 } {
   return {
     /**
@@ -132,6 +133,21 @@ export function makeDynamicSecretsClient(http: VaultHttp): {
         }
         throw e;
       }
+    },
+
+    /**
+     * Apply a routine bundle (stored procedures/functions) to a dynamic-secrets role.
+     *
+     * POST /v1/dynamic-secrets/roles/:roleId/routines { bundle, version }
+     *
+     * No SQL is accepted here — only the pre-validated bundle text and its version.
+     * Resolves on 200; a non-2xx response propagates as a throw (the caller — the
+     * deploy migrate phase — must abort on apply failure rather than proceed to
+     * mint a migrate lease against a stale/broken routine set).
+     */
+    async applyRoutines(roleId: string, opts: { bundle: string; version: number }): Promise<void> {
+      const path = `/v1/dynamic-secrets/roles/${roleId}/routines`;
+      await http.post(path, { bundle: opts.bundle, version: opts.version });
     },
   };
 }

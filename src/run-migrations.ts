@@ -46,6 +46,7 @@ export interface RunMigrationsOpts {
 export interface DynamicSecretsClient {
   issueCredential(roleId: string, opts: { ttlSeconds: number }): Promise<Lease>;
   revokeCredential(leaseId: string, opts: { reason: string }): Promise<void>;
+  applyRoutines(roleId: string, opts: { bundle: string; version: number }): Promise<void>;
 }
 
 /** Minimal DB handle exposed by openDb (for injection / testing). */

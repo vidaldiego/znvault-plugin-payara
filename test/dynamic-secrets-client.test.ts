@@ -121,4 +121,27 @@ describe('dynamic-secrets client', () => {
     const c = makeDynamicSecretsClient(http as any);
     await expect(c.issueCredential('roleX', { ttlSeconds: 300 })).rejects.toThrow('vault down');
   });
+
+  it('applyRoutines posts the bundle and version to the role routines endpoint', async () => {
+    const http = {
+      post: vi.fn().mockResolvedValue({ status: 200, body: {} }),
+    };
+    const c = makeDynamicSecretsClient(http as any);
+    await expect(
+      c.applyRoutines('dbr_bc3546e8729d4727', { bundle: '-- routines sql --', version: 3 }),
+    ).resolves.toBeUndefined();
+    expect(http.post).toHaveBeenCalledWith(
+      '/v1/dynamic-secrets/roles/dbr_bc3546e8729d4727/routines',
+      { bundle: '-- routines sql --', version: 3 },
+    );
+  });
+
+  it('applyRoutines rejects on non-2xx (propagates the http error)', async () => {
+    const err = Object.assign(new Error('routines rejected'), { status: 422 });
+    const http = { post: vi.fn().mockRejectedValue(err) };
+    const c = makeDynamicSecretsClient(http as any);
+    await expect(
+      c.applyRoutines('roleX', { bundle: 'bad bundle', version: 1 }),
+    ).rejects.toThrow('routines rejected');
+  });
 });
