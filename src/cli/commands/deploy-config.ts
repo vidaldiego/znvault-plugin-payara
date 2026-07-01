@@ -2,7 +2,7 @@
 // Deploy config management commands
 
 import type { Command } from 'commander';
-import type { CLIPluginContext, DeployConfig, HealthCheckConfig, HAProxyConfig } from '../types.js';
+import type { CLIPluginContext, DeployConfig, HealthCheckConfig, HAProxyConfig, MigrationConfig } from '../types.js';
 import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
 import { getConfigOrExit, confirmPrompt, withErrorHandling } from './helpers.js';
@@ -182,6 +182,20 @@ export function registerConfigCommands(
           }
         } else {
           console.log(`\n  HAProxy: ${ANSI.dim}(not configured)${ANSI.reset}`);
+        }
+        // Migration configuration
+        if (config.migration) {
+          const mg = config.migration;
+          console.log(`\n  Migration:`);
+          console.log(`    Role:     ${mg.roleId}`);
+          console.log(`    Dir:      ${mg.migrationsDir}`);
+          if (mg.database) {
+            console.log(`    Database: ${mg.database} (override)`);
+          } else {
+            console.log(`    Database: ${ANSI.dim}(from Vault dynamic-secrets connection)${ANSI.reset}`);
+          }
+        } else {
+          console.log(`\n  Migration: ${ANSI.dim}(not configured — schema migrations will be skipped)${ANSI.reset}`);
         }
         console.log();
       }, 'Failed to show config');
@@ -600,6 +614,63 @@ export function registerConfigCommands(
         }
       }, 'Failed to update HAProxy mappings');
     });
+  // deploy config set-migration <name>
+  configCmd
+    .command('set-migration <name>')
+    .description('Set (or clear) the migration config for a deployment configuration')
+    .option('--role <roleId>', 'Dynamic-secrets role ID for the migration DB user (write role)')
+    .option('--dir <path>', 'Migrations directory (e.g. docs/migrations)')
+    .option('--database <db>', 'DB name override (normally Vault connection provides it)')
+    .option('--clear', 'Remove the migration config from this deploy config')
+    .action(async (name: string, options: {
+      role?: string;
+      dir?: string;
+      database?: string;
+      clear?: boolean;
+    }) => {
+      await withErrorHandling(ctx, async () => {
+        const { store, config } = await getConfigOrExit(ctx, name);
+
+        if (options.clear) {
+          delete config.migration;
+          await saveDeployConfigs(store);
+          ctx.output.success(`Cleared migration config for '${name}'`);
+          return;
+        }
+
+        if (!options.role) {
+          ctx.output.error('--role <roleId> is required');
+          ctx.output.info('Usage: znvault deploy config set-migration <name> --role <roleId> --dir <path>');
+          process.exit(1);
+        }
+
+        if (!options.dir) {
+          ctx.output.error('--dir <path> is required');
+          ctx.output.info('Usage: znvault deploy config set-migration <name> --role <roleId> --dir <path>');
+          process.exit(1);
+        }
+
+        const migration: MigrationConfig = {
+          roleId: options.role,
+          migrationsDir: options.dir,
+          ...(options.database ? { database: options.database } : {}),
+        };
+
+        config.migration = migration;
+        await saveDeployConfigs(store);
+
+        ctx.output.success(`Set migration config for '${name}'`);
+        ctx.output.info(`  Role:     ${migration.roleId}`);
+        ctx.output.info(`  Dir:      ${migration.migrationsDir}`);
+        if (migration.database) {
+          ctx.output.info(`  Database: ${migration.database} (override)`);
+        } else {
+          ctx.output.info(`  Database: (from Vault dynamic-secrets connection via the lease)`);
+        }
+        ctx.output.info(`  Note: host/port/database otherwise come from the Vault dynamic-secrets connection referenced by the role.`);
+      }, 'Failed to set migration config');
+    });
+
   // deploy config validate <name>
   configCmd
     .command('validate <name>')
