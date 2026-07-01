@@ -25,12 +25,14 @@ interface HarnessOverrides {
   revoke?: ReturnType<typeof vi.fn>;
   run?: ReturnType<typeof vi.fn>;
   openDb?: ReturnType<typeof vi.fn>;
+  applyRoutines?: ReturnType<typeof vi.fn>;
 }
 
 function harness(overrides: HarnessOverrides = {}): {
   issue: ReturnType<typeof vi.fn>;
   revoke: ReturnType<typeof vi.fn>;
   run: ReturnType<typeof vi.fn>;
+  applyRoutines: ReturnType<typeof vi.fn>;
   deps: RunMigrationsDeps;
   opts: RunMigrationsOpts;
 } {
@@ -46,12 +48,13 @@ function harness(overrides: HarnessOverrides = {}): {
   const run = overrides.run ?? vi.fn().mockResolvedValue({
     seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0,
   });
+  const applyRoutines = overrides.applyRoutines ?? vi.fn().mockResolvedValue(undefined);
 
   const mockDbHandle = { end: vi.fn().mockResolvedValue(undefined) };
   const openDb = overrides.openDb ?? vi.fn().mockResolvedValue(mockDbHandle);
 
   const deps: RunMigrationsDeps = {
-    client: { issueCredential: issue, revokeCredential: revoke },
+    client: { issueCredential: issue, revokeCredential: revoke, applyRoutines },
     openDb: openDb as RunMigrationsDeps['openDb'],
     makeRunner: () => ({ run }),
     settleMs: 0, // no real waiting in tests
@@ -65,7 +68,7 @@ function harness(overrides: HarnessOverrides = {}): {
     migrationsDir: '/migrations',
   };
 
-  return { issue, revoke, run, deps, opts };
+  return { issue, revoke, run, applyRoutines, deps, opts };
 }
 
 // Minimal ctx that captures warn messages
@@ -126,7 +129,7 @@ describe('runMigrations', () => {
     const openDb = vi.fn().mockResolvedValue(mockDbHandle);
 
     const deps: RunMigrationsDeps = {
-      client: { issueCredential: issue, revokeCredential: vi.fn().mockResolvedValue(undefined) },
+      client: { issueCredential: issue, revokeCredential: vi.fn().mockResolvedValue(undefined), applyRoutines: vi.fn().mockResolvedValue(undefined) },
       openDb: openDb as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn().mockResolvedValue({}) }),
       settleMs: 0,
@@ -165,7 +168,7 @@ describe('runMigrations', () => {
     const openDb = vi.fn().mockResolvedValue(mockDbHandle);
 
     const deps: RunMigrationsDeps = {
-      client: { issueCredential: issue, revokeCredential: vi.fn().mockResolvedValue(undefined) },
+      client: { issueCredential: issue, revokeCredential: vi.fn().mockResolvedValue(undefined), applyRoutines: vi.fn().mockResolvedValue(undefined) },
       openDb: openDb as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn().mockResolvedValue({}) }),
       settleMs: 0,
@@ -198,7 +201,7 @@ describe('runMigrations', () => {
     });
     const revoke = vi.fn().mockResolvedValue(undefined);
     const deps: RunMigrationsDeps = {
-      client: { issueCredential: issue, revokeCredential: revoke },
+      client: { issueCredential: issue, revokeCredential: revoke, applyRoutines: vi.fn().mockResolvedValue(undefined) },
       openDb: vi.fn() as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn() }),
       settleMs: 0,
@@ -242,7 +245,7 @@ describe('runMigrations', () => {
     const issue = vi.fn().mockRejectedValue(new Error('vault down'));
     const revoke = vi.fn();
     const deps: RunMigrationsDeps = {
-      client: { issueCredential: issue, revokeCredential: revoke },
+      client: { issueCredential: issue, revokeCredential: revoke, applyRoutines: vi.fn().mockResolvedValue(undefined) },
       openDb: vi.fn() as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn() }),
       settleMs: 0,
@@ -365,6 +368,7 @@ describe('runMigrations', () => {
           database: 'd',
         }),
         revokeCredential: revoke,
+        applyRoutines: vi.fn().mockResolvedValue(undefined),
       },
       openDb: openDb as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn() }),
@@ -469,5 +473,50 @@ describe('runMigrations', () => {
     await expect(runMigrations(ctx, opts, deps)).resolves.toBeUndefined();
     // Generic transient error → all 3 attempts exhausted
     expect(revoke).toHaveBeenCalledTimes(3);
+  });
+
+  // ─── Step 0: apply routine bundle BEFORE minting the lease ────────────────
+
+  it('applies the routine bundle BEFORE minting the lease when opts.routines is set', async () => {
+    const { issue, applyRoutines, deps, opts } = harness();
+    const ctx = makeCtx();
+
+    const routines = { bundle: 'zn_migration_helpers', version: 3 };
+    await runMigrations(ctx, { ...opts, routines }, deps);
+
+    expect(applyRoutines).toHaveBeenCalledWith('dbr_bc3546e8729d4727', routines);
+    expect(issue).toHaveBeenCalledTimes(1);
+
+    // Call order: applyRoutines must fire strictly before issueCredential.
+    const applyOrder = applyRoutines.mock.invocationCallOrder[0];
+    const issueOrder = issue.mock.invocationCallOrder[0];
+    expect(applyOrder).toBeLessThan(issueOrder);
+  });
+
+  it('aborts before minting a lease when applyRoutines rejects', async () => {
+    const applyRoutines = vi.fn().mockRejectedValue(new Error('bundle rejected: DEFINER clause present'));
+    const { issue, revoke, deps, opts } = harness({ applyRoutines });
+    const ctx = makeCtx();
+
+    const routines = { bundle: 'zn_migration_helpers', version: 3 };
+    await expect(runMigrations(ctx, { ...opts, routines }, deps)).rejects.toThrow(
+      'bundle rejected: DEFINER clause present',
+    );
+
+    // No lease minted, and therefore nothing to revoke.
+    expect(issue).not.toHaveBeenCalled();
+    expect(revoke).not.toHaveBeenCalled();
+  });
+
+  it('does not call applyRoutines when opts.routines is absent (byte-identical to today)', async () => {
+    const { issue, revoke, run, applyRoutines, deps, opts } = harness();
+    const ctx = makeCtx();
+
+    await runMigrations(ctx, opts, deps);
+
+    expect(applyRoutines).not.toHaveBeenCalled();
+    expect(issue).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(revoke).toHaveBeenCalledTimes(1);
   });
 });
