@@ -632,6 +632,10 @@ export function registerConfigCommands(
         const { store, config } = await getConfigOrExit(ctx, name);
 
         if (options.clear) {
+          if (!config.migration) {
+            ctx.output.info(`No migration config was set on '${name}'.`);
+            return;
+          }
           delete config.migration;
           await saveDeployConfigs(store);
           ctx.output.success(`Cleared migration config for '${name}'`);
