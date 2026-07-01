@@ -45,7 +45,12 @@ export async function openDb(cfg: DbConfig): Promise<Db> {
       database: cfg.database,
       user: cfg.user,
       password: cfg.password,
-      ssl: cfg.ssl ? {} : undefined,
+      // Kotlin's ConnectionFactory uses sslMode=REQUIRED — encrypt but do NOT verify the
+      // server certificate (REQUIRED ≠ VERIFY_CA). mysql2's `ssl: {}` defaults to
+      // rejectUnauthorized:true (verify against the system CA store), which FAILS against
+      // the prod MySQL's internal CA ("unable to verify the first certificate"). Match
+      // Kotlin: encrypt without cert verification. (Local/e2e uses ssl:false → undefined.)
+      ssl: cfg.ssl ? { rejectUnauthorized: false } : undefined,
       multipleStatements: false,
       // connector-j 9.x note: on the SSL-disabled path (dev/e2e) allowPublicKeyRetrieval
       // is needed for caching_sha2_password auth. The mysql2 driver handles this
