@@ -192,6 +192,7 @@ export async function runMigrationPhase(
     roleId: config.migration.roleId,
     migrationsDir: config.migration.migrationsDir,
     database: config.migration.database,
+    routines: config.migration.routines,
   }, deps);
   ctx.output.info('[deploy] Migrations complete — proceeding with rollout.');
 }

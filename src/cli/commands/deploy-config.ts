@@ -621,11 +621,15 @@ export function registerConfigCommands(
     .option('--role <roleId>', 'Dynamic-secrets role ID for the migration DB user (write role)')
     .option('--dir <path>', 'Migrations directory (e.g. docs/migrations)')
     .option('--database <db>', 'DB name override (normally Vault connection provides it)')
+    .option('--routines-bundle <name>', 'Routine bundle name to apply before migrations (requires --routines-version)')
+    .option('--routines-version <n>', 'Routine bundle version to apply before migrations (requires --routines-bundle)')
     .option('--clear', 'Remove the migration config from this deploy config')
     .action(async (name: string, options: {
       role?: string;
       dir?: string;
       database?: string;
+      routinesBundle?: string;
+      routinesVersion?: string;
       clear?: boolean;
     }) => {
       await withErrorHandling(ctx, async () => {
@@ -654,10 +658,19 @@ export function registerConfigCommands(
           process.exit(1);
         }
 
+        if ((options.routinesBundle && !options.routinesVersion) || (!options.routinesBundle && options.routinesVersion)) {
+          ctx.output.error('--routines-bundle and --routines-version are required together');
+          ctx.output.info('Usage: znvault deploy config set-migration <name> --role <roleId> --dir <path> --routines-bundle <name> --routines-version <n>');
+          process.exit(1);
+        }
+
         const migration: MigrationConfig = {
           roleId: options.role,
           migrationsDir: options.dir,
           ...(options.database ? { database: options.database } : {}),
+          ...(options.routinesBundle && options.routinesVersion
+            ? { routines: { bundle: options.routinesBundle, version: Number(options.routinesVersion) } }
+            : {}),
         };
 
         config.migration = migration;
@@ -670,6 +683,9 @@ export function registerConfigCommands(
           ctx.output.info(`  Database: ${migration.database} (override)`);
         } else {
           ctx.output.info(`  Database: (from Vault dynamic-secrets connection via the lease)`);
+        }
+        if (migration.routines) {
+          ctx.output.info(`  Routines: ${migration.routines.bundle} v${migration.routines.version} (applied before migrations)`);
         }
         ctx.output.info(`  Note: host/port/database otherwise come from the Vault dynamic-secrets connection referenced by the role.`);
       }, 'Failed to set migration config');

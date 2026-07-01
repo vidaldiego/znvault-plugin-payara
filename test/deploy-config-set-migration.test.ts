@@ -113,3 +113,77 @@ describe('validateDeployConfig — migration config', () => {
     expect(r.errors.some(e => /migration.*missing roleId|roleId.*migration/i.test(e))).toBe(true);
   });
 });
+
+// ── Routines selector validation (C3) ──
+
+describe('validateDeployConfig — migration.routines selector', () => {
+  it('errors when routines.bundle is empty', () => {
+    const r = validateDeployConfig({
+      ...flatBase,
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: '', version: 1 },
+      },
+    });
+    expect(r.errors.some(e => /routines.*bundle/i.test(e))).toBe(true);
+  });
+
+  it('errors when routines.bundle is whitespace-only', () => {
+    const r = validateDeployConfig({
+      ...flatBase,
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: '   ', version: 1 },
+      },
+    });
+    expect(r.errors.some(e => /routines.*bundle/i.test(e))).toBe(true);
+  });
+
+  it('errors when routines.version is less than 1', () => {
+    const r = validateDeployConfig({
+      ...flatBase,
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: 'zn_helpers', version: 0 },
+      },
+    });
+    expect(r.errors.some(e => /routines.*version/i.test(e))).toBe(true);
+  });
+
+  it('errors when routines.version is not an integer', () => {
+    const r = validateDeployConfig({
+      ...flatBase,
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: 'zn_helpers', version: 1.5 },
+      },
+    });
+    expect(r.errors.some(e => /routines.*version/i.test(e))).toBe(true);
+  });
+
+  it('passes and emits an info line for a well-formed routines selector', () => {
+    const r = validateDeployConfig({
+      ...flatBase,
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: 'zn_helpers', version: 2 },
+      },
+    });
+    expect(r.errors).toEqual([]);
+    expect(r.info.some(i => /will apply routine bundle zn_helpers v2 before migrations/i.test(i))).toBe(true);
+  });
+
+  it('does not require routines at all (absent is valid)', () => {
+    const r = validateDeployConfig({
+      ...flatBase,
+      migration: { roleId: 'zincdb-rw', migrationsDir: 'docs/migrations' },
+    });
+    expect(r.errors).toEqual([]);
+    expect(r.info.some(i => /will apply routine bundle/i.test(i))).toBe(false);
+  });
+});

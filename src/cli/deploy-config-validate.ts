@@ -105,6 +105,23 @@ export function validateDeployConfig(config: DeployConfig): ValidationReport {
         config.migration.migrationsDir && config.migration.migrationsDir.trim() !== '') {
       info.push(`config '${config.name}' will run schema migrations before rollout (role '${config.migration.roleId}', dir '${config.migration.migrationsDir}'); host/port/database come from the Vault dynamic-secrets connection.`);
     }
+
+    // ── Routines selector validation (applied before the migrate lease is minted) ──
+    if (config.migration.routines) {
+      const { bundle, version } = config.migration.routines;
+      const bundleValid = !!bundle && bundle.trim() !== '';
+      const versionValid = Number.isInteger(version) && version >= 1;
+
+      if (!bundleValid) {
+        errors.push(`config '${config.name}' migration.routines is missing bundle (the routine bundle name).`);
+      }
+      if (!versionValid) {
+        errors.push(`config '${config.name}' migration.routines.version must be an integer >= 1.`);
+      }
+      if (bundleValid && versionValid) {
+        info.push(`config '${config.name}' will apply routine bundle ${bundle} v${version} before migrations.`);
+      }
+    }
   }
 
   return { errors, warnings, info };
