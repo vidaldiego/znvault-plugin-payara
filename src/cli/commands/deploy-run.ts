@@ -274,7 +274,10 @@ export function registerDeployRunCommand(
             classNames: options.class, strategy: options.strategy, host: [...options.host, ...options.only],
           });
           if (flagCheck.error) { ctx.output.error(flagCheck.error); process.exit(1); }
-          // 3. Run the multi-class deploy (helper below) and exit.
+          // 3. Run the migration phase (if configured) BEFORE any class rolls out,
+          //    so a migration failure aborts the deploy before any host is touched.
+          await runMigrationPhase(config, configName, ctx);
+          // 4. Run the multi-class deploy (helper below) and exit.
           await runMultiClassDeploy(ctx, config, options, { openTunnels, isPlain });
           return; // handled — do not fall through to the flat path
         }

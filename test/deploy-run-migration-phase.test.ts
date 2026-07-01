@@ -149,3 +149,88 @@ describe('runMigrationPhase', () => {
     expect(revoke).toHaveBeenCalledTimes(1);
   });
 });
+
+// ─── Multi-class config shape ─────────────────────────────────────────────────
+//
+// These tests prove that runMigrationPhase is shape-agnostic: it inspects only
+// config.migration and config.name — it does NOT care whether the config has
+// `hosts` (flat) or `classes` (multi-class).  The call-site addition in
+// deploy-run.ts now calls runMigrationPhase BEFORE runMultiClassDeploy, so the
+// multi-class deploy aborts on migration failure before ANY host is touched.
+//
+
+describe('runMigrationPhase — multi-class config shape', () => {
+  it('is a no-op when a multi-class config has no migration block', async () => {
+    const config: DeployConfig = {
+      name: 'staging',
+      classes: [
+        { name: 'api', hosts: ['10.0.0.1'] },
+        { name: 'worker', hosts: ['10.0.0.2'] },
+      ],
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await runMigrationPhase(config, 'staging', ctx, deps);
+
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+    expect(ctx.output.info).not.toHaveBeenCalled();
+  });
+
+  it('runs migrations when a multi-class config has a migration block', async () => {
+    const config: DeployConfig = {
+      name: 'staging',
+      classes: [
+        { name: 'api', hosts: ['10.0.0.1'] },
+        { name: 'worker', hosts: ['10.0.0.2'] },
+      ],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await runMigrationPhase(config, 'staging', ctx, deps);
+
+    // Credential must have been issued — runMigrations ran
+    expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
+    expect(deps.client.issueCredential).toHaveBeenCalledTimes(1);
+
+    // Both info lines fire — full runMigrations lifecycle completed
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Running schema migrations before rollout...');
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+  });
+
+  it('propagates failure for a multi-class config (aborts before any class rolls out)', async () => {
+    const migrationError = new Error('migration failed: table already exists');
+    const run = vi.fn().mockRejectedValue(migrationError);
+    const revoke = vi.fn().mockResolvedValue(undefined);
+
+    const config: DeployConfig = {
+      name: 'production',
+      classes: [
+        { name: 'api', hosts: ['10.0.0.1', '10.0.0.2'] },
+        { name: 'worker', hosts: ['10.0.0.3'] },
+      ],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps({ run, revoke });
+
+    // Must reject — the caller (the action handler) will NOT proceed to runMultiClassDeploy
+    await expect(runMigrationPhase(config, 'production', ctx, deps)).rejects.toThrow(
+      'migration failed: table already exists',
+    );
+
+    // Lease revoked even on failure
+    expect(revoke).toHaveBeenCalledTimes(1);
+  });
+});
