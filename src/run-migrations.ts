@@ -65,6 +65,11 @@ export interface RunMigrationsDeps {
     ssl: boolean;
   }): Promise<DbHandle>;
   makeRunner(db: DbHandle, dir: string, appliedBy: string): { run(): Promise<unknown> };
+  /**
+   * Override the settle delay applied after db.end() and before revokeOnce().
+   * Set to 0 in tests to avoid real waiting.  Production always uses REVOKE_SETTLE_MS.
+   */
+  settleMs?: number;
 }
 
 // ─── VaultHttp adapter ────────────────────────────────────────────────────────
@@ -117,14 +122,34 @@ export function defaultDeps(client: { post<T>(path: string, body: unknown): Prom
 const REVOKE_RETRY_DELAYS_MS = [200, 600]; // 3 attempts: immediate + 2 retries
 
 /**
+ * Return true when the caught error indicates the lease is permanently in a
+ * non-revocable state (e.g. vault already marked it FAILED after a previous
+ * failed attempt).  Retrying these is futile — bail out immediately.
+ *
+ * Examples from the vault server:
+ *   "Cannot revoke failed lease"
+ *   "Cannot revoke a FAILED lease"
+ */
+function isNonRevocable(e: unknown): boolean {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /cannot revoke .* lease|failed lease/i.test(msg);
+}
+
+/**
  * Build a guarded single-shot revoke function with 3× retry + backoff.
  *
  * Idempotent: subsequent calls after the first are no-ops (the `revoked` flag
  * is captured in closure so parallel signal + finally can't double-revoke).
  *
- * 404/410/non-ACTIVE response → already gone → log WARN, do NOT retry (F6.1).
- * Other transient failures → retry up to 3 times, then log WARN without throwing
- * (the cleanup job + 4h TTL will drop the user eventually).
+ * 404/410/non-ACTIVE response → already gone → resolved as success (F6.1 — handled
+ * inside revokeCredential, never reaches the catch here).
+ *
+ * Non-revocable lease (vault marked FAILED) → log WARN with real error, stop
+ * immediately without retrying — retrying cannot fix a FAILED-lease state.
+ *
+ * Other transient failures → log DEBUG + retry up to 3 times; on final failure
+ * log WARN with the real error and give up without throwing (cleanup job + 4h
+ * TTL will drop the user eventually).
  */
 function makeRevokeOnce(
   client: DynamicSecretsClient,
@@ -143,23 +168,58 @@ function makeRevokeOnce(
       try {
         await client.revokeCredential(lease.leaseId, { reason: 'migration complete' });
         return; // success
-      } catch {
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+
+        // Part C: if the lease is permanently non-revocable (vault already
+        // marked it FAILED), retrying is futile — stop immediately.
+        if (isNonRevocable(e)) {
+          log(
+            `[run-migrations] WARN: revoke failed after ${attempt} attempt(s): ${errMsg}; ` +
+              `lease is in a non-revocable state — cleanup job + 4h TTL will drop the user. leaseId=${lease.leaseId}`,
+          );
+          return;
+        }
+
         const isLast = attempt === attempts;
         if (isLast) {
-          // All retries exhausted — log and give up; do NOT throw.
+          // All retries exhausted — log real error and give up; do NOT throw.
           log(
-            `[run-migrations] WARN: revoke failed after ${attempts} attempt(s); ` +
+            `[run-migrations] WARN: revoke failed after ${attempts} attempt(s): ${errMsg}; ` +
               `cleanup job + 4h TTL will drop the user. leaseId=${lease.leaseId}`,
           );
           return;
         }
-        // Wait before the next attempt.
+        // Non-last transient failure: log attempt details then wait before retry.
         const delayMs = REVOKE_RETRY_DELAYS_MS[attempt - 1] ?? 200;
+        log(
+          `[run-migrations] revoke attempt ${attempt} failed: ${errMsg}; retrying in ${delayMs}ms`,
+        );
         await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
       }
     }
   };
 }
+
+// ─── Settle delay constant ────────────────────────────────────────────────────
+
+/**
+ * How long to wait after db.end() before calling revokeOnce() in the normal
+ * teardown path.
+ *
+ * WHY: db.end() sends COM_QUIT to MySQL, but the server-side session lingers
+ * for a short window.  The vault revoke path does:
+ *   SELECT ID FROM processlist WHERE user=<ephemeral> → KILL sessions → DROP USER
+ * If the KILL races a just-closed session, the DROP USER fails transiently and
+ * vault marks the lease FAILED — subsequent retry attempts then hit
+ * "Cannot revoke failed lease" (vault's failed-lease guard), making all 3
+ * attempts fail.  Waiting ~1.5s gives the server time to tear down the session
+ * so the revoke's KILL/DROP runs against a clean slate.
+ *
+ * This delay is ONLY in the normal finally teardown.  The signal handler path
+ * calls revokeOnce() directly (inside withTimeout) and must stay fast.
+ */
+export const REVOKE_SETTLE_MS = 1500;
 
 // ─── withTimeout helper ───────────────────────────────────────────────────────
 
@@ -270,6 +330,17 @@ export async function runMigrations(
       await db.end().catch(() => {
         // best-effort; never mask the primary error
       });
+      // Settle delay: give the server time to tear down the just-closed
+      // ephemeral session before the vault revoke's KILL/DROP runs.
+      // Without this, db.end() (COM_QUIT) may still linger server-side,
+      // causing the revoke's KILL to race it → vault marks the lease FAILED
+      // → subsequent retry attempts hit "Cannot revoke failed lease".
+      // The signal handler path does NOT include this delay (stays fast).
+      // deps.settleMs overrides REVOKE_SETTLE_MS (set to 0 in tests to skip).
+      const settleMs = deps.settleMs ?? REVOKE_SETTLE_MS;
+      if (settleMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, settleMs));
+      }
     }
     await revokeOnce();
 

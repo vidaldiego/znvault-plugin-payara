@@ -11,6 +11,8 @@
  *  - Transient revoke failures are retried; a 3× failure logs rather than throwing
  *  - openDb is called with the LEASE's host/port/database (not from opts)
  *  - Signal handler registration/cleanup (hard to test process.exit path safely)
+ *  - Real error message is included in the WARN log on revoke failure (Part A)
+ *  - Non-revocable lease (vault FAILED state) stops retrying immediately (Part C)
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -52,6 +54,7 @@ function harness(overrides: HarnessOverrides = {}): {
     client: { issueCredential: issue, revokeCredential: revoke },
     openDb: openDb as RunMigrationsDeps['openDb'],
     makeRunner: () => ({ run }),
+    settleMs: 0, // no real waiting in tests
   };
 
   const opts: RunMigrationsOpts = {
@@ -126,6 +129,7 @@ describe('runMigrations', () => {
       client: { issueCredential: issue, revokeCredential: vi.fn().mockResolvedValue(undefined) },
       openDb: openDb as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn().mockResolvedValue({}) }),
+      settleMs: 0,
     };
     // NOTE: opts does NOT carry host/port — those come from the lease
     const opts: RunMigrationsOpts = {
@@ -164,6 +168,7 @@ describe('runMigrations', () => {
       client: { issueCredential: issue, revokeCredential: vi.fn().mockResolvedValue(undefined) },
       openDb: openDb as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn().mockResolvedValue({}) }),
+      settleMs: 0,
     };
     const opts: RunMigrationsOpts = {
       env: 'production',
@@ -196,6 +201,7 @@ describe('runMigrations', () => {
       client: { issueCredential: issue, revokeCredential: revoke },
       openDb: vi.fn() as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn() }),
+      settleMs: 0,
     };
     const opts: RunMigrationsOpts = {
       env: 'production',
@@ -239,6 +245,7 @@ describe('runMigrations', () => {
       client: { issueCredential: issue, revokeCredential: revoke },
       openDb: vi.fn() as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn() }),
+      settleMs: 0,
     };
     const ctx = makeCtx();
 
@@ -361,6 +368,7 @@ describe('runMigrations', () => {
       },
       openDb: openDb as RunMigrationsDeps['openDb'],
       makeRunner: () => ({ run: vi.fn() }),
+      settleMs: 0,
     };
 
     const opts: RunMigrationsOpts = {
@@ -377,5 +385,89 @@ describe('runMigrations', () => {
 
     // Verify the lease was still revoked (cleanup ran)
     expect(revoke).toHaveBeenCalledTimes(1);
+  });
+
+  // ─── Part A: real error message in WARN log ────────────────────────────────
+
+  it('WARN log includes the real error message when all revoke attempts fail', async () => {
+    vi.useRealTimers();
+    const revoke = vi.fn().mockRejectedValue(new Error('tls handshake timeout'));
+    const { deps, opts } = harness({ revoke });
+    const ctx = makeCtx();
+
+    await expect(runMigrations(ctx, opts, deps)).resolves.toBeUndefined();
+
+    // At least one WARN must include the actual error text, not just "revoke failed"
+    const warnWithError = ctx.warns.find(
+      (w) => w.includes('tls handshake timeout'),
+    );
+    expect(warnWithError).toBeTruthy();
+    // And the final WARN must mention how many attempts were made
+    expect(ctx.warns.some((w) => w.includes('revoke failed after'))).toBe(true);
+  });
+
+  it('non-last retry attempt logs DEBUG line with attempt number and error', async () => {
+    vi.useRealTimers();
+    const revoke = vi.fn()
+      .mockRejectedValueOnce(new Error('net blip attempt 1'))
+      .mockResolvedValueOnce(undefined); // succeeds on attempt 2
+
+    const { deps, opts } = harness({ revoke });
+    const ctx = makeCtx();
+
+    await expect(runMigrations(ctx, opts, deps)).resolves.toBeUndefined();
+
+    // Should have logged a retry attempt message with the error text
+    const retryLog = ctx.warns.find(
+      (w) => w.includes('revoke attempt') && w.includes('net blip attempt 1'),
+    );
+    expect(retryLog).toBeTruthy();
+  });
+
+  // ─── Part C: non-revocable lease stops retrying immediately ───────────────
+
+  it('stops retrying immediately when vault reports a non-revocable FAILED lease state', async () => {
+    vi.useRealTimers();
+    const revoke = vi.fn().mockRejectedValue(
+      new Error('Cannot revoke failed lease'),
+    );
+    const { deps, opts } = harness({ revoke });
+    const ctx = makeCtx();
+
+    // Must resolve (not throw) — the non-retrying path still logs and returns
+    await expect(runMigrations(ctx, opts, deps)).resolves.toBeUndefined();
+
+    // Should have called revokeCredential only ONCE (no futile retries)
+    expect(revoke).toHaveBeenCalledTimes(1);
+
+    // WARN log must include the real vault error
+    const warnWithMsg = ctx.warns.find(
+      (w) => w.includes('Cannot revoke failed lease'),
+    );
+    expect(warnWithMsg).toBeTruthy();
+  });
+
+  it('stops retrying immediately on "failed lease" variant error message', async () => {
+    vi.useRealTimers();
+    const revoke = vi.fn().mockRejectedValue(
+      new Error('Cannot revoke a FAILED lease — state transition not allowed'),
+    );
+    const { deps, opts } = harness({ revoke });
+    const ctx = makeCtx();
+
+    await expect(runMigrations(ctx, opts, deps)).resolves.toBeUndefined();
+    // Only ONE attempt — no retries
+    expect(revoke).toHaveBeenCalledTimes(1);
+  });
+
+  it('still retries 3× on a generic transient error (not a failed-lease error)', async () => {
+    vi.useRealTimers();
+    const revoke = vi.fn().mockRejectedValue(new Error('ECONNRESET'));
+    const { deps, opts } = harness({ revoke });
+    const ctx = makeCtx();
+
+    await expect(runMigrations(ctx, opts, deps)).resolves.toBeUndefined();
+    // Generic transient error → all 3 attempts exhausted
+    expect(revoke).toHaveBeenCalledTimes(3);
   });
 });

@@ -10,6 +10,17 @@
  *  - Skips runMigrations when config.migration is absent (no-op).
  *  - Calls runMigrations with the correct args when config.migration is present.
  *  - Propagates runMigrations failures (migration failure aborts the deploy before rollout).
+ *
+ * Also covers the --migrations-only behaviour: since the early-return that skips the
+ * rollout lives in the `.action()` closure (not in runMigrationPhase itself), the unit
+ * tests below verify the runMigrationPhase contract that --migrations-only relies on:
+ *  - Runs successfully when config.migration is present (so the caller can early-return).
+ *  - Does NOT run when config.migration is absent (guard in the action catches this first,
+ *    but runMigrationPhase is a safe no-op regardless).
+ * The action-level guard (`--migrations-only requires a migration config`) and the
+ * early-return calls to ctx.output.success are in the `.action()` closure and are
+ * verified by the integration / cli.test.ts if needed; they're not cheaply testable
+ * without spawning a full commander parse.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { runMigrationPhase } from '../src/cli/commands/deploy-run.js';
@@ -42,15 +53,25 @@ function makeMockDeps(overrides: {
   };
 }
 
-function makeMockCtx(): CLIPluginContext & { output: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> } } {
+type MockCtx = CLIPluginContext & {
+  output: {
+    info: ReturnType<typeof vi.fn>;
+    warn: ReturnType<typeof vi.fn>;
+    error: ReturnType<typeof vi.fn>;
+    success: ReturnType<typeof vi.fn>;
+  };
+};
+
+function makeMockCtx(): MockCtx {
   return {
     output: {
       info: vi.fn(),
       warn: vi.fn(),
       error: vi.fn(),
+      success: vi.fn(),
     },
     client: {} as CLIPluginContext['client'],
-  } as unknown as CLIPluginContext & { output: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> } };
+  } as unknown as MockCtx;
 }
 
 // ─── Suite ────────────────────────────────────────────────────────────────────
@@ -232,5 +253,79 @@ describe('runMigrationPhase — multi-class config shape', () => {
 
     // Lease revoked even on failure
     expect(revoke).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ─── --migrations-only contract ───────────────────────────────────────────────
+//
+// The early-return that skips the rollout lives inside the `.action()` closure and
+// can't be unit-tested without a full commander spawn.  These tests verify the
+// runMigrationPhase contract that the --migrations-only path relies on:
+//   • runMigrationPhase completes successfully when migration config is present
+//     (so the caller can safely early-return after it).
+//   • runMigrationPhase is a no-op when migration config is absent
+//     (the action-level guard fires before this, but no-op is safe regardless).
+//
+
+describe('--migrations-only: runMigrationPhase contract', () => {
+  it('completes successfully with migration config (caller can early-return after)', async () => {
+    const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 2, pendingRemaining: 0 });
+    const config: DeployConfig = {
+      name: 'production',
+      hosts: ['10.0.0.1'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps({ run });
+
+    // Must resolve (not throw) — --migrations-only returns right after this
+    await expect(runMigrationPhase(config, 'production', ctx, deps)).resolves.toBeUndefined();
+
+    // Migrations ran and lease was revoked
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(deps.client.revokeCredential).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a no-op without migration config (action guard fires first; runMigrationPhase safe regardless)', async () => {
+    const config: DeployConfig = {
+      name: 'no-migration',
+      hosts: ['10.0.0.1'],
+      // No migration block
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await expect(runMigrationPhase(config, 'no-migration', ctx, deps)).resolves.toBeUndefined();
+
+    // runMigrations was NOT invoked
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+  });
+
+  it('propagates failure so the action cannot proceed past runMigrationPhase', async () => {
+    const run = vi.fn().mockRejectedValue(new Error('migration failed: column missing'));
+
+    const config: DeployConfig = {
+      name: 'production',
+      hosts: ['10.0.0.1'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps({ run });
+
+    // --migrations-only flow: if runMigrationPhase rejects, the action
+    // propagates the error (no rollout runs, no success message emitted)
+    await expect(runMigrationPhase(config, 'production', ctx, deps)).rejects.toThrow(
+      'migration failed: column missing',
+    );
+    expect(ctx.output.success).not.toHaveBeenCalled();
   });
 });
