@@ -23,8 +23,10 @@ export interface RunResult {
  * Ports MigrationRunner.kt + MigrateMain.kt orchestration EXACTLY:
  *  - status(): read-only — ensureTable + plan; preflight(version-check only).
  *  - run(): write path — preflight(requireWritePrimary=true) → ensureTable (before lock,
- *    Kotlin parity) → acquire → helpers every run → seedIfVirgin → plan → reconcile →
- *    pending → release.
+ *    Kotlin parity) → acquire → seedIfVirgin → plan → reconcile → pending → release.
+ *
+ * `zn_*` helper procedures (0000_ files) are NOT created by this engine — see the
+ * doc comment on run() for details.
  */
 export class MigrationRunner {
   private repo: SchemaMigrationsRepo;
@@ -56,14 +58,21 @@ export class MigrationRunner {
    *  1. preflight(requireWritePrimary=true) — refuse read-only replicas.
    *  2. ensureTable() BEFORE the lock (the only pre-lock mutation, per Kotlin parity).
    *  3. acquire(db) — GET_LOCK.
-   *  4. Apply ALL 0000_ helper files unconditionally on EVERY run (DROP-then-CREATE =
-   *     idempotent). These must exist before any migration CALLs them and before
-   *     reconcile runs a trailing postcondition. requireLockHeld() per file.
-   *  5. seedBaselineIfVirgin — seed baselined rows when schema_migrations is empty.
-   *  6. plan() — classify remaining files.
-   *  7. reconcile — asserts-first; re-run body only when unmet or no asserts.
-   *  8. pending — claim(success=0) → exec → markSuccess(success=1).
-   *  9. finally: release lock; if release was not clean and no primary error, throw tripwire.
+   *  4. seedBaselineIfVirgin — seed baselined rows when schema_migrations is empty.
+   *  5. plan() — classify remaining files.
+   *  6. reconcile — asserts-first; re-run body only when unmet or no asserts.
+   *  7. pending — claim(success=0) → exec → markSuccess(success=1).
+   *  8. finally: release lock; if release was not clean and no primary error, throw tripwire.
+   *
+   * The `zn_*` helper procedures (0000_ files) are NO LONGER created here. They are
+   * now provisioned ahead of the migration phase by vault's routines-apply step,
+   * owned by a persistent routines DB account — see the vault-side dynsec-routines-
+   * provisioning feature (docs/superpowers/specs/2026-07-01-dynsec-routines-
+   * provisioning-design.md). Root cause: DROP+CREATE'ing them here made the
+   * ephemeral migrate user their DEFINER, and MySQL 8.4 refuses `DROP USER` for an
+   * account referenced as a stored-routine DEFINER (ER 4006) — which broke lease
+   * revocation on every migration run. Migrations now only `CALL zn_*`; they never
+   * (re)create the procedures themselves.
    */
   async run(): Promise<RunResult> {
     await preflight(this.db, true); // refuse read-only replica
@@ -78,22 +87,19 @@ export class MigrationRunner {
     try {
       const files = discover(this.migrationsDir);
 
-      // Step 4: Apply ALL 0000_ helper files unconditionally on EVERY run.
-      // These contain DROP-then-CREATE procedure bodies that must be refreshed even
-      // when nothing is pending — a stale body from a prior version would break
-      // zn_assert_* postcondition logic.
-      for (const f of files.filter((x) => x.version.startsWith('0000_'))) {
-        await this.requireLockHeld();
-        await this.executeStatements(f.path);
-      }
+      // NOTE: 0000_ helper files are discovered above (discover() does not filter
+      // them out) but are intentionally never applied here — plan() excludes them
+      // from all buckets (migration-planner.ts) and seedBaselineIfVirgin() skips
+      // them too, so they are inert as far as this engine is concerned. See the
+      // class doc comment on run() for why per-run creation was removed.
 
-      // Step 5: Seed baseline rows for a virgin DB (schema_migrations is empty).
+      // Step 4: Seed baseline rows for a virgin DB (schema_migrations is empty).
       const seeded = await this.seedBaselineIfVirgin(files);
 
-      // Step 6: Plan.
+      // Step 5: Plan.
       const p = plan(files, await this.repo.all());
 
-      // Step 7: Reconcile — asserts-first; re-run body only when asserts are absent
+      // Step 6: Reconcile — asserts-first; re-run body only when asserts are absent
       // or one failed (indicating the migration was only partially applied).
       let reconciled = 0;
       for (const f of p.reconcile) {
@@ -102,7 +108,7 @@ export class MigrationRunner {
         reconciled++;
       }
 
-      // Step 8: Pending — claim(success=0) → execute body → markSuccess(success=1).
+      // Step 7: Pending — claim(success=0) → execute body → markSuccess(success=1).
       // A throw in executeStatements leaves the row at success=0 for later reconcile.
       let applied = 0;
       for (const f of p.pending) {

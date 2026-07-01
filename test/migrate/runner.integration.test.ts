@@ -15,15 +15,19 @@
  *     flip the row to success=1.
  *  3b. Reconcile with asserts: flip an existing corpus migration to success=0, run,
  *      confirm it reconciles back to success=1.
- *  4. Helper refresh on nothing-pending → 0000_ procs exist after a run with 0 pending.
+ *  4. No per-run helper provisioning → run() does not apply 0000_ files; the corpus
+ *     migrations' `CALL zn_*` statements still succeed against helpers that were
+ *     pre-provisioned out-of-band (vault's routines bundle in production; the e2e
+ *     fixture DB for this test), proving the engine no longer needs to create them.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { writeFileSync, unlinkSync } from 'node:fs';
+import { writeFileSync, unlinkSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDb, type Db } from '../../src/migrate/db.js';
 import { MigrationRunner } from '../../src/migrate/migration-runner.js';
 import { canonicalChecksumFile } from '../../src/migrate/checksum.js';
+import { splitStatements } from '../../src/migrate/sql-splitter.js';
 
 const HAVE_DB = !!process.env.MYSQL_TEST_HOST;
 const cfg = {
@@ -202,29 +206,109 @@ describe.skipIf(!HAVE_DB)('MigrationRunner integration', () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────────
-  // 4. Helper refresh runs even on nothing-pending
-  //    After a run where pending=0, the 0000_ procs must exist in the DB.
+  // 4. run() no longer provisions the 0000_ helpers itself.
+  //
+  //    Helper procs are now provisioned out-of-band, before the migration phase,
+  //    by vault's routines bundle (see docs/superpowers/specs/2026-07-01-dynsec-
+  //    routines-provisioning-design.md) — owned by a persistent routines account,
+  //    NOT the ephemeral migrate user. The engine must not DROP+CREATE them itself.
+  //
+  //    We prove this two ways:
+  //      a) drop every zn_* proc first, run(), and confirm they are still absent
+  //         (the runner did not recreate them) while `applied`/`reconciled` stay 0
+  //         (nothing pending on the already-migrated DB).
+  //      b) re-create the helpers out-of-band (mirroring the vault routines-apply
+  //         step) and confirm a subsequent run() still succeeds — i.e. reconcile/
+  //         pending migrations that CALL zn_* keep working against pre-provisioned
+  //         helpers the engine itself never touched.
   // ──────────────────────────────────────────────────────────────────────────
-  it('0000_ helper procs exist after a run with 0 pending', async () => {
-    // Run (nothing pending on an already-migrated DB)
-    const db4 = await openDb(cfg);
-    try {
-      const runner4 = new MigrationRunner(db4, MIGRATIONS_DIR, 'test-runner-4');
-      const result = await runner4.run();
-      expect(result.applied).toBe(0);
-      expect(result.pending).toBeUndefined(); // not a field
-      expect(result.pendingRemaining).toBe(0);
-    } finally {
-      await db4.end();
-    }
+  it('run() does not (re-)create the 0000_ helper procs', async () => {
+    const helperFile = join(MIGRATIONS_DIR, '0000_migration-helpers.sql');
+    const helperSql = readFileSync(helperFile, 'utf8');
 
-    // Check that at least one zn_assert_* or zn_add_* proc was created by the helpers
-    const procs = (await db.query(
+    // Drop every zn_* proc so we can observe whether run() recreates any of them.
+    const before = (await db.query(
       "SHOW PROCEDURE STATUS WHERE Db = ? AND (Name LIKE 'zn_assert_%' OR Name LIKE 'zn_add_%')",
       [cfg.database],
     )) as { Name: string }[];
+    for (const p of before) {
+      await db.query(`DROP PROCEDURE IF EXISTS \`${p.Name}\``);
+    }
 
-    expect(procs.length).toBeGreaterThan(0);
+    try {
+      const db4 = await openDb(cfg);
+      try {
+        const runner4 = new MigrationRunner(db4, MIGRATIONS_DIR, 'test-runner-4');
+        const result = await runner4.run();
+        expect(result.applied).toBe(0);
+        expect(result.reconciled).toBe(0);
+        expect(result.pending).toBeUndefined(); // not a field
+        expect(result.pendingRemaining).toBe(0);
+      } finally {
+        await db4.end();
+      }
+
+      // The engine must NOT have recreated any zn_* proc.
+      const procsAfterRun = (await db.query(
+        "SHOW PROCEDURE STATUS WHERE Db = ? AND (Name LIKE 'zn_assert_%' OR Name LIKE 'zn_add_%')",
+        [cfg.database],
+      )) as { Name: string }[];
+      expect(procsAfterRun.length).toBe(0);
+    } finally {
+      // Restore the helpers out-of-band (as vault's routines-apply would), so later
+      // tests in this file (and other runs against this shared e2e DB) still see
+      // working `CALL zn_*` postconditions.
+      for (const stmt of splitStatements(helperSql)) {
+        await db.query(stmt);
+      }
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // 4b. Migrations that CALL zn_* still work once helpers are pre-provisioned
+  //     out-of-band — proving the engine's job is only to CALL them, never to
+  //     create them.
+  // ──────────────────────────────────────────────────────────────────────────
+  it('a migration body calling zn_* succeeds against pre-provisioned helpers', async () => {
+    const migrationVersion = '2099-01-02_001_calls-zn-helper-probe.sql';
+    const migrationPath = join(MIGRATIONS_DIR, migrationVersion);
+
+    // A minimal body that CALLs a real pre-provisioned helper (zn_assert_table is
+    // part of the 0000_ bundle) as its trailing postcondition.
+    writeFileSync(
+      migrationPath,
+      [
+        'CREATE TABLE IF NOT EXISTS _call_helper_probe (id INT PRIMARY KEY) ENGINE=InnoDB;',
+        "CALL zn_assert_table('_call_helper_probe');",
+      ].join('\n'),
+    );
+
+    try {
+      await db.query('DELETE FROM schema_migrations WHERE version = ?', [migrationVersion]);
+      await db.query('DROP TABLE IF EXISTS _call_helper_probe');
+
+      const dbTemp = await openDb(cfg);
+      try {
+        const runnerTemp = new MigrationRunner(dbTemp, MIGRATIONS_DIR, 'test-calls-helper');
+        const result = await runnerTemp.run();
+
+        // Pending: the new file has no row yet.
+        expect(result.applied).toBe(1);
+        expect(result.reconciled).toBe(0);
+      } finally {
+        await dbTemp.end();
+      }
+
+      const rows = (await db.query(
+        'SELECT success FROM schema_migrations WHERE version = ?',
+        [migrationVersion],
+      )) as { success: unknown }[];
+      expect(Number(rows[0]?.success)).toBe(1);
+    } finally {
+      try { unlinkSync(migrationPath); } catch { /* best-effort */ }
+      await db.query('DELETE FROM schema_migrations WHERE version = ?', [migrationVersion]);
+      await db.query('DROP TABLE IF EXISTS _call_helper_probe');
+    }
   });
 
   // ──────────────────────────────────────────────────────────────────────────
