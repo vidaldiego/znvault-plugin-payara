@@ -219,6 +219,7 @@ export function registerDeployRunCommand(
     .option('--only <host>', 'Alias for --host', collectHosts, [])
     .option('--class <name>', 'Deploy only this node class from a multi-class config (repeatable)', collectHosts, [])
     .option('-y, --yes', 'Skip confirmation prompts')
+    .option('--migrations-only', 'Run only the schema-migration phase, then stop (skip the WAR rollout)')
     .action(async (configName: string, options: {
       force?: boolean;
       dryRun?: boolean;
@@ -232,6 +233,7 @@ export function registerDeployRunCommand(
       only: string[];
       class: string[];
       yes?: boolean;
+      migrationsOnly?: boolean;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
       const isPlain = ctx.isPlainMode();
@@ -259,6 +261,11 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
+        if (options.migrationsOnly && !config.migration) {
+          ctx.output.error(`--migrations-only requires a migration config; none set on '${configName}'. Use 'znvault deploy config set-migration ${configName} ...' first.`);
+          process.exit(1);
+        }
+
         // ── Multi-class branch (Spec §3, §4) ──
         if (detectConfigShape(config) === 'multi-class') {
           // 1. Validate (zero network I/O) — hard violation aborts before any host.
@@ -277,6 +284,10 @@ export function registerDeployRunCommand(
           // 3. Run the migration phase (if configured) BEFORE any class rolls out,
           //    so a migration failure aborts the deploy before any host is touched.
           await runMigrationPhase(config, configName, ctx);
+          if (options.migrationsOnly) {
+            ctx.output.success('[deploy] --migrations-only: migrations complete, skipping rollout.');
+            return;
+          }
           // 4. Run the multi-class deploy (helper below) and exit.
           await runMultiClassDeploy(ctx, config, options, { openTunnels, isPlain });
           return; // handled — do not fall through to the flat path
@@ -630,6 +641,10 @@ export function registerDeployRunCommand(
         // TODO(T9): validate migration config fields in deploy-config-validate.ts.
         // ═══════════════════════════════════════════════════════════════════
         await runMigrationPhase(config, configName, ctx);
+        if (options.migrationsOnly) {
+          ctx.output.success('[deploy] --migrations-only: migrations complete, skipping rollout.');
+          return;
+        }
 
         // Execute deployment using Listr2
         const deployResult = await executeListrDeployment(strategy, deployableHosts, {
