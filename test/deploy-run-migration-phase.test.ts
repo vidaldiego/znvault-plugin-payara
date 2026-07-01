@@ -94,6 +94,35 @@ describe('runMigrationPhase', () => {
     expect(ctx.output.info).not.toHaveBeenCalled();
   });
 
+  it('does NOT run migrations under dryRun — prints the plan and skips execution', async () => {
+    // Regression: --dry-run must not actually mint a lease / apply the bundle / run
+    // migrations. Previously runMigrationPhase ignored dryRun and executed the full
+    // migration phase against the real DB even for a dry run.
+    const config: DeployConfig = {
+      name: 'staging',
+      hosts: ['10.0.0.1'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: 'znapi-helpers', version: 1 },
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await runMigrationPhase(config, 'staging', ctx, deps, { dryRun: true });
+
+    // Nothing executed: no lease minted, no runner invoked.
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+    // A dry-run plan line was printed (mentions the routines bundle + that it's a dry run).
+    const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
+    expect(infoCalls.some((m) => /dry.?run/i.test(m))).toBe(true);
+    expect(infoCalls.some((m) => m.includes('znapi-helpers') && m.includes('1'))).toBe(true);
+    // The "Migrations complete" line (which only fires after a real run) must NOT appear.
+    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+  });
+
   it('calls runMigrations with the correct roleId and migrationsDir when config.migration is present', async () => {
     const config: DeployConfig = {
       name: 'production',

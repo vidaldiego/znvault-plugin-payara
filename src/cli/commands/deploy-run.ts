@@ -184,8 +184,28 @@ export async function runMigrationPhase(
   configName: string,
   ctx: CLIPluginContext,
   deps = migrationDefaultDeps(ctx.client),
+  opts: { dryRun?: boolean } = {},
 ): Promise<void> {
   if (!config.migration) return;
+
+  // --dry-run must NOT execute the migration phase. The migration phase has real
+  // side effects — it applies the routine bundle, mints a dynamic-secrets lease,
+  // and runs migrations against the live DB — so under a dry run we only print the
+  // plan and return. (Previously this ran for real even under --dry-run.)
+  if (opts.dryRun) {
+    const m = config.migration;
+    ctx.output.info(
+      `[deploy] [dry-run] would run schema migrations before rollout ` +
+        `(role '${m.roleId}', dir '${m.migrationsDir}')`,
+    );
+    if (m.routines) {
+      ctx.output.info(
+        `[deploy] [dry-run] would apply routine bundle ${m.routines.bundle} v${m.routines.version} before migrations`,
+      );
+    }
+    return;
+  }
+
   ctx.output.info('[deploy] Running schema migrations before rollout...');
   await runMigrations(ctx, {
     env: configName,
@@ -284,9 +304,14 @@ export function registerDeployRunCommand(
           if (flagCheck.error) { ctx.output.error(flagCheck.error); process.exit(1); }
           // 3. Run the migration phase (if configured) BEFORE any class rolls out,
           //    so a migration failure aborts the deploy before any host is touched.
-          await runMigrationPhase(config, configName, ctx);
+          //    --dry-run prints the plan without executing (no lease, no bundle apply).
+          await runMigrationPhase(config, configName, ctx, undefined, { dryRun: options.dryRun });
           if (options.migrationsOnly) {
-            ctx.output.success('[deploy] --migrations-only: migrations complete, skipping rollout.');
+            ctx.output.success(
+              options.dryRun
+                ? '[deploy] --dry-run --migrations-only: nothing executed.'
+                : '[deploy] --migrations-only: migrations complete, skipping rollout.',
+            );
             return;
           }
           // 4. Run the multi-class deploy (helper below) and exit.
@@ -641,9 +666,13 @@ export function registerDeployRunCommand(
         // so existing deploy configs without migration settings are unaffected.
         // TODO(T9): validate migration config fields in deploy-config-validate.ts.
         // ═══════════════════════════════════════════════════════════════════
-        await runMigrationPhase(config, configName, ctx);
+        await runMigrationPhase(config, configName, ctx, undefined, { dryRun: options.dryRun });
         if (options.migrationsOnly) {
-          ctx.output.success('[deploy] --migrations-only: migrations complete, skipping rollout.');
+          ctx.output.success(
+            options.dryRun
+              ? '[deploy] --dry-run --migrations-only: nothing executed.'
+              : '[deploy] --migrations-only: migrations complete, skipping rollout.',
+          );
           return;
         }
 
