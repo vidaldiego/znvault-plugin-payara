@@ -9,16 +9,23 @@ vi.mock('../src/run-migrations.js', async () => {
   const actual = await vi.importActual<typeof import('../src/run-migrations.js')>('../src/run-migrations.js');
   return { ...actual, runMigrations: vi.fn().mockResolvedValue(undefined) };
 });
-// Preflight must return all hosts reachable + analyzed with changes.
+// Preflight must return all hosts reachable + analyzed with changes by
+// default. `reachableOverride` lets an individual test narrow which of the
+// requested hosts come back as reachable/analyzed (e.g. to simulate a
+// dropped/unreachable host without touching the other tests).
+let reachableOverride: string[] | undefined;
 vi.mock('../src/cli/listr-preflight.js', async () => {
   const actual = await vi.importActual<typeof import('../src/cli/listr-preflight.js')>('../src/cli/listr-preflight.js');
   return {
     ...actual,
-    executePreflightChecks: vi.fn(async (o: any) => ({
-      reachableHosts: o.hosts,
-      analysisMap: new Map(o.hosts.map((h: string) => [h, { success: true, filesChanged: 1, filesDeleted: 0, bytesToUpload: 10, isFullUpload: false }])),
-      updateTargets: [],
-    })),
+    executePreflightChecks: vi.fn(async (o: any) => {
+      const hosts = reachableOverride ?? o.hosts;
+      return {
+        reachableHosts: hosts,
+        analysisMap: new Map(hosts.map((h: string) => [h, { success: true, filesChanged: 1, filesDeleted: 0, bytesToUpload: 10, isFullUpload: false }])),
+        updateTargets: [],
+      };
+    }),
     printPreflightSummary: vi.fn(),
   };
 });
@@ -72,7 +79,10 @@ async function runDeploy(ctx: CLIPluginContext, argv: string[]) {
 }
 
 describe('flat post-deploy gate', () => {
-  beforeEach(() => { Object.assign(deployResult, { failed: 0, aborted: false, healthCheckFailed: 0, workerFailed: 0 }); });
+  beforeEach(() => {
+    Object.assign(deployResult, { failed: 0, aborted: false, healthCheckFailed: 0, workerFailed: 0 });
+    reachableOverride = undefined;
+  });
 
   it('post runs after a full clean rollout', async () => {
     const { ctx, infos } = makeCtx();
@@ -91,5 +101,17 @@ describe('flat post-deploy gate', () => {
     const { ctx, infos } = makeCtx();
     await runDeploy(ctx, ['deploy', 'run', 'stg', '--host', 'h1', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /scoped to a subset/i.test(m))).toBe(true);
+  });
+
+  it('dropped/unreachable host → post skipped (partial-coverage)', async () => {
+    // Config has 2 hosts (h1, h2), but only h1 comes back reachable/analyzed
+    // from preflight — simulating a host that was dropped/unreachable
+    // pre-rollout. No --host flag is passed, so flatIsScoped is false: this
+    // must be caught by the coverage check, not the scope check.
+    reachableOverride = ['h1'];
+    const { ctx, infos } = makeCtx();
+    await runDeploy(ctx, ['deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /not deployed/i.test(m) && /h2/.test(m))).toBe(true);
+    expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(false);
   });
 });
