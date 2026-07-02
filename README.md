@@ -209,6 +209,11 @@ znvault deploy to staging --dry-run
 # Sequential deployment (one host at a time)
 znvault deploy to staging --sequential
 
+# Skip the schema-migration phase (deploy the WAR without running migrations).
+# Only relevant when the config has a migration block; otherwise a no-op.
+# Mutually exclusive with --migrations-only.
+znvault deploy to staging --skip-migrations
+
 # Manage configs
 znvault deploy config list
 znvault deploy config show staging

@@ -275,6 +275,88 @@ describe('runMigrationPhase', () => {
   });
 });
 
+// ─── --skip-migrations ──────────────────────────────────────────────────────
+//
+// `--skip-migrations` is the inverse of `--migrations-only`: it deploys the WAR
+// WITHOUT running the schema-migration phase, even when config.migration is set.
+// The skip is implemented in runMigrationPhase via opts.skipMigrations so both the
+// flat and multi-class call-sites share one behaviour. When the flag is set and a
+// migration config exists, runMigrationPhase prints a skip line and returns before
+// minting a lease / applying the bundle / running any SQL.
+//
+
+describe('runMigrationPhase — --skip-migrations', () => {
+  it('does NOT run migrations when skipMigrations is set (config.migration present)', async () => {
+    const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0 });
+    const config: DeployConfig = {
+      name: 'production',
+      hosts: ['10.0.0.1'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: 'znapi-helpers', version: 1 },
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps({ run });
+
+    await runMigrationPhase(config, 'production', ctx, deps, { skipMigrations: true });
+
+    // Nothing executed: no lease minted, no runner invoked, no bundle applied.
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+    expect(run).not.toHaveBeenCalled();
+
+    // A visible skip line was printed (so the operator knows migrations were bypassed).
+    const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
+    expect(infoCalls.some((m) => /skip/i.test(m) && /migration/i.test(m))).toBe(true);
+
+    // The real-run lines must NOT appear.
+    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] Running schema migrations before rollout...');
+    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+  });
+
+  it('is a silent no-op when skipMigrations is set but config.migration is absent', async () => {
+    const config: DeployConfig = {
+      name: 'no-migration',
+      hosts: ['10.0.0.1'],
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await runMigrationPhase(config, 'no-migration', ctx, deps, { skipMigrations: true });
+
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+    // Nothing to skip, so no skip line is printed either.
+    expect(ctx.output.info).not.toHaveBeenCalled();
+  });
+
+  it('skipMigrations takes precedence over dryRun (skip line, not dry-run plan)', async () => {
+    // If both are somehow set, skip wins — no plan is printed, nothing runs.
+    const config: DeployConfig = {
+      name: 'staging',
+      hosts: ['10.0.0.1'],
+      migration: {
+        roleId: 'zincdb-rw',
+        migrationsDir: 'docs/migrations',
+        routines: { bundle: 'znapi-helpers', version: 1 },
+      },
+    } as unknown as DeployConfig;
+
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+
+    await runMigrationPhase(config, 'staging', ctx, deps, { skipMigrations: true, dryRun: true });
+
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+    const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
+    expect(infoCalls.some((m) => /skip/i.test(m) && /migration/i.test(m))).toBe(true);
+    // The dry-run plan line must NOT appear (skip short-circuited before it).
+    expect(infoCalls.some((m) => /would run schema migrations/i.test(m))).toBe(false);
+  });
+});
+
 // ─── Multi-class config shape ─────────────────────────────────────────────────
 //
 // These tests prove that runMigrationPhase is shape-agnostic: it inspects only

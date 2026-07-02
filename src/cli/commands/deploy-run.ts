@@ -184,9 +184,18 @@ export async function runMigrationPhase(
   configName: string,
   ctx: CLIPluginContext,
   deps = migrationDefaultDeps(ctx.client),
-  opts: { dryRun?: boolean } = {},
+  opts: { dryRun?: boolean; skipMigrations?: boolean } = {},
 ): Promise<void> {
   if (!config.migration) return;
+
+  // --skip-migrations deploys the WAR WITHOUT running the migration phase, even
+  // when the config declares one. It takes precedence over --dry-run: nothing is
+  // executed and no plan is printed — we just note that migrations were bypassed
+  // (only reachable here when config.migration exists, so the operator sees it).
+  if (opts.skipMigrations) {
+    ctx.output.info('[deploy] Skipping schema migrations (--skip-migrations).');
+    return;
+  }
 
   // --dry-run must NOT execute the migration phase. The migration phase has real
   // side effects — it applies the routine bundle, mints a dynamic-secrets lease,
@@ -241,6 +250,7 @@ export function registerDeployRunCommand(
     .option('--class <name>', 'Deploy only this node class from a multi-class config (repeatable)', collectHosts, [])
     .option('-y, --yes', 'Skip confirmation prompts')
     .option('--migrations-only', 'Run only the schema-migration phase, then stop (skip the WAR rollout)')
+    .option('--skip-migrations', 'Deploy the WAR without running the schema-migration phase')
     .action(async (configName: string, options: {
       force?: boolean;
       dryRun?: boolean;
@@ -255,6 +265,7 @@ export function registerDeployRunCommand(
       class: string[];
       yes?: boolean;
       migrationsOnly?: boolean;
+      skipMigrations?: boolean;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
       const isPlain = ctx.isPlainMode();
@@ -282,6 +293,13 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
+        // --migrations-only ("only migrate") and --skip-migrations ("never
+        // migrate") are contradictory. Reject before any host is touched.
+        if (options.migrationsOnly && options.skipMigrations) {
+          ctx.output.error('--migrations-only and --skip-migrations are mutually exclusive.');
+          process.exit(1);
+        }
+
         if (options.migrationsOnly && !config.migration) {
           ctx.output.error(`--migrations-only requires a migration config; none set on '${configName}'. Use 'znvault deploy config set-migration ${configName} ...' first.`);
           process.exit(1);
@@ -304,8 +322,12 @@ export function registerDeployRunCommand(
           if (flagCheck.error) { ctx.output.error(flagCheck.error); process.exit(1); }
           // 3. Run the migration phase (if configured) BEFORE any class rolls out,
           //    so a migration failure aborts the deploy before any host is touched.
-          //    --dry-run prints the plan without executing (no lease, no bundle apply).
-          await runMigrationPhase(config, configName, ctx, undefined, { dryRun: options.dryRun });
+          //    --dry-run prints the plan without executing (no lease, no bundle apply);
+          //    --skip-migrations bypasses the phase entirely.
+          await runMigrationPhase(config, configName, ctx, undefined, {
+            dryRun: options.dryRun,
+            skipMigrations: options.skipMigrations,
+          });
           if (options.migrationsOnly) {
             ctx.output.success(
               options.dryRun
@@ -666,7 +688,10 @@ export function registerDeployRunCommand(
         // so existing deploy configs without migration settings are unaffected.
         // TODO(T9): validate migration config fields in deploy-config-validate.ts.
         // ═══════════════════════════════════════════════════════════════════
-        await runMigrationPhase(config, configName, ctx, undefined, { dryRun: options.dryRun });
+        await runMigrationPhase(config, configName, ctx, undefined, {
+          dryRun: options.dryRun,
+          skipMigrations: options.skipMigrations,
+        });
         if (options.migrationsOnly) {
           ctx.output.success(
             options.dryRun
