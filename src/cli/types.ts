@@ -333,7 +333,7 @@ export interface DeployConfig {
    * rollout begins, so a migration failure aborts the deploy before any host
    * is touched. When absent, the migration phase is skipped entirely.
    *
-   * Set via `znvault deploy config set-migration <name> --role <roleId> --dir <path>`;
+   * Set via `znvault payara config set-migration <name> --role <roleId> --dir <path>`;
    * clear via `--clear`. Validated by `validateDeployConfig` (errors on missing
    * roleId or migrationsDir). host/port/database come from the Vault
    * dynamic-secrets connection referenced by roleId via the lease, not from
@@ -348,7 +348,7 @@ export interface DeployConfig {
    * while old app instances are still live. Same shape as `migration`, but MUST
    * point at a DIFFERENT migrationsDir (the engine applies "all pending per dir").
    * Absent = no post-deploy phase. Set via
-   * `deploy config set-migration <name> --phase post ...`.
+   * `payara config set-migration <name> --phase post ...`.
    */
   postMigration?: MigrationConfig;
 }

@@ -200,10 +200,10 @@ znvault payara config create staging \
   --parallel
 
 # Deploy to all hosts in config (diff transfer)
-znvault payara deploy to staging
-
-# Or use 'run' alias
 znvault payara deploy run staging
+
+# Or use the 'to' alias
+znvault payara deploy to staging
 
 # Force full deployment
 znvault payara deploy to staging --force

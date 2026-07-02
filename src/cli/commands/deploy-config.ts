@@ -277,7 +277,7 @@ export function registerConfigCommands(
         }
 
         // ── Execution plan ─────────────────────────────────────────────────
-        // Describe, in order, what `znvault deploy run` would actually do with
+        // Describe, in order, what `znvault payara deploy run` would actually do with
         // this config: the migration phase first (if configured), then each node
         // class as an ordered phase with its strategy batches and blocking gate.
         // Reuses the same resolution the deploy path uses, so the plan is accurate.
