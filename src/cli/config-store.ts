@@ -1,18 +1,41 @@
 // Path: src/cli/config-store.ts
 // Deployment configuration storage
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import type { DeployConfig, DeployConfigStore } from './types.js';
-import { CONFIG_DIR, CONFIG_FILE } from './constants.js';
+import { PAYARA_CONFIG_DIR, CONFIG_FILE, LEGACY_CONFIG_FILE } from './constants.js';
 
 /**
- * Load deployment configs from file
+ * One-time, non-destructive migration from the pre-v2 shared config location
+ * (~/.znvault/deploy-configs.json) to the per-deployer file
+ * (~/.znvault/payara/configs.json). Runs only when the new file is absent and the
+ * legacy file exists. The legacy file is left intact as a backup. Never throws —
+ * a migration failure must not make an existing config unusable.
+ */
+async function migrateLegacyConfigIfNeeded(): Promise<void> {
+  if (existsSync(CONFIG_FILE) || !existsSync(LEGACY_CONFIG_FILE)) return;
+  try {
+    await mkdir(PAYARA_CONFIG_DIR, { recursive: true });
+    await copyFile(LEGACY_CONFIG_FILE, CONFIG_FILE);
+    // Notice to stderr, not stdout — keep machine-readable output clean.
+    console.error(`[payara] Migrated deploy configs to ${CONFIG_FILE} (legacy ${LEGACY_CONFIG_FILE} kept as backup).`);
+  } catch (err) {
+    console.error(`[payara] Warning: could not migrate legacy config (${(err as Error).message}); using legacy location.`);
+  }
+}
+
+/**
+ * Load deployment configs from file. Reads the new path; on first run migrates
+ * the legacy file into place. Falls back to the legacy file if migration failed.
  */
 export async function loadDeployConfigs(): Promise<DeployConfigStore> {
+  await migrateLegacyConfigIfNeeded();
+  // Prefer the new path; if migration failed and it's still absent, read legacy.
+  const source = existsSync(CONFIG_FILE) ? CONFIG_FILE : LEGACY_CONFIG_FILE;
   try {
-    if (existsSync(CONFIG_FILE)) {
-      const content = await readFile(CONFIG_FILE, 'utf-8');
+    if (existsSync(source)) {
+      const content = await readFile(source, 'utf-8');
       return JSON.parse(content);
     }
   } catch {
@@ -22,11 +45,11 @@ export async function loadDeployConfigs(): Promise<DeployConfigStore> {
 }
 
 /**
- * Save deployment configs to file
+ * Save deployment configs to the new per-deployer path.
  */
 export async function saveDeployConfigs(store: DeployConfigStore): Promise<void> {
-  if (!existsSync(CONFIG_DIR)) {
-    await mkdir(CONFIG_DIR, { recursive: true });
+  if (!existsSync(PAYARA_CONFIG_DIR)) {
+    await mkdir(PAYARA_CONFIG_DIR, { recursive: true });
   }
   await writeFile(CONFIG_FILE, JSON.stringify(store, null, 2));
 }
