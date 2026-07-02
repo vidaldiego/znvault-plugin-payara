@@ -86,7 +86,7 @@ python3 deploy_client.py \
 **After (znvault CLI):**
 ```bash
 # New znvault CLI
-znvault deploy war ./target/ZincAPI.war \
+znvault payara deploy war ./target/ZincAPI.war \
   --target https://staging-1.zincapp.dev:9100
 ```
 
@@ -106,12 +106,12 @@ zn-vault-agent start --health-port 9100
 Test the new deployment:
 ```bash
 # Test with new CLI
-znvault deploy war ./target/ZincAPI.war \
+znvault payara deploy war ./target/ZincAPI.war \
   --target https://staging-1.zincapp.dev:9100 \
   --dry-run
 
 # If looks good, deploy for real
-znvault deploy war ./target/ZincAPI.war \
+znvault payara deploy war ./target/ZincAPI.war \
   --target https://staging-1.zincapp.dev:9100
 ```
 
@@ -248,7 +248,7 @@ deploy:
   script:
     - npm install -g @zincapp/znvault-cli
     - npm install -g @zincapp/znvault-plugin-payara
-    - znvault deploy war target/app.war \
+    - znvault payara deploy war target/app.war \
         --target https://$DEPLOY_HOST:9100
 ```
 

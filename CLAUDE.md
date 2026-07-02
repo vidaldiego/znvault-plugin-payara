@@ -32,7 +32,7 @@ src/
 ├── payara-manager.ts     # Payara process management (asadmin wrapper)
 ├── war-deployer.ts       # WAR diff deployment, hash calculation
 ├── routes.ts             # HTTP API endpoints (/plugins/payara/*)
-├── cli.ts                # CLI commands (znvault deploy)
+├── cli.ts                # CLI commands (znvault payara)
 ├── deployment-lock.ts    # File-based lock for SIGTERM deferral
 ├── deployment-journal.ts # Crash recovery checkpointing
 └── types.ts              # TypeScript interfaces
@@ -66,8 +66,8 @@ src/
 - `GET /status`, `POST /restart`, `POST /start`, `POST /stop`
 
 **CLI Plugin** (`cli.ts`):
-- Multi-host deployment configs (`znvault deploy config create`)
-- WAR deployment with visual progress (`znvault deploy to <config>`)
+- Multi-host deployment configs (`znvault payara config create`)
+- WAR deployment with visual progress (`znvault payara deploy to <config>`)
 - Chunked file transfer for large deployments
 
 ### Plugin Integration Points
@@ -77,7 +77,7 @@ The plugin implements `@zincapp/zn-vault-agent/plugins` interface:
 - `PluginContext` provides vault client, logger, config
 - Events: `CertificateDeployedEvent`, `KeyRotatedEvent`, `SecretChangedEvent`
 
-### Deploy node classes (`deploy run`)
+### Deploy node classes (`payara deploy run`)
 
 A deploy config is **flat** (top-level `hosts`) or **multi-class** (an ordered
 `classes` array) — never both. `classes` absent ⇒ flat path runs byte-identically
@@ -87,7 +87,7 @@ to v1.21.1. Two layers:
    **serving** nodes (in `haproxy.serverMap`); **worker** nodes (not in
    `serverMap`) deploy in a separate final batch — parallel, no drain,
    **non-blocking**. `partitionHostsByClass` (`listr-deploy.ts`) is the split.
-2. **Multi-class (v1.22.0):** an explicit `classes[]` so `deploy run <env>`
+2. **Multi-class (v1.22.0):** an explicit `classes[]` so `payara deploy run <env>`
    deploys every node class (api, worker, future) as **ordered phases**, each
    self-describing (own `strategy`, `blocking`, `haproxy` drain, `quiesce`, and
    overridable shared defaults incl. a per-class WAR). Classes deploy in array
@@ -112,13 +112,13 @@ only** (never inherit; top-level on a multi-class config is a validation error).
 
 **CLI:** `--class <name>` (repeatable, config order), `--dry-run` (per-class
 plan), class-scoped `--strategy`/`--host` (need exactly one `--class`),
-`deploy config validate <cfg>`. v1 authors `classes` by hand-editing
-`~/.znvault/deploy-configs.json` (no CLI authoring command yet).
+`payara config validate <cfg>`. v1 authors `classes` by hand-editing
+`~/.znvault/payara/configs.json` (no CLI authoring command yet).
 
 Guide: README → "Multi-class configs". Design:
 `../docs/superpowers/specs/2026-06-23-multi-class-deploy-design.md`.
 
-### Migration phases (`deploy run`, v1.28.0)
+### Migration phases (`payara deploy run`, v1.28.0)
 
 A deploy config may carry **two** schema-migration blocks: `migration` (pre-deploy,
 runs BEFORE any host) and `postMigration` (post-deploy, runs ONLY after a fully
@@ -156,8 +156,8 @@ an early no-rollout branch (need no WAR/preflight).
 wiring in `commands/deploy-run.ts`, `ClassOutcome.coverageOk` in
 `multi-class-deploy.ts`.
 
-**CLI:** `deploy config set-migration <cfg> --phase pre|post --role <r> --dir <d>`
-(`--clear` is phase-scoped); the six `deploy run` flags above; `deploy config show`
+**CLI:** `payara config set-migration <cfg> --phase pre|post --role <r> --dir <d>`
+(`--clear` is phase-scoped); the six `payara deploy run` flags above; `payara config show`
 renders both phases + the execution plan. Guide: README → migration flags. Design:
 `../docs/superpowers/specs/2026-07-02-post-deploy-migration-phase-design.md`; runbook:
 `../docs/superpowers/runbooks/2026-07-02-post-deploy-migration-phase-rollout.md`.

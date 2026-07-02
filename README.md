@@ -179,7 +179,12 @@ curl http://localhost:9100/plugins/payara/file/WEB-INF/web.xml
 
 ## CLI Commands
 
-The plugin adds commands to `znvault`:
+The plugin adds a `payara` command group to `znvault`, organized by concern:
+
+- `znvault payara deploy run/to/war` — deploy WAR files (multi-host config or single-host)
+- `znvault payara config …` — manage deployment configurations (peer of `deploy`)
+- `znvault payara restart/status/applications` — lifecycle & status (peers of `deploy`)
+- `znvault payara tls …` — TLS management (peer of `deploy`)
 
 ### Multi-Host Deployment Configs
 
@@ -187,7 +192,7 @@ Create and manage deployment configurations for multiple hosts:
 
 ```bash
 # Create a new deployment config
-znvault deploy config create staging \
+znvault payara config create staging \
   --war /path/to/app.war \
   --host 172.16.220.55 \
   --host 172.16.220.56 \
@@ -195,38 +200,38 @@ znvault deploy config create staging \
   --parallel
 
 # Deploy to all hosts in config (diff transfer)
-znvault deploy to staging
+znvault payara deploy to staging
 
 # Or use 'run' alias
-znvault deploy run staging
+znvault payara deploy run staging
 
 # Force full deployment
-znvault deploy to staging --force
+znvault payara deploy to staging --force
 
 # Dry run
-znvault deploy to staging --dry-run
+znvault payara deploy to staging --dry-run
 
 # Sequential deployment (one host at a time)
-znvault deploy to staging --sequential
+znvault payara deploy to staging --sequential
 
 # Skip ALL schema migrations (deploy the WAR without running any migrations).
 # No-op unless the config has a migration/postMigration block.
-znvault deploy to staging --skip-migrations
+znvault payara deploy to staging --skip-migrations
 
 # Post-deploy migrations: run destructive schema changes AFTER a successful
 # rollout (see the "Migration phases" section below for the full rules).
-znvault deploy config set-migration staging --phase post --role zincdb-rw --dir docs/migrations/post
-znvault deploy to staging --skip-post
+znvault payara config set-migration staging --phase post --role zincdb-rw --dir docs/migrations/post
+znvault payara deploy to staging --skip-post
 
 # Manage configs
-znvault deploy config list
-znvault deploy config show staging
-znvault deploy config add-host staging 172.16.220.58
-znvault deploy config set staging war /new/path.war
-znvault deploy config delete staging
+znvault payara config list
+znvault payara config show staging
+znvault payara config add-host staging 172.16.220.58
+znvault payara config set staging war /new/path.war
+znvault payara config delete staging
 ```
 
-### Migration phases (`deploy run`)
+### Migration phases (`payara deploy run`)
 
 A deploy config may carry **two** schema-migration blocks:
 
@@ -243,7 +248,7 @@ hosts/classes → **post migrations**.
 > ⚠️ **Pre and post MUST use different `migrationsDir` folders.** The migration
 > engine applies *all pending files* in a directory and records what it applied,
 > so pointing both phases at the same folder makes the post phase a **silent
-> no-op** (the pre phase already applied everything). `znvault deploy config
+> no-op** (the pre phase already applied everything). `znvault payara config
 > validate <cfg>` warns when the two dirs match.
 
 **Post-deploy migrations are skipped (with a logged reason) when it is unsafe to
@@ -261,7 +266,7 @@ run destructive SQL** — i.e. when any host might still be on the old WAR:
 > WAR. `--post-only` is the sanctioned way to run the post phase later, once every
 > host is current.
 
-**Migration flags on `deploy run`** (resolved together; contradictory combos error
+**Migration flags on `payara deploy run`** (resolved together; contradictory combos error
 out before any host is touched):
 
 | Flag | Pre | Post | Rollout |
@@ -274,7 +279,7 @@ out before any host is touched):
 | `--pre-only` | ✅ | ❌ | ❌ (stop) |
 | `--post-only` | ❌ | ✅ | ❌ (recovery) |
 
-`deploy config show <cfg>` renders both phases and the ordered execution plan.
+`payara config show <cfg>` renders both phases and the ordered execution plan.
 When both phases use the same role + database, the shared settings are shown once
 under a common `Migration:` header, with each phase nested beneath it:
 
@@ -289,7 +294,7 @@ under a common `Migration:` header, with each phase nested beneath it:
       Dir:    docs/migrations/post
       Bundle: znapi-helpers v1 (applied before migrations)
 
-  Execution plan (what 'deploy run staging' does, in order):
+  Execution plan (what 'payara deploy run staging' does, in order):
     1. Apply routine bundle znapi-helpers v1 (pre-deploy, before any host is touched; …)
     2. Run pre-deploy schema migrations (role zincdb-rw; aborts the deploy on failure)
     3. Roll out hosts (…)
@@ -412,9 +417,9 @@ This guarantees the canary "1" in a `1+R` (or any first batch) is **always a ser
 
 > **Why this exists:** before this rule, the deployer filled strategy batches in plain config order with no notion of node class. A scheduler worker placed first in a `1+R` config became the canary; its "green" was worthless (it serves no traffic), and the serving nodes then rolled unsafely — a production outage (2026-06-23). Partitioning by `serverMap` membership makes that configuration impossible.
 
-When a config **mixes** serving and worker hosts, the deploy prints a one-line warning that the strategy applies to serving nodes only and workers deploy last. To see the resolved plan without deploying, run `znvault deploy run <config> --dry-run` — it lists the serving batch (under the strategy) and the final worker batch separately.
+When a config **mixes** serving and worker hosts, the deploy prints a one-line warning that the strategy applies to serving nodes only and workers deploy last. To see the resolved plan without deploying, run `znvault payara deploy run <config> --dry-run` — it lists the serving batch (under the strategy) and the final worker batch separately.
 
-If you would rather deploy a worker on its own schedule, give it a **separate deploy config** (or use `deploy war --target`) instead of mixing it into a serving config.
+If you would rather deploy a worker on its own schedule, give it a **separate deploy config** (or use `payara deploy war --target`) instead of mixing it into a serving config.
 
 > **Guard — single class:** with no `haproxy` block (or an empty `serverMap`) there is no serving/worker distinction; **all** hosts are treated as one class and the strategy runs over them unchanged. A worker-only config (a `serverMap` that matches none of the listed hosts) simply deploys every host as a non-blocking worker batch — it does not error, because there is no serving node to protect.
 
@@ -471,7 +476,7 @@ A config is either **flat** (top-level `hosts`, no `classes`) or **multi-class**
 }
 ```
 
-`deploy run staging` deploys the `api` class first (`1+R`, drain) and, only if it succeeds, deploys the `worker` class (parallel, no drain, quiesce, non-blocking).
+`payara deploy run staging` deploys the `api` class first (`1+R`, drain) and, only if it succeeds, deploys the `worker` class (parallel, no drain, quiesce, non-blocking).
 
 ##### Per-class fields and shared defaults
 
@@ -506,27 +511,27 @@ Classes deploy in **array order** — the order you list them in `classes` is th
 
 When a blocking class fails, all downstream classes are skipped and recorded as `upstream-abort` in the summary. The process exits non-zero.
 
-##### CLI: `deploy run` with multi-class configs
+##### CLI: `payara deploy run` with multi-class configs
 
 ```bash
 # Deploy all classes in config order
-znvault deploy run staging
+znvault payara deploy run staging
 
 # Deploy a single class (replaces the separate-config workaround)
-znvault deploy run staging --class worker
+znvault payara deploy run staging --class worker
 
 # Deploy a subset (config order preserved, gating applies)
-znvault deploy run staging --class api --class worker
+znvault payara deploy run staging --class api --class worker
 
 # Override the roll strategy for one class
-znvault deploy run staging --class api --strategy 1+2
+znvault payara deploy run staging --class api --strategy 1+2
 
 # Scope to a specific host within one class
-znvault deploy run staging --class api --host 172.16.220.55
+znvault payara deploy run staging --class api --host 172.16.220.55
 
 # Dry run — print the ordered plan without deploying
-znvault deploy run staging --dry-run
-znvault deploy run staging --class worker --dry-run
+znvault payara deploy run staging --dry-run
+znvault payara deploy run staging --class worker --dry-run
 ```
 
 `--dry-run` output example:
@@ -544,14 +549,14 @@ Deploying a subset that omits an upstream blocking class (e.g. `--class worker` 
 ##### Validating a multi-class config
 
 ```bash
-znvault deploy config validate staging
+znvault payara config validate staging
 ```
 
 Runs all structural checks — duplicate hosts, class names, `serverMap` integrity, resolvable `warPath`/`port` — and exits non-zero on any hard violation. Run this after hand-editing a config before deploying. It makes zero network calls.
 
 ##### Authoring multi-class configs
 
-Multi-class configs are authored by **editing `~/.znvault/deploy-configs.json` directly**. There is no CLI command to create or modify a `classes` block in v1 — use `deploy config validate <name>` as the safety net after each edit. The worked example above is the canonical starting point for a two-class api + worker environment.
+Multi-class configs are authored by **editing `~/.znvault/payara/configs.json` directly**. There is no CLI command to create or modify a `classes` block in v1 — use `payara config validate <name>` as the safety net after each edit. The worked example above is the canonical starting point for a two-class api + worker environment.
 
 #### How it works (per host)
 
@@ -657,29 +662,29 @@ The single untested integration seam is the **agent → znapi call over real loo
 
 ```bash
 # Deploy changed files only
-znvault deploy war ./target/MyApp.war --target server.example.com
+znvault payara deploy war ./target/MyApp.war --target server.example.com
 
 # Force full deployment
-znvault deploy war ./target/MyApp.war --target server.example.com --force
+znvault payara deploy war ./target/MyApp.war --target server.example.com --force
 
 # Dry run - show what would be deployed
-znvault deploy war ./target/MyApp.war --target server.example.com --dry-run
+znvault payara deploy war ./target/MyApp.war --target server.example.com --dry-run
 ```
 
 ### Server Management
 
 ```bash
 # Restart Payara
-znvault deploy restart --target server.example.com
-znvault deploy restart staging  # All hosts in config
+znvault payara restart --target server.example.com
+znvault payara restart staging  # All hosts in config
 
 # Check status
-znvault deploy status --target server.example.com
-znvault deploy status staging  # All hosts in config
+znvault payara status --target server.example.com
+znvault payara status staging  # All hosts in config
 
 # List applications
-znvault deploy applications --target server.example.com
-znvault deploy apps --target server.example.com
+znvault payara applications --target server.example.com
+znvault payara apps --target server.example.com
 ```
 
 ## CLI Installation
@@ -731,8 +736,8 @@ This reduces deployment time from minutes (full WAR transfer) to seconds (increm
 │        │        │                          │  └─────┬─────┘  │
 │  ┌─────▼─────┐  │                          │        │        │
 │  │ znvault   │  │   GET /hashes            │  ┌─────▼─────┐  │
-│  │ deploy    │◄─┼──────────────────────────┼──│ WAR File  │  │
-│  │ war       │  │                          │  └─────┬─────┘  │
+│  │ payara    │◄─┼──────────────────────────┼──│ WAR File  │  │
+│  │ deploy war│  │                          │  └─────┬─────┘  │
 │  └───────────┘  │   POST /deploy           │        │        │
 │                 │ ────────────────────────>│  ┌─────▼─────┐  │
 │                 │                          │  │ Payara    │  │
@@ -816,6 +821,16 @@ npm run lint
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v2.0.0
+- **BREAKING: CLI namespace `deploy` → `payara`.** All commands moved from
+  `znvault deploy …` to `znvault payara …`, grouped by concern:
+  `payara deploy run/to/war`, `payara config …`, `payara restart/status/applications`,
+  `payara tls …`. There is **no `deploy` alias** — update scripts accordingly.
+  Deploy configs moved to `~/.znvault/payara/configs.json`; an existing
+  `~/.znvault/deploy-configs.json` is **auto-migrated once** on first run
+  (non-destructive — the old file is kept as a backup). Prerequisite for
+  additional deployers and the upcoming `payara deploy validate` / `plan` commands.
 
 ### v1.28.0
 - **Post-deploy migration phase.** A deploy config may now carry a second migration block, `postMigration`, that runs **only after a fully successful, unscoped rollout** — for **destructive** schema changes (drop column/table, remove routines) that are unsafe while old-WAR instances are still serving. Full execution order: pre routines → **pre migrations** → deploy all hosts/classes → **post migrations**. The post-deploy gate is deliberately stricter than the deploy's exit code: it skips (with a logged reason — `scoped-subset`, `partial-coverage`, or `rollout-failed`) whenever any host might still be on the old WAR, **including a failed non-blocking worker** or a host dropped pre-rollout. Six flags control which phases run: `--skip-migrations` (skip both), `--skip-pre`, `--skip-post`, `--migrations-only` (run both phases, no rollout), `--pre-only`, `--post-only` (recovery); contradictory combos error before any host is touched. Author phases with `deploy config set-migration <cfg> --phase pre|post …`; `deploy config show` renders both phases + the execution plan. **Pre and post must use separate `migrationsDir` folders** (`deploy config validate` warns if they match). **Existing single-`migration` configs are unchanged** (full back-compat). See [Migration phases](#migration-phases-deploy-run).
