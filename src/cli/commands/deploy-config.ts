@@ -728,6 +728,7 @@ export function registerConfigCommands(
     .option('--routines-bundle <name>', 'Routine bundle name to apply before migrations (requires --routines-version)')
     .option('--routines-version <n>', 'Routine bundle version to apply before migrations (requires --routines-bundle)')
     .option('--clear', 'Remove the migration config from this deploy config')
+    .option('--phase <pre|post>', 'Which migration phase to set (pre = before rollout, post = after successful rollout)', 'pre')
     .action(async (name: string, options: {
       role?: string;
       dir?: string;
@@ -735,18 +736,29 @@ export function registerConfigCommands(
       routinesBundle?: string;
       routinesVersion?: string;
       clear?: boolean;
+      phase?: string;
     }) => {
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
 
+        const phase = (options.phase ?? 'pre').toLowerCase();
+        if (phase !== 'pre' && phase !== 'post') {
+          ctx.output.error(`--phase must be 'pre' or 'post' (got '${options.phase}')`);
+          process.exit(1);
+        }
+        const key: 'migration' | 'postMigration' = phase === 'post' ? 'postMigration' : 'migration';
+
         if (options.clear) {
-          if (!config.migration) {
-            ctx.output.info(`No migration config was set on '${name}'.`);
+          if (!config[key]) {
+            ctx.output.info(`No ${phase}-deploy migration config was set on '${name}'.`);
             return;
           }
-          delete config.migration;
+          delete config[key];
           await saveDeployConfigs(store);
-          ctx.output.success(`Cleared migration config for '${name}'`);
+          ctx.output.success(`Cleared ${phase}-deploy migration config for '${name}'`);
+          if (key === 'migration' && config.postMigration) {
+            ctx.output.info(`  Note: the post-deploy migration block is still set.`);
+          }
           return;
         }
 
@@ -777,10 +789,10 @@ export function registerConfigCommands(
             : {}),
         };
 
-        config.migration = migration;
+        config[key] = migration;
         await saveDeployConfigs(store);
 
-        ctx.output.success(`Set migration config for '${name}'`);
+        ctx.output.success(`Set ${phase}-deploy migration config for '${name}'`);
         ctx.output.info(`  Role:     ${migration.roleId}`);
         ctx.output.info(`  Dir:      ${migration.migrationsDir}`);
         if (migration.database) {
