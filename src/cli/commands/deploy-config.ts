@@ -245,9 +245,9 @@ export function registerConfigCommands(
         let step = 1;
         if (config.migration) {
           if (config.migration.routines) {
-            console.log(`    ${step++}. Apply routine bundle ${config.migration.routines.bundle} v${config.migration.routines.version} (before any host is touched; aborts the deploy on failure)`);
+            console.log(`    ${step++}. Apply routine bundle ${config.migration.routines.bundle} v${config.migration.routines.version} (pre-deploy, before any host is touched; aborts the deploy on failure)`);
           }
-          console.log(`    ${step++}. Run schema migrations (role ${config.migration.roleId}; aborts the deploy on failure)`);
+          console.log(`    ${step++}. Run pre-deploy schema migrations (role ${config.migration.roleId}; aborts the deploy on failure)`);
         }
 
         // Build the ordered list of phases: multi-class → each class; flat → one phase.
@@ -300,7 +300,7 @@ export function registerConfigCommands(
         if (config.postMigration) {
           const noRollout = phases.length === 0;
           if (config.postMigration.routines) {
-            console.log(`    ${step++}. Apply routine bundle ${config.postMigration.routines.bundle} v${config.postMigration.routines.version} (post-deploy, before post migrations)`);
+            console.log(`    ${step++}. Apply routine bundle ${config.postMigration.routines.bundle} v${config.postMigration.routines.version} (re-applied post-deploy before post-deploy migrations)`);
           }
           const annot = noRollout
             ? '(no rollout in this config — runs via --post-only/--migrations-only)'
