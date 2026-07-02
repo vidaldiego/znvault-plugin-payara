@@ -32,9 +32,15 @@ export const STATUS_POLL_MAX_WAIT_MS = 600000;   // Wait up to 10 minutes for co
 
 /**
  * Config file paths
+ *
+ * Payara deploy configs live under a per-deployer subdir (v2.0.0). The legacy
+ * ~/.znvault/deploy-configs.json is migrated on first load (see config-store.ts).
  */
 export const CONFIG_DIR = join(homedir(), '.znvault');
-export const CONFIG_FILE = join(CONFIG_DIR, 'deploy-configs.json');
+export const PAYARA_CONFIG_DIR = join(CONFIG_DIR, 'payara');
+export const CONFIG_FILE = join(PAYARA_CONFIG_DIR, 'configs.json');
+/** Pre-v2 shared location; source for the one-time auto-migration. */
+export const LEGACY_CONFIG_FILE = join(CONFIG_DIR, 'deploy-configs.json');
 
 /**
  * ANSI escape codes for colors and cursor control
