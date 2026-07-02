@@ -38,8 +38,8 @@ function makeCtx() {
 function makeProgram(ctx: ReturnType<typeof makeCtx>) {
   const program = new Command();
   program.exitOverride(); // throw instead of process.exit on commander errors
-  const deploy = program.command('deploy');
-  const configCmd = deploy.command('config');
+  const payara = program.command('payara');
+  const configCmd = payara.command('config');
   registerConfigCommands(configCmd, ctx);
   return program;
 }
@@ -63,7 +63,7 @@ describe('deploy config set-migration --routines-bundle / --routines-version', (
 
     await program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'staging',
+      'payara', 'config', 'set-migration', 'staging',
       '--role', 'zincdb-rw',
       '--dir', 'docs/migrations',
       '--routines-bundle', 'zn_helpers',
@@ -84,7 +84,7 @@ describe('deploy config set-migration --routines-bundle / --routines-version', (
 
     await program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'staging',
+      'payara', 'config', 'set-migration', 'staging',
       '--role', 'zincdb-rw',
       '--dir', 'docs/migrations',
     ]);
@@ -104,7 +104,7 @@ describe('deploy config set-migration --routines-bundle / --routines-version', (
 
     await expect(program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'staging',
+      'payara', 'config', 'set-migration', 'staging',
       '--role', 'zincdb-rw',
       '--dir', 'docs/migrations',
       '--routines-bundle', 'zn_helpers',
@@ -123,7 +123,7 @@ describe('deploy config set-migration --routines-bundle / --routines-version', (
 
     await expect(program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'staging',
+      'payara', 'config', 'set-migration', 'staging',
       '--role', 'zincdb-rw',
       '--dir', 'docs/migrations',
       '--routines-version', '2',

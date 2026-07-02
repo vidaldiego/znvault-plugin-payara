@@ -62,7 +62,7 @@ function makeCtx(): { ctx: CLIPluginContext; errors: string[] } {
 function buildProgram(ctx: CLIPluginContext): Command {
   const program = new Command();
   program.exitOverride(); // don't kill the test process on commander parse errors
-  const deploy = program.command('deploy');
+  const deploy = program.command('payara').command('deploy');
   registerDeployRunCommand(deploy, ctx);
   return program;
 }
@@ -105,7 +105,8 @@ describe('deploy run --skip-migrations (CLI wiring)', () => {
     const { ctx } = makeCtx();
     const program = buildProgram(ctx);
     const run = program.commands
-      .find((c) => c.name() === 'deploy')!
+      .find((c) => c.name() === 'payara')!
+      .commands.find((c) => c.name() === 'deploy')!
       .commands.find((c) => c.name() === 'run')!;
 
     const opt = run.options.find((o) => o.long === '--skip-migrations');
@@ -118,7 +119,7 @@ describe('deploy run --skip-migrations (CLI wiring)', () => {
     const program = buildProgram(ctx);
 
     const exitCode = await parseCapturingExit(program, [
-      'deploy', 'run', 'stg', '--migrations-only', '--skip-migrations',
+      'payara', 'deploy', 'run', 'stg', '--migrations-only', '--skip-migrations',
     ]);
 
     expect(exitCode).toBe(1);
@@ -133,7 +134,7 @@ describe('deploy run --skip-migrations (CLI wiring)', () => {
     const program = buildProgram(ctx);
 
     const exitCode = await parseCapturingExit(program, [
-      'deploy', 'run', 'does-not-exist', '--migrations-only', '--skip-migrations',
+      'payara', 'deploy', 'run', 'does-not-exist', '--migrations-only', '--skip-migrations',
     ]);
 
     expect(exitCode).toBe(1);

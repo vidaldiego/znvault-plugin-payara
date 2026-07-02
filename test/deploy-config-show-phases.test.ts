@@ -46,8 +46,8 @@ describe('config show — two phases', () => {
   const runShow = async (name: string): Promise<string> => {
     const ctx = { output: { info: (m: string) => lines.push(m), warn: vi.fn(), success: vi.fn(), error: vi.fn(), table: vi.fn(), keyValue: vi.fn() }, client: {}, getConfig: () => ({ url: 'x' }), isPlainMode: () => false } as unknown as CLIPluginContext;
     const program = new Command(); program.exitOverride();
-    registerConfigCommands(program.command('config'), ctx);
-    await program.parseAsync(['node', 'znvault', 'config', 'show', name]);
+    registerConfigCommands(program.command('payara').command('config'), ctx);
+    await program.parseAsync(['node', 'znvault', 'payara', 'config', 'show', name]);
     return lines.join('\n');
   };
 

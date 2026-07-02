@@ -37,7 +37,7 @@ function makeCtx() {
 }
 function build(ctx: CLIPluginContext) {
   const program = new Command(); program.exitOverride();
-  const deploy = program.command('deploy'); registerDeployRunCommand(deploy, ctx);
+  const deploy = program.command('payara').command('deploy'); registerDeployRunCommand(deploy, ctx);
   return program;
 }
 async function parseExit(program: Command, argv: string[]): Promise<number | null> {
@@ -57,7 +57,7 @@ describe('deploy run — six flags (CLI)', () => {
 
   it('registers all six flags on `deploy run`', () => {
     const { ctx } = makeCtx();
-    const run = build(ctx).commands.find((c) => c.name() === 'deploy')!.commands.find((c) => c.name() === 'run')!;
+    const run = build(ctx).commands.find((c) => c.name() === 'payara')!.commands.find((c) => c.name() === 'deploy')!.commands.find((c) => c.name() === 'run')!;
     for (const long of ['--skip-migrations', '--skip-pre', '--skip-post', '--migrations-only', '--pre-only', '--post-only']) {
       expect(run.options.find((o) => o.long === long), long).toBeDefined();
     }
@@ -65,7 +65,7 @@ describe('deploy run — six flags (CLI)', () => {
 
   it('--pre-only + --post-only → exit 1 (mutually exclusive)', async () => {
     const { ctx, errors } = makeCtx();
-    const code = await parseExit(build(ctx), ['deploy', 'run', 'stg', '--pre-only', '--post-only']);
+    const code = await parseExit(build(ctx), ['payara', 'deploy', 'run', 'stg', '--pre-only', '--post-only']);
     expect(code).toBe(1);
     expect(errors.some((m) => /mutually exclusive/i.test(m))).toBe(true);
   });
@@ -73,7 +73,7 @@ describe('deploy run — six flags (CLI)', () => {
   it('--post-only runs post inline and does NOT require a WAR/preflight', async () => {
     const { ctx, infos } = makeCtx();
     // No exit expected on the happy path — the action returns after post.
-    await build(ctx).parseAsync(['node', 'znvault', 'deploy', 'run', 'stg', '--post-only']);
+    await build(ctx).parseAsync(['node', 'znvault', 'payara', 'deploy', 'run', 'stg', '--post-only']);
     expect(infos.some((m) => /post-deploy/i.test(m) && /Running/i.test(m))).toBe(true);
     // Pre must NOT have run.
     expect(infos.some((m) => /pre-deploy/i.test(m) && /Running/i.test(m))).toBe(false);

@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { spawn, ChildProcess } from 'node:child_process';
 import { writeFile, readFile, mkdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import AdmZip from 'adm-zip';
 
@@ -14,7 +14,7 @@ const TEST_WAR_PATH = join(TEST_CONFIG_DIR, 'TestApp.war');
 
 // Simulated znvault config directory for tests
 const ZNVAULT_CONFIG_DIR = join(TEST_CONFIG_DIR, '.znvault');
-const DEPLOY_CONFIGS_PATH = join(ZNVAULT_CONFIG_DIR, 'deploy-configs.json');
+const DEPLOY_CONFIGS_PATH = join(ZNVAULT_CONFIG_DIR, 'payara', 'configs.json');
 
 // Mock agent server for testing HTTP endpoints (reserved for future use)
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -90,7 +90,7 @@ async function loadConfigs(): Promise<Record<string, unknown>> {
  * Save deploy configs to file
  */
 async function saveConfigs(configs: Record<string, unknown>): Promise<void> {
-  await mkdir(ZNVAULT_CONFIG_DIR, { recursive: true });
+  await mkdir(dirname(DEPLOY_CONFIGS_PATH), { recursive: true });
   await writeFile(DEPLOY_CONFIGS_PATH, JSON.stringify(configs, null, 2));
 }
 

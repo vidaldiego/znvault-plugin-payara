@@ -69,7 +69,7 @@ function makeCtx() {
 }
 async function runDeploy(ctx: CLIPluginContext, argv: string[]) {
   const program = new Command(); program.exitOverride();
-  registerDeployRunCommand(program.command('deploy'), ctx);
+  registerDeployRunCommand(program.command('payara').command('deploy'), ctx);
   const real = process.exit;
   // @ts-expect-error stub
   process.exit = () => { throw new Error('__exit__'); };
@@ -86,20 +86,20 @@ describe('flat post-deploy gate', () => {
 
   it('post runs after a full clean rollout', async () => {
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(true);
   });
 
   it('worker failure → post skipped (rollout-failed)', async () => {
     deployResult.workerFailed = 1;
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /did not fully succeed/i.test(m))).toBe(true);
   });
 
   it('--host subset → post skipped (scoped-subset)', async () => {
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['deploy', 'run', 'stg', '--host', 'h1', '--yes', '--skip-drain']);
+    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--host', 'h1', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /scoped to a subset/i.test(m))).toBe(true);
   });
 
@@ -110,7 +110,7 @@ describe('flat post-deploy gate', () => {
     // must be caught by the coverage check, not the scope check.
     reachableOverride = ['h1'];
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /not deployed/i.test(m) && /h2/.test(m))).toBe(true);
     expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(false);
   });

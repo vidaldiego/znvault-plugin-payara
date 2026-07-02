@@ -46,58 +46,61 @@ describe('createPayaraCLIPlugin', () => {
   });
 
   describe('registerCommands', () => {
-    it('should register deploy command group', () => {
+    it('should register payara deploy command group', () => {
       const program = new Command();
       const plugin = createPayaraCLIPlugin();
 
       plugin.registerCommands(program, mockContext as any);
 
-      const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
+      const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+      expect(payaraCmd).toBeDefined();
+      const deployCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'deploy');
       expect(deployCmd).toBeDefined();
       expect(deployCmd?.description()).toContain('WAR');
     });
 
-    it('should register deploy war subcommand', () => {
+    it('should register payara deploy war subcommand', () => {
       const program = new Command();
       const plugin = createPayaraCLIPlugin();
 
       plugin.registerCommands(program, mockContext as any);
 
-      const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
+      const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+      const deployCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'deploy');
       const warCmd = deployCmd?.commands.find(cmd => cmd.name() === 'war');
       expect(warCmd).toBeDefined();
     });
 
-    it('should register deploy restart subcommand', () => {
+    it('should register payara restart subcommand as a peer of deploy', () => {
       const program = new Command();
       const plugin = createPayaraCLIPlugin();
 
       plugin.registerCommands(program, mockContext as any);
 
-      const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
-      const restartCmd = deployCmd?.commands.find(cmd => cmd.name() === 'restart');
+      const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+      const restartCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'restart');
       expect(restartCmd).toBeDefined();
     });
 
-    it('should register deploy status subcommand', () => {
+    it('should register payara status subcommand as a peer of deploy', () => {
       const program = new Command();
       const plugin = createPayaraCLIPlugin();
 
       plugin.registerCommands(program, mockContext as any);
 
-      const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
-      const statusCmd = deployCmd?.commands.find(cmd => cmd.name() === 'status');
+      const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+      const statusCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'status');
       expect(statusCmd).toBeDefined();
     });
 
-    it('should register deploy applications subcommand', () => {
+    it('should register payara applications subcommand as a peer of deploy', () => {
       const program = new Command();
       const plugin = createPayaraCLIPlugin();
 
       plugin.registerCommands(program, mockContext as any);
 
-      const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
-      const appsCmd = deployCmd?.commands.find(cmd => cmd.name() === 'applications');
+      const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+      const appsCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'applications');
       expect(appsCmd).toBeDefined();
     });
 
@@ -107,8 +110,8 @@ describe('createPayaraCLIPlugin', () => {
 
       plugin.registerCommands(program, mockContext as any);
 
-      const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
-      const appsCmd = deployCmd?.commands.find(cmd => cmd.name() === 'applications');
+      const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+      const appsCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'applications');
       expect(appsCmd?.aliases()).toContain('apps');
     });
   });
@@ -120,7 +123,8 @@ describe('CLI command options', () => {
     const plugin = createPayaraCLIPlugin();
     plugin.registerCommands(program, mockContext as any);
 
-    const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
+    const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+    const deployCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'deploy');
     const warCmd = deployCmd?.commands.find(cmd => cmd.name() === 'war');
 
     const options = warCmd?.options.map(o => o.name());
@@ -135,8 +139,8 @@ describe('CLI command options', () => {
     const plugin = createPayaraCLIPlugin();
     plugin.registerCommands(program, mockContext as any);
 
-    const deployCmd = program.commands.find(cmd => cmd.name() === 'deploy');
-    const restartCmd = deployCmd?.commands.find(cmd => cmd.name() === 'restart');
+    const payaraCmd = program.commands.find(cmd => cmd.name() === 'payara');
+    const restartCmd = payaraCmd?.commands.find(cmd => cmd.name() === 'restart');
 
     const options = restartCmd?.options.map(o => o.name());
     expect(options).toContain('target');

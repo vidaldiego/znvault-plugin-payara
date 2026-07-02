@@ -37,7 +37,7 @@ function makeCtx() {
 }
 async function runDeploy(ctx: CLIPluginContext, argv: string[]) {
   const program = new Command(); program.exitOverride();
-  registerDeployRunCommand(program.command('deploy'), ctx);
+  registerDeployRunCommand(program.command('payara').command('deploy'), ctx);
   const real = process.exit;
   // @ts-expect-error stub
   process.exit = () => { throw new Error('__exit__'); };
@@ -60,7 +60,7 @@ describe('multi-class post-deploy gate', () => {
 
   it('post runs after a clean multi-class rollout', async () => {
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(true);
   });
 
@@ -68,7 +68,7 @@ describe('multi-class post-deploy gate', () => {
     mcResult.abortedAt = 'api';
     mcResult.classes = [{ name: 'api', blocking: true, ran: true, coverageOk: false, ctx: { failed: 1, aborted: true, healthCheckFailed: 0, workerFailed: 0, successful: 0, skipped: 0, results: new Map() } }];
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Skipping post-deploy/i.test(m))).toBe(true);
     expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(false);
   });
@@ -82,7 +82,7 @@ describe('multi-class post-deploy gate', () => {
       { name: 'worker', blocking: false, ran: true, coverageOk: false, ctx: { failed: 0, aborted: false, healthCheckFailed: 0, workerFailed: 0, successful: 1, skipped: 0, results: new Map() } },
     ];
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Skipping post-deploy/i.test(m))).toBe(true);
     expect(infos.some((m) => /worker/i.test(m))).toBe(true);
     expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(false);

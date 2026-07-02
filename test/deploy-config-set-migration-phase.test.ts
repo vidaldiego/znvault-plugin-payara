@@ -37,8 +37,8 @@ function makeCtx() {
 function makeProgram(ctx: ReturnType<typeof makeCtx>) {
   const program = new Command();
   program.exitOverride(); // throw instead of process.exit on commander errors
-  const deploy = program.command('deploy');
-  const configCmd = deploy.command('config');
+  const payara = program.command('payara');
+  const configCmd = payara.command('config');
   registerConfigCommands(configCmd, ctx);
   return program;
 }
@@ -61,7 +61,7 @@ describe('deploy config set-migration --phase', () => {
 
     await program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'stg',
+      'payara', 'config', 'set-migration', 'stg',
       '--phase', 'post',
       '--role', 'r',
       '--dir', 'db/post',
@@ -78,7 +78,7 @@ describe('deploy config set-migration --phase', () => {
 
     await program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'stg',
+      'payara', 'config', 'set-migration', 'stg',
       '--role', 'r',
       '--dir', 'db/pre',
     ]);
@@ -94,7 +94,7 @@ describe('deploy config set-migration --phase', () => {
 
     await program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'stg',
+      'payara', 'config', 'set-migration', 'stg',
       '--phase', 'pre',
       '--role', 'r',
       '--dir', 'db/pre',
@@ -113,7 +113,7 @@ describe('deploy config set-migration --phase', () => {
 
     await program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'stg',
+      'payara', 'config', 'set-migration', 'stg',
       '--phase', 'post',
       '--clear',
     ]);
@@ -132,7 +132,7 @@ describe('deploy config set-migration --phase', () => {
 
     await program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'stg',
+      'payara', 'config', 'set-migration', 'stg',
       '--clear',
     ]);
 
@@ -150,7 +150,7 @@ describe('deploy config set-migration --phase', () => {
 
     await expect(program.parseAsync([
       'node', 'znvault',
-      'deploy', 'config', 'set-migration', 'stg',
+      'payara', 'config', 'set-migration', 'stg',
       '--phase', 'bogus',
       '--role', 'r',
       '--dir', 'db/pre',
