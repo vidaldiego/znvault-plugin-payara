@@ -43,28 +43,30 @@ export function createPayaraCLIPlugin(): CLIPlugin {
     description: 'Payara WAR deployment commands with visual progress',
 
     registerCommands(program: Command, ctx: CLIPluginContext): void {
-      // Create deploy command group
-      const deploy = program
+      // Top-level per-deployer group (v2.0.0). Future deployers register their own
+      // top-level group as peers of `payara`.
+      const payara = program
+        .command('payara')
+        .description('Payara application-server deployment & management');
+
+      // ── deploy verb group: run / to / war ──
+      const deploy = payara
         .command('deploy')
-        .description('Deploy WAR files to remote Payara servers');
+        .description('Deploy WAR files to Payara servers');
+      registerDeployRunCommand(deploy, ctx);   // run <cfg> (+ 'to' alias)
+      registerDeployWarCommand(deploy, ctx);   // war <file>
 
-      // deploy run <configName> - Multi-host deployment using saved configurations
-      registerDeployRunCommand(deploy, ctx);
-
-      // deploy config - Manage deployment configurations
-      const configCmd = deploy
+      // ── config management (peer) ──
+      const configCmd = payara
         .command('config')
         .description('Manage deployment configurations');
       registerConfigCommands(configCmd, ctx);
 
-      // deploy war <file> - Single-host deployment
-      registerDeployWarCommand(deploy, ctx);
+      // ── lifecycle (peers): restart / status / applications ──
+      registerLifecycleCommands(payara, ctx);
 
-      // deploy restart, status, applications
-      registerLifecycleCommands(deploy, ctx);
-
-      // deploy tls - TLS certificate management
-      registerTLSCommands(deploy, ctx);
+      // ── tls (peer) ──
+      registerTLSCommands(payara, ctx);
     },
   };
 }
