@@ -822,6 +822,15 @@ See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Pyt
 
 ## Changelog
 
+### v2.0.1
+- **Fix: post-deploy migrations no longer fail with `OrphanTrackedRowError`.** The pre/post
+  migration phases run the engine against separate directories that share one
+  `schema_migrations` history table, so the post phase (scanning only `post/`) saw tracked
+  rows for the `pre/` migrations and rejected them as renamed/deleted files. The planner's
+  orphan/checksum integrity check now validates rows against the **union** of the pre and post
+  directories, while still applying only the current phase's directory. Single-directory
+  configs are unaffected. `payara deploy run <cfg> --post-only` now works with prior migrations.
+
 ### v2.0.0
 - **BREAKING: CLI namespace `deploy` → `payara`.** All commands moved from
   `znvault deploy …` to `znvault payara …`, grouped by concern:
