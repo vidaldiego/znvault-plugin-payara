@@ -214,6 +214,22 @@ znvault deploy to staging --sequential
 # Mutually exclusive with --migrations-only.
 znvault deploy to staging --skip-migrations
 
+# Post-deploy migrations: run destructive schema changes AFTER a successful
+# rollout (they run only when every host is on the new WAR). Configure a
+# separate directory:
+znvault deploy config set-migration staging --phase post --role zincdb-rw --dir docs/migrations/post
+
+# Migration phase flags (deploy run):
+#   --skip-migrations   deploy WARs only, no migrations
+#   --skip-pre          skip pre-deploy migrations (still deploy + post)
+#   --skip-post         skip post-deploy migrations (still pre + deploy)
+#   --migrations-only   run both phases, no rollout
+#   --pre-only          run only pre-deploy migrations, no rollout
+#   --post-only         run only post-deploy migrations, no rollout (recovery)
+# Post-deploy migrations are skipped (with a reason) on a scoped deploy
+# (--host/--class), a dropped/unreachable host, or any rollout failure.
+znvault deploy to staging --skip-post
+
 # Manage configs
 znvault deploy config list
 znvault deploy config show staging
