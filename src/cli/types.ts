@@ -340,6 +340,17 @@ export interface DeployConfig {
    * this config (database may optionally be overridden here).
    */
   migration?: MigrationConfig;
+
+  /**
+   * Optional POST-deploy migration phase. Runs ONLY after a fully successful
+   * rollout (every configured host on the new WAR, no failures, not scoped).
+   * For destructive changes (drop column/table, remove routines) that are unsafe
+   * while old app instances are still live. Same shape as `migration`, but MUST
+   * point at a DIFFERENT migrationsDir (the engine applies "all pending per dir").
+   * Absent = no post-deploy phase. Set via
+   * `deploy config set-migration <name> --phase post ...`.
+   */
+  postMigration?: MigrationConfig;
 }
 
 /**
