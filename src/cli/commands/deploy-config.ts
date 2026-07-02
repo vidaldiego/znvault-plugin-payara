@@ -194,25 +194,21 @@ export function registerConfigCommands(
         } else {
           console.log(`\n  HAProxy: ${ANSI.dim}(not configured)${ANSI.reset}`);
         }
-        // Migration configuration
-        if (config.migration) {
-          const mg = config.migration;
-          console.log(`\n  Migration:`);
-          console.log(`    Role:     ${mg.roleId}`);
-          console.log(`    Dir:      ${mg.migrationsDir}`);
-          if (mg.database) {
-            console.log(`    Database: ${mg.database} (override)`);
-          } else {
-            console.log(`    Database: ${ANSI.dim}(from Vault dynamic-secrets connection)${ANSI.reset}`);
-          }
-          if (mg.routines) {
-            console.log(`    Routines: ${mg.routines.bundle} v${mg.routines.version} (applied before migrations)`);
-          } else {
-            console.log(`    Routines: ${ANSI.dim}(none — migration engine assumes helpers already exist)${ANSI.reset}`);
-          }
-        } else {
-          console.log(`\n  Migration: ${ANSI.dim}(not configured — schema migrations will be skipped)${ANSI.reset}`);
-        }
+        // Migration configuration — two phases, each rendered the same way.
+        const renderMigration = (block: MigrationConfig | undefined, label: string, absentNote: string): void => {
+          if (!block) { console.log(`\n  ${label}: ${ANSI.dim}(${absentNote})${ANSI.reset}`); return; }
+          console.log(`\n  ${label}:`);
+          console.log(`    Role:     ${block.roleId}`);
+          console.log(`    Dir:      ${block.migrationsDir}`);
+          console.log(block.database
+            ? `    Database: ${block.database} (override)`
+            : `    Database: ${ANSI.dim}(from Vault dynamic-secrets connection)${ANSI.reset}`);
+          console.log(block.routines
+            ? `    Routines: ${block.routines.bundle} v${block.routines.version} (applied before migrations)`
+            : `    Routines: ${ANSI.dim}(none — migration engine assumes helpers already exist)${ANSI.reset}`);
+        };
+        renderMigration(config.migration, 'Migration (pre-deploy)', 'not configured — pre-deploy migrations will be skipped');
+        renderMigration(config.postMigration, 'Migration (post-deploy)', 'not configured — no post-deploy migrations');
 
         // Node classes (multi-class configs). A multi-class config carries its
         // hosts/strategy/haproxy PER CLASS, so the flat "Hosts"/"HAProxy" sections
@@ -300,6 +296,17 @@ export function registerConfigCommands(
             console.log(`         strategy ${ph.strategy}${drainNote}`);
           }
         });
+
+        if (config.postMigration) {
+          const noRollout = phases.length === 0;
+          if (config.postMigration.routines) {
+            console.log(`    ${step++}. Apply routine bundle ${config.postMigration.routines.bundle} v${config.postMigration.routines.version} (post-deploy, before post migrations)`);
+          }
+          const annot = noRollout
+            ? '(no rollout in this config — runs via --post-only/--migrations-only)'
+            : 'only if the rollout succeeded (all hosts on the new WAR, no failures)';
+          console.log(`    ${step++}. Run post-deploy schema migrations (role ${config.postMigration.roleId}; ${annot})`);
+        }
 
         console.log();
       }, 'Failed to show config');
