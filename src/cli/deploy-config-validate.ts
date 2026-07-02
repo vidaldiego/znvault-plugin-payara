@@ -2,13 +2,50 @@
 // Pure static validation of a DeployConfig — flat or multi-class.
 // errors.length > 0 ⇒ a hard violation (deploy must abort before touching hosts).
 
-import type { DeployConfig } from './types.js';
+import type { DeployConfig, MigrationConfig } from './types.js';
 import { resolveClass, hasActiveServerMap } from './deploy-class.js';
 
 export interface ValidationReport {
   errors: string[];
   warnings: string[];
   info: string[];
+}
+
+/** Validate one migration block (pre or post). Pushes into the caller's arrays. */
+function validateMigrationBlock(
+  configName: string,
+  block: MigrationConfig,
+  label: 'migration' | 'postMigration',
+  errors: string[],
+  info: string[],
+): void {
+  const isPre = label === 'migration';
+  if (!block.roleId || block.roleId.trim() === '') {
+    errors.push(`config '${configName}' ${label} is missing roleId (the dynamic-secrets write role).`);
+  }
+  if (!block.migrationsDir || block.migrationsDir.trim() === '') {
+    errors.push(`config '${configName}' ${label} is missing migrationsDir.`);
+  }
+  if (block.roleId && block.roleId.trim() !== '' && block.migrationsDir && block.migrationsDir.trim() !== '') {
+    const when = isPre ? 'before rollout' : 'after a successful rollout';
+    const suffix = isPre ? `; host/port/database come from the Vault dynamic-secrets connection.` : `.`;
+    info.push(`config '${configName}' will run schema migrations ${when} (role '${block.roleId}', dir '${block.migrationsDir}')${suffix}`);
+  }
+  if (block.routines) {
+    const { bundle, version } = block.routines;
+    const bundleValid = !!bundle && bundle.trim() !== '';
+    const versionValid = Number.isInteger(version) && version >= 1;
+    if (!bundleValid) {
+      errors.push(`config '${configName}' ${label}.routines is missing bundle (the routine bundle name).`);
+    }
+    if (!versionValid) {
+      errors.push(`config '${configName}' ${label}.routines.version must be an integer >= 1.`);
+    }
+    if (bundleValid && versionValid) {
+      const beforeWhat = isPre ? 'migrations' : `${label} migrations`;
+      info.push(`config '${configName}' will apply routine bundle ${bundle} v${version} before ${beforeWhat}.`);
+    }
+  }
 }
 
 export function validateDeployConfig(config: DeployConfig): ValidationReport {
@@ -95,33 +132,21 @@ export function validateDeployConfig(config: DeployConfig): ValidationReport {
 
   // ── Migration config validation (applies to BOTH flat and multi-class) ──
   if (config.migration) {
-    if (!config.migration.roleId || config.migration.roleId.trim() === '') {
-      errors.push(`config '${config.name}' migration is missing roleId (the dynamic-secrets write role).`);
-    }
-    if (!config.migration.migrationsDir || config.migration.migrationsDir.trim() === '') {
-      errors.push(`config '${config.name}' migration is missing migrationsDir.`);
-    }
-    if (config.migration.roleId && config.migration.roleId.trim() !== '' &&
-        config.migration.migrationsDir && config.migration.migrationsDir.trim() !== '') {
-      info.push(`config '${config.name}' will run schema migrations before rollout (role '${config.migration.roleId}', dir '${config.migration.migrationsDir}'); host/port/database come from the Vault dynamic-secrets connection.`);
-    }
-
-    // ── Routines selector validation (applied before the migrate lease is minted) ──
-    if (config.migration.routines) {
-      const { bundle, version } = config.migration.routines;
-      const bundleValid = !!bundle && bundle.trim() !== '';
-      const versionValid = Number.isInteger(version) && version >= 1;
-
-      if (!bundleValid) {
-        errors.push(`config '${config.name}' migration.routines is missing bundle (the routine bundle name).`);
-      }
-      if (!versionValid) {
-        errors.push(`config '${config.name}' migration.routines.version must be an integer >= 1.`);
-      }
-      if (bundleValid && versionValid) {
-        info.push(`config '${config.name}' will apply routine bundle ${bundle} v${version} before migrations.`);
-      }
-    }
+    validateMigrationBlock(config.name, config.migration, 'migration', errors, info);
+  }
+  if (config.postMigration) {
+    validateMigrationBlock(config.name, config.postMigration, 'postMigration', errors, info);
+  }
+  if (
+    config.migration?.migrationsDir &&
+    config.postMigration?.migrationsDir &&
+    config.migration.migrationsDir.trim() === config.postMigration.migrationsDir.trim()
+  ) {
+    warnings.push(
+      `config '${config.name}' uses the same migrationsDir for pre- and post-deploy migrations — ` +
+        `the post-deploy phase will find nothing to run (the engine applies all-pending per dir). ` +
+        `Use separate directories.`,
+    );
   }
 
   return { errors, warnings, info };

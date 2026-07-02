@@ -89,3 +89,44 @@ describe('validateDeployConfig', () => {
     expect(r.errors).toEqual([]);
   });
 });
+
+const base = (over: Partial<DeployConfig>): DeployConfig =>
+  ({ name: 'x', hosts: ['h1'], warPath: '/a.war', ...over }) as DeployConfig;
+
+describe('validateDeployConfig — postMigration', () => {
+  it('errors when postMigration is missing roleId', () => {
+    const cfg = base({ postMigration: { roleId: '', migrationsDir: 'db/post' } as any });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /postMigration/i.test(e) && /roleId/i.test(e))).toBe(true);
+  });
+
+  it('errors when postMigration is missing migrationsDir', () => {
+    const cfg = base({ postMigration: { roleId: 'r', migrationsDir: '' } as any });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /postMigration/i.test(e) && /migrationsDir/i.test(e))).toBe(true);
+  });
+
+  it('errors on malformed postMigration.routines', () => {
+    const cfg = base({ postMigration: { roleId: 'r', migrationsDir: 'db/post', routines: { bundle: '', version: 0 } } as any });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /postMigration.*routines/i.test(e))).toBe(true);
+  });
+
+  it('warns when pre and post share the same migrationsDir', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/all' },
+      postMigration: { roleId: 'r', migrationsDir: 'db/all' },
+    });
+    const { warnings } = validateDeployConfig(cfg);
+    expect(warnings.some((w) => /same.*migrationsDir|same dir/i.test(w))).toBe(true);
+  });
+
+  it('accepts a well-formed postMigration with a distinct dir', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/pre' },
+      postMigration: { roleId: 'r', migrationsDir: 'db/post' },
+    });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors).toHaveLength(0);
+  });
+});
