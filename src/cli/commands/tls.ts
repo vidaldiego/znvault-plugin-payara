@@ -86,7 +86,7 @@ export function registerTLSCommands(
 
         ctx.output.success('TLS setup complete. CA certificate cached locally.');
         ctx.output.info('To enable TLS for a deploy config, run:');
-        console.log(`  ${ANSI.cyan}znvault deploy config set <name> tls true${ANSI.reset}`);
+        console.log(`  ${ANSI.cyan}znvault payara config set <name> tls true${ANSI.reset}`);
       }, 'TLS setup failed');
     });
 
@@ -123,7 +123,7 @@ export function registerTLSCommands(
           }
         } else {
           console.log(`  CA Certificate: ${ANSI.red}not cached${ANSI.reset}`);
-          console.log(`  Run '${ANSI.cyan}znvault deploy tls setup${ANSI.reset}' to fetch CA`);
+          console.log(`  Run '${ANSI.cyan}znvault payara tls setup${ANSI.reset}' to fetch CA`);
         }
 
         console.log('');
@@ -175,7 +175,7 @@ export function registerTLSCommands(
           configureTLS({ verify: true, caCertPath: caPath });
         } else {
           ctx.output.error(`CA certificate not found at ${caPath}`);
-          ctx.output.info(`Run '${ANSI.cyan}znvault deploy tls setup${ANSI.reset}' to fetch CA from vault`);
+          ctx.output.info(`Run '${ANSI.cyan}znvault payara tls setup${ANSI.reset}' to fetch CA from vault`);
           process.exit(1);
         }
 
@@ -199,7 +199,7 @@ export function registerTLSCommands(
           if (message.includes('certificate') || message.includes('SSL') || message.includes('TLS')) {
             ctx.output.error('TLS verification failed - certificate issue');
             ctx.output.info('The CA certificate may be incorrect or expired.');
-            ctx.output.info(`Run '${ANSI.cyan}znvault deploy tls setup${ANSI.reset}' to refresh CA`);
+            ctx.output.info(`Run '${ANSI.cyan}znvault payara tls setup${ANSI.reset}' to refresh CA`);
           } else if (message.includes('ECONNREFUSED')) {
             ctx.output.error(`Connection refused. Is the agent running HTTPS on port ${port}?`);
           } else if (message.includes('timeout')) {

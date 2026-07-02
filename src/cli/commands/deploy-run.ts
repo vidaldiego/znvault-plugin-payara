@@ -129,7 +129,7 @@ function configureTLSForDeployment(config: DeployConfig, ctx: CLIPluginContext):
   // Verify CA certificate exists
   if (caCertPath && !existsSync(caCertPath)) {
     ctx.output.warn(`CA certificate not found at ${caCertPath}`);
-    ctx.output.info('Run "znvault deploy tls setup" to fetch CA from vault');
+    ctx.output.info('Run "znvault payara tls setup" to fetch CA from vault');
     ctx.output.info('Falling back to HTTP (insecure)');
     return { port: config.port ?? 9100, useTLS: false };
   }
@@ -209,7 +209,7 @@ export async function runMigrationPhase(
       const flag = r && r.kind === 'flag' ? r.flag : 'flag';
       msg = `[deploy] Skipping ${phase} schema migrations (${flag}).`;
     } else if (r.kind === 'scoped-subset') {
-      msg = `[deploy] Skipping ${phase} schema migrations: deploy scoped to a subset (other hosts still run the previous WAR). Run a full deploy or 'deploy run ${configName} --post-only' once all hosts are current.`;
+      msg = `[deploy] Skipping ${phase} schema migrations: deploy scoped to a subset (other hosts still run the previous WAR). Run a full deploy or 'payara deploy run ${configName} --post-only' once all hosts are current.`;
     } else if (r.kind === 'partial-coverage') {
       msg = `[deploy] Skipping ${phase} schema migrations: ${r.dropped.length} configured host(s) were not deployed (${r.dropped.join(', ')}) — they still run the previous WAR.`;
     } else {
@@ -315,7 +315,7 @@ export function registerDeployRunCommand(
 
         if (!config) {
           ctx.output.error(`Deployment config '${configName}' not found`);
-          ctx.output.info('Use "znvault deploy config list" to see available configs');
+          ctx.output.info('Use "znvault payara config list" to see available configs');
           process.exit(1);
         }
 
@@ -328,11 +328,11 @@ export function registerDeployRunCommand(
 
         // Required-block checks for -only flags (config-dependent, action-level).
         if (options.preOnly && !config.migration) {
-          ctx.output.error(`--pre-only requires a pre-deploy migration config; none set on '${configName}'. Use 'deploy config set-migration ${configName} --phase pre ...'.`);
+          ctx.output.error(`--pre-only requires a pre-deploy migration config; none set on '${configName}'. Use 'payara config set-migration ${configName} --phase pre ...'.`);
           process.exit(1);
         }
         if (options.postOnly && !config.postMigration) {
-          ctx.output.error(`--post-only requires a post-deploy migration config; none set on '${configName}'. Use 'deploy config set-migration ${configName} --phase post ...'.`);
+          ctx.output.error(`--post-only requires a post-deploy migration config; none set on '${configName}'. Use 'payara config set-migration ${configName} --phase post ...'.`);
           process.exit(1);
         }
         if (options.migrationsOnly && !config.migration && !config.postMigration) {
@@ -402,7 +402,7 @@ export function registerDeployRunCommand(
 
         if ((config.hosts ?? []).length === 0) {
           ctx.output.error('No hosts configured for this deployment');
-          ctx.output.info(`Use "znvault deploy config add-host ${configName} <host>" to add hosts`);
+          ctx.output.info(`Use "znvault payara config add-host ${configName} <host>" to add hosts`);
           process.exit(1);
         }
 
@@ -812,7 +812,7 @@ export function registerDeployRunCommand(
             { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason });
         } catch (postErr) {
           ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
-          ctx.output.info(`Re-run just the post phase with: deploy run ${configName} --post-only`);
+          ctx.output.info(`Re-run just the post phase with: payara deploy run ${configName} --post-only`);
           process.exit(1);
         }
 
@@ -1228,7 +1228,7 @@ async function runMultiClassDeploy(
       { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason });
   } catch (postErr) {
     ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
-    ctx.output.info(`Re-run just the post phase with: deploy run ${config.name} --post-only`);
+    ctx.output.info(`Re-run just the post phase with: payara deploy run ${config.name} --post-only`);
     process.exit(1);
   }
 

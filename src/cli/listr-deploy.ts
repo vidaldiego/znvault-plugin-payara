@@ -364,7 +364,7 @@ export async function executeListrDeployment(
       `[znvault-deploy] config mixes serving (${serving.join(', ')}) and ` +
       `worker (${workers.join(', ')}) nodes; the strategy applies to serving ` +
       `nodes only — workers deploy last (parallel, non-blocking). Consider a ` +
-      `separate config / 'deploy war --target' for workers.`
+      `separate config / 'payara deploy war --target' for workers.`
     );
   }
 

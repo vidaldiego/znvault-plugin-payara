@@ -25,7 +25,7 @@ export async function getConfigOrExit(
 
   if (!config) {
     ctx.output.error(`Config '${name}' not found`);
-    ctx.output.info('Use "znvault deploy config list" to see available configs');
+    ctx.output.info('Use "znvault payara config list" to see available configs');
     process.exit(1);
   }
 

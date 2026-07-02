@@ -82,7 +82,7 @@ export function registerConfigCommands(
             console.log(JSON.stringify([], null, 2));
           } else {
             ctx.output.info('No deployment configurations found.');
-            ctx.output.info('Create one with: znvault deploy config create <name>');
+            ctx.output.info('Create one with: znvault payara config create <name>');
           }
           return;
         }
@@ -281,7 +281,7 @@ export function registerConfigCommands(
         // this config: the migration phase first (if configured), then each node
         // class as an ordered phase with its strategy batches and blocking gate.
         // Reuses the same resolution the deploy path uses, so the plan is accurate.
-        console.log(`\n  ${ANSI.bold}Execution plan${ANSI.reset} ${ANSI.dim}(what 'deploy run ${config.name}' does, in order)${ANSI.reset}:`);
+        console.log(`\n  ${ANSI.bold}Execution plan${ANSI.reset} ${ANSI.dim}(what 'payara deploy run ${config.name}' does, in order)${ANSI.reset}:`);
         let step = 1;
         if (config.migration) {
           if (config.migration.routines) {
@@ -475,7 +475,7 @@ export function registerConfigCommands(
             if (value.toLowerCase() === 'true' || value === '1') {
               config.tls.verify = true;
               config.tls.useVaultCA = true;
-              ctx.output.info('TLS enabled with vault CA. Run "znvault deploy tls setup" to fetch CA certificate.');
+              ctx.output.info('TLS enabled with vault CA. Run "znvault payara tls setup" to fetch CA certificate.');
             } else if (value.toLowerCase() === 'false' || value === '0') {
               config.tls.verify = false;
               config.tls.useVaultCA = false;
@@ -546,7 +546,7 @@ export function registerConfigCommands(
 
         if (!options.path && !config.healthCheck?.path) {
           ctx.output.error('Health check path is required');
-          ctx.output.info('Usage: znvault deploy config health-check <name> --path /api/health');
+          ctx.output.info('Usage: znvault payara config health-check <name> --path /api/health');
           process.exit(1);
         }
 
@@ -618,7 +618,7 @@ export function registerConfigCommands(
 
         if (!options.hosts && !existing?.hosts?.length && !options.backend && !existing?.backend) {
           ctx.output.error('HAProxy hosts and backend are required');
-          ctx.output.info('Usage: znvault deploy config haproxy <name> --hosts 1.2.3.4,1.2.3.5 --backend api_servers');
+          ctx.output.info('Usage: znvault payara config haproxy <name> --hosts 1.2.3.4,1.2.3.5 --backend api_servers');
           process.exit(1);
         }
 
@@ -685,7 +685,7 @@ export function registerConfigCommands(
         if (mapCount > 0) {
           ctx.output.info(`  Server map: ${mapCount} mapping(s)`);
         } else {
-          ctx.output.warn('  Server map: empty — use "znvault deploy config haproxy-map" to add mappings');
+          ctx.output.warn('  Server map: empty — use "znvault payara config haproxy-map" to add mappings');
         }
       }, 'Failed to configure HAProxy');
     });
@@ -707,7 +707,7 @@ export function registerConfigCommands(
 
         if (!config.haproxy) {
           ctx.output.error('HAProxy not configured for this deployment');
-          ctx.output.info(`Use "znvault deploy config haproxy ${name} --hosts ... --backend ..." first`);
+          ctx.output.info(`Use "znvault payara config haproxy ${name} --hosts ... --backend ..." first`);
           process.exit(1);
         }
 
@@ -734,7 +734,7 @@ export function registerConfigCommands(
           const mappings = Object.entries(config.haproxy.serverMap);
           if (mappings.length === 0) {
             ctx.output.info('No HAProxy server mappings configured');
-            ctx.output.info('Usage: znvault deploy config haproxy-map <name> --set host=server');
+            ctx.output.info('Usage: znvault payara config haproxy-map <name> --set host=server');
             return;
           }
           console.log(`\nHAProxy server mappings for '${name}':\n`);
@@ -816,19 +816,19 @@ export function registerConfigCommands(
 
         if (!options.role) {
           ctx.output.error('--role <roleId> is required');
-          ctx.output.info('Usage: znvault deploy config set-migration <name> --role <roleId> --dir <path>');
+          ctx.output.info('Usage: znvault payara config set-migration <name> --role <roleId> --dir <path>');
           process.exit(1);
         }
 
         if (!options.dir) {
           ctx.output.error('--dir <path> is required');
-          ctx.output.info('Usage: znvault deploy config set-migration <name> --role <roleId> --dir <path>');
+          ctx.output.info('Usage: znvault payara config set-migration <name> --role <roleId> --dir <path>');
           process.exit(1);
         }
 
         if ((options.routinesBundle && !options.routinesVersion) || (!options.routinesBundle && options.routinesVersion)) {
           ctx.output.error('--routines-bundle and --routines-version are required together');
-          ctx.output.info('Usage: znvault deploy config set-migration <name> --role <roleId> --dir <path> --routines-bundle <name> --routines-version <n>');
+          ctx.output.info('Usage: znvault payara config set-migration <name> --role <roleId> --dir <path> --routines-bundle <name> --routines-version <n>');
           process.exit(1);
         }
 
