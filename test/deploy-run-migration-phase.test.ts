@@ -21,6 +21,11 @@
  * early-return calls to ctx.output.success are in the `.action()` closure and are
  * verified by the integration / cli.test.ts if needed; they're not cheaply testable
  * without spawning a full commander parse.
+ *
+ * `runMigrationPhase` was generalized (Task 5) to run either the pre-deploy OR
+ * post-deploy migration phase, driven by an explicit `phase` argument and a
+ * `run` boolean (replacing the old `skipMigrations` boolean) plus an optional
+ * reason-tagged `skipReason` for accurate incident-log skip lines.
  */
 import { describe, it, expect, vi } from 'vitest';
 import { runMigrationPhase } from '../src/cli/commands/deploy-run.js';
@@ -86,7 +91,7 @@ describe('runMigrationPhase', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhase(config, 'test-config', ctx, deps);
+    await runMigrationPhase(config.migration, 'pre-deploy', 'test-config', ctx, deps, { run: true });
 
     // runMigrations should NOT have been called (deps.client.issueCredential is the
     // first thing runMigrations calls — if it wasn't called, runMigrations was skipped)
@@ -111,7 +116,7 @@ describe('runMigrationPhase', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhase(config, 'staging', ctx, deps, { dryRun: true });
+    await runMigrationPhase(config.migration, 'pre-deploy', 'staging', ctx, deps, { dryRun: true, run: true });
 
     // Nothing executed: no lease minted, no runner invoked.
     expect(deps.client.issueCredential).not.toHaveBeenCalled();
@@ -120,7 +125,7 @@ describe('runMigrationPhase', () => {
     expect(infoCalls.some((m) => /dry.?run/i.test(m))).toBe(true);
     expect(infoCalls.some((m) => m.includes('znapi-helpers') && m.includes('1'))).toBe(true);
     // The "Migrations complete" line (which only fires after a real run) must NOT appear.
-    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] pre-deploy migrations complete.');
   });
 
   it('calls runMigrations with the correct roleId and migrationsDir when config.migration is present', async () => {
@@ -136,7 +141,7 @@ describe('runMigrationPhase', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhase(config, 'production', ctx, deps);
+    await runMigrationPhase(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true });
 
     // The lease must have been minted — runMigrations ran
     expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
@@ -144,8 +149,8 @@ describe('runMigrationPhase', () => {
 
     // Verify via output messages — both info lines must have fired (before + after),
     // which proves the full runMigrations call completed successfully.
-    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Running schema migrations before rollout...');
-    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Running pre-deploy schema migrations...');
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] pre-deploy migrations complete.');
   });
 
   it('forwards config.migration.routines to runMigrations opts (C3 pass-through)', async () => {
@@ -178,7 +183,7 @@ describe('runMigrationPhase', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhaseMocked(config, 'production', ctx, deps);
+    await runMigrationPhaseMocked(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true });
 
     expect(runMigrationsSpy).toHaveBeenCalledTimes(1);
     const [, opts] = runMigrationsSpy.mock.calls[0];
@@ -213,7 +218,7 @@ describe('runMigrationPhase', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhaseMocked(config, 'production', ctx, deps);
+    await runMigrationPhaseMocked(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true });
 
     expect(runMigrationsSpy).toHaveBeenCalledTimes(1);
     const [, opts] = runMigrationsSpy.mock.calls[0];
@@ -237,7 +242,7 @@ describe('runMigrationPhase', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps({ run });
 
-    await runMigrationPhase(config, 'staging', ctx, deps);
+    await runMigrationPhase(config.migration, 'pre-deploy', 'staging', ctx, deps, { run: true });
 
     // runner.run() must be called exactly once (no short-circuit)
     expect(run).toHaveBeenCalledTimes(1);
@@ -266,9 +271,9 @@ describe('runMigrationPhase', () => {
 
     // runMigrationPhase must REJECT — proving the caller (the action) sees the error
     // and cannot proceed to executeListrDeployment
-    await expect(runMigrationPhase(config, 'production', ctx, deps)).rejects.toThrow(
-      'migration failed: duplicate column "foo"',
-    );
+    await expect(
+      runMigrationPhase(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true }),
+    ).rejects.toThrow('migration failed: duplicate column "foo"');
 
     // The lease must still be revoked even on failure (run-migrations finally block)
     expect(revoke).toHaveBeenCalledTimes(1);
@@ -279,14 +284,14 @@ describe('runMigrationPhase', () => {
 //
 // `--skip-migrations` is the inverse of `--migrations-only`: it deploys the WAR
 // WITHOUT running the schema-migration phase, even when config.migration is set.
-// The skip is implemented in runMigrationPhase via opts.skipMigrations so both the
-// flat and multi-class call-sites share one behaviour. When the flag is set and a
-// migration config exists, runMigrationPhase prints a skip line and returns before
-// minting a lease / applying the bundle / running any SQL.
+// The skip is implemented in runMigrationPhase via opts.run === false so both the
+// flat and multi-class call-sites share one behaviour. When run is false and a
+// migration config exists, runMigrationPhase prints a reason-tagged skip line and
+// returns before minting a lease / applying the bundle / running any SQL.
 //
 
 describe('runMigrationPhase — --skip-migrations', () => {
-  it('does NOT run migrations when skipMigrations is set (config.migration present)', async () => {
+  it('does NOT run migrations when run:false is set (config.migration present)', async () => {
     const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0 });
     const config: DeployConfig = {
       name: 'production',
@@ -301,7 +306,9 @@ describe('runMigrationPhase — --skip-migrations', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps({ run });
 
-    await runMigrationPhase(config, 'production', ctx, deps, { skipMigrations: true });
+    await runMigrationPhase(config.migration, 'pre-deploy', 'production', ctx, deps, {
+      run: false, skipReason: { kind: 'flag', flag: '--skip-migrations' },
+    });
 
     // Nothing executed: no lease minted, no runner invoked, no bundle applied.
     expect(deps.client.issueCredential).not.toHaveBeenCalled();
@@ -312,11 +319,11 @@ describe('runMigrationPhase — --skip-migrations', () => {
     expect(infoCalls.some((m) => /skip/i.test(m) && /migration/i.test(m))).toBe(true);
 
     // The real-run lines must NOT appear.
-    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] Running schema migrations before rollout...');
-    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] Running pre-deploy schema migrations...');
+    expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] pre-deploy migrations complete.');
   });
 
-  it('is a silent no-op when skipMigrations is set but config.migration is absent', async () => {
+  it('is a silent no-op when run:false is set but config.migration is absent', async () => {
     const config: DeployConfig = {
       name: 'no-migration',
       hosts: ['10.0.0.1'],
@@ -325,14 +332,16 @@ describe('runMigrationPhase — --skip-migrations', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhase(config, 'no-migration', ctx, deps, { skipMigrations: true });
+    await runMigrationPhase(config.migration, 'pre-deploy', 'no-migration', ctx, deps, {
+      run: false, skipReason: { kind: 'flag', flag: '--skip-migrations' },
+    });
 
     expect(deps.client.issueCredential).not.toHaveBeenCalled();
     // Nothing to skip, so no skip line is printed either.
     expect(ctx.output.info).not.toHaveBeenCalled();
   });
 
-  it('skipMigrations takes precedence over dryRun (skip line, not dry-run plan)', async () => {
+  it('run:false takes precedence over dryRun (skip line, not dry-run plan)', async () => {
     // If both are somehow set, skip wins — no plan is printed, nothing runs.
     const config: DeployConfig = {
       name: 'staging',
@@ -347,20 +356,22 @@ describe('runMigrationPhase — --skip-migrations', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhase(config, 'staging', ctx, deps, { skipMigrations: true, dryRun: true });
+    await runMigrationPhase(config.migration, 'pre-deploy', 'staging', ctx, deps, {
+      run: false, dryRun: true, skipReason: { kind: 'flag', flag: '--skip-migrations' },
+    });
 
     expect(deps.client.issueCredential).not.toHaveBeenCalled();
     const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
     expect(infoCalls.some((m) => /skip/i.test(m) && /migration/i.test(m))).toBe(true);
     // The dry-run plan line must NOT appear (skip short-circuited before it).
-    expect(infoCalls.some((m) => /would run schema migrations/i.test(m))).toBe(false);
+    expect(infoCalls.some((m) => /would run.*schema migrations/i.test(m))).toBe(false);
   });
 });
 
 // ─── Multi-class config shape ─────────────────────────────────────────────────
 //
 // These tests prove that runMigrationPhase is shape-agnostic: it inspects only
-// config.migration and config.name — it does NOT care whether the config has
+// the migration config and phase — it does NOT care whether the caller's config has
 // `hosts` (flat) or `classes` (multi-class).  The call-site addition in
 // deploy-run.ts now calls runMigrationPhase BEFORE runMultiClassDeploy, so the
 // multi-class deploy aborts on migration failure before ANY host is touched.
@@ -379,7 +390,7 @@ describe('runMigrationPhase — multi-class config shape', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhase(config, 'staging', ctx, deps);
+    await runMigrationPhase(config.migration, 'pre-deploy', 'staging', ctx, deps, { run: true });
 
     expect(deps.client.issueCredential).not.toHaveBeenCalled();
     expect(ctx.output.info).not.toHaveBeenCalled();
@@ -401,15 +412,15 @@ describe('runMigrationPhase — multi-class config shape', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await runMigrationPhase(config, 'staging', ctx, deps);
+    await runMigrationPhase(config.migration, 'pre-deploy', 'staging', ctx, deps, { run: true });
 
     // Credential must have been issued — runMigrations ran
     expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
     expect(deps.client.issueCredential).toHaveBeenCalledTimes(1);
 
     // Both info lines fire — full runMigrations lifecycle completed
-    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Running schema migrations before rollout...');
-    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Migrations complete — proceeding with rollout.');
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Running pre-deploy schema migrations...');
+    expect(ctx.output.info).toHaveBeenCalledWith('[deploy] pre-deploy migrations complete.');
   });
 
   it('propagates failure for a multi-class config (aborts before any class rolls out)', async () => {
@@ -433,9 +444,9 @@ describe('runMigrationPhase — multi-class config shape', () => {
     const deps = makeMockDeps({ run, revoke });
 
     // Must reject — the caller (the action handler) will NOT proceed to runMultiClassDeploy
-    await expect(runMigrationPhase(config, 'production', ctx, deps)).rejects.toThrow(
-      'migration failed: table already exists',
-    );
+    await expect(
+      runMigrationPhase(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true }),
+    ).rejects.toThrow('migration failed: table already exists');
 
     // Lease revoked even on failure
     expect(revoke).toHaveBeenCalledTimes(1);
@@ -469,7 +480,9 @@ describe('--migrations-only: runMigrationPhase contract', () => {
     const deps = makeMockDeps({ run });
 
     // Must resolve (not throw) — --migrations-only returns right after this
-    await expect(runMigrationPhase(config, 'production', ctx, deps)).resolves.toBeUndefined();
+    await expect(
+      runMigrationPhase(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true }),
+    ).resolves.toBeUndefined();
 
     // Migrations ran and lease was revoked
     expect(run).toHaveBeenCalledTimes(1);
@@ -486,7 +499,9 @@ describe('--migrations-only: runMigrationPhase contract', () => {
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
 
-    await expect(runMigrationPhase(config, 'no-migration', ctx, deps)).resolves.toBeUndefined();
+    await expect(
+      runMigrationPhase(config.migration, 'pre-deploy', 'no-migration', ctx, deps, { run: true }),
+    ).resolves.toBeUndefined();
 
     // runMigrations was NOT invoked
     expect(deps.client.issueCredential).not.toHaveBeenCalled();
@@ -509,9 +524,53 @@ describe('--migrations-only: runMigrationPhase contract', () => {
 
     // --migrations-only flow: if runMigrationPhase rejects, the action
     // propagates the error (no rollout runs, no success message emitted)
-    await expect(runMigrationPhase(config, 'production', ctx, deps)).rejects.toThrow(
-      'migration failed: column missing',
-    );
+    await expect(
+      runMigrationPhase(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true }),
+    ).rejects.toThrow('migration failed: column missing');
     expect(ctx.output.success).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Generalized (post + reasons) ─────────────────────────────────────────────
+//
+// Task 5: runMigrationPhase now takes an explicit `migration` value (not a whole
+// DeployConfig) and a `phase` ('pre-deploy' | 'post-deploy'), so it can drive
+// either migration phase. `opts.run === false` skips with a reason-tagged line
+// built from `opts.skipReason` (see MigrationSkipReason in post-gate.ts).
+//
+
+describe('runMigrationPhase — generalized (post + reasons)', () => {
+  it('runs the post-deploy phase against its own dir', async () => {
+    const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0 });
+    const post = { roleId: 'zincdb-rw', migrationsDir: 'db/post' } as any;
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps({ run });
+    await runMigrationPhase(post, 'post-deploy', 'prod', ctx, deps, { run: true });
+    expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
+    const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
+    expect(infoCalls.some((m) => /post-deploy/i.test(m) && /Running/i.test(m))).toBe(true);
+  });
+
+  it('run:false prints a reason-tagged skip line and does not execute', async () => {
+    const post = { roleId: 'r', migrationsDir: 'db/post' } as any;
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+    await runMigrationPhase(post, 'post-deploy', 'prod', ctx, deps, {
+      run: false, skipReason: { kind: 'partial-coverage', dropped: ['h3'] },
+    });
+    expect(deps.client.issueCredential).not.toHaveBeenCalled();
+    const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
+    expect(infoCalls.some((m) => /Skipping post-deploy/i.test(m) && /h3/.test(m))).toBe(true);
+  });
+
+  it('run:false with a flag reason names the flag', async () => {
+    const pre = { roleId: 'r', migrationsDir: 'db/pre' } as any;
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+    await runMigrationPhase(pre, 'pre-deploy', 'prod', ctx, deps, {
+      run: false, skipReason: { kind: 'flag', flag: '--skip-migrations' },
+    });
+    const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
+    expect(infoCalls.some((m) => /Skipping pre-deploy/i.test(m) && /--skip-migrations/.test(m))).toBe(true);
   });
 });

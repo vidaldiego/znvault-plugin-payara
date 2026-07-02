@@ -18,9 +18,11 @@ import { ANSI } from '../constants.js';
 import {
   type CLIPluginContext,
   type DeployConfig,
+  type MigrationConfig,
   parseDeploymentStrategy,
   getStrategyDisplayName,
 } from '../types.js';
+import type { MigrationSkipReason } from '../post-gate.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { resolveStrategy } from '../strategy-executor.js';
 import { formatSize } from '../formatters.js';
@@ -170,60 +172,68 @@ export function validateClassHostOverride(
 }
 
 /**
- * Run the schema-migration phase if the deploy config requests it. Called ONCE,
- * BEFORE the rolling WAR rollout, so a migration failure aborts the deploy before
- * any host is touched. No-op when config.migration is absent.
+ * Run a schema-migration phase (pre-deploy or post-deploy) if a migration config
+ * is provided. No-op when `migration` is undefined.
  *
- * @param config     - The resolved deploy config (may or may not have .migration).
+ * @param migration  - The migration config for this phase (undefined = no-op).
+ * @param phase      - Which phase this is, for log lines and skip-reason messages.
  * @param configName - The config name, used as the `env` label in runMigrations.
  * @param ctx        - The CLI plugin context (output + client).
  * @param deps       - Injectable deps (defaults to production wiring via migrationDefaultDeps).
+ * @param opts       - `dryRun` prints the plan only; `run: false` skips with a
+ *                     reason-tagged log line built from `skipReason`.
  */
 export async function runMigrationPhase(
-  config: DeployConfig,
+  migration: MigrationConfig | undefined,
+  phase: 'pre-deploy' | 'post-deploy',
   configName: string,
   ctx: CLIPluginContext,
   deps = migrationDefaultDeps(ctx.client),
-  opts: { dryRun?: boolean; skipMigrations?: boolean } = {},
+  opts: { dryRun?: boolean; run?: boolean; skipReason?: MigrationSkipReason } = {},
 ): Promise<void> {
-  if (!config.migration) return;
+  if (!migration) return;
 
-  // --skip-migrations deploys the WAR WITHOUT running the migration phase, even
-  // when the config declares one. It takes precedence over --dry-run: nothing is
-  // executed and no plan is printed — we just note that migrations were bypassed
-  // (only reachable here when config.migration exists, so the operator sees it).
-  if (opts.skipMigrations) {
-    ctx.output.info('[deploy] Skipping schema migrations (--skip-migrations).');
+  // Skip (with a reason-tagged line so incident logs are accurate).
+  if (opts.run === false) {
+    const r = opts.skipReason;
+    let msg: string;
+    if (!r || r.kind === 'flag') {
+      const flag = r && r.kind === 'flag' ? r.flag : 'flag';
+      msg = `[deploy] Skipping ${phase} schema migrations (${flag}).`;
+    } else if (r.kind === 'scoped-subset') {
+      msg = `[deploy] Skipping ${phase} schema migrations: deploy scoped to a subset (other hosts still run the previous WAR). Run a full deploy or 'deploy run ${configName} --post-only' once all hosts are current.`;
+    } else if (r.kind === 'partial-coverage') {
+      msg = `[deploy] Skipping ${phase} schema migrations: ${r.dropped.length} configured host(s) were not deployed (${r.dropped.join(', ')}) — they still run the previous WAR.`;
+    } else {
+      msg = `[deploy] Skipping ${phase} schema migrations: rollout did not fully succeed.`;
+    }
+    ctx.output.info(msg);
     return;
   }
 
-  // --dry-run must NOT execute the migration phase. The migration phase has real
-  // side effects — it applies the routine bundle, mints a dynamic-secrets lease,
-  // and runs migrations against the live DB — so under a dry run we only print the
-  // plan and return. (Previously this ran for real even under --dry-run.)
+  // --dry-run: print the plan only, no side effects.
   if (opts.dryRun) {
-    const m = config.migration;
     ctx.output.info(
-      `[deploy] [dry-run] would run schema migrations before rollout ` +
-        `(role '${m.roleId}', dir '${m.migrationsDir}')`,
+      `[deploy] [dry-run] would run ${phase} schema migrations ` +
+        `(role '${migration.roleId}', dir '${migration.migrationsDir}')`,
     );
-    if (m.routines) {
+    if (migration.routines) {
       ctx.output.info(
-        `[deploy] [dry-run] would apply routine bundle ${m.routines.bundle} v${m.routines.version} before migrations`,
+        `[deploy] [dry-run] would apply routine bundle ${migration.routines.bundle} v${migration.routines.version} before ${phase} migrations`,
       );
     }
     return;
   }
 
-  ctx.output.info('[deploy] Running schema migrations before rollout...');
+  ctx.output.info(`[deploy] Running ${phase} schema migrations...`);
   await runMigrations(ctx, {
     env: configName,
-    roleId: config.migration.roleId,
-    migrationsDir: config.migration.migrationsDir,
-    database: config.migration.database,
-    routines: config.migration.routines,
+    roleId: migration.roleId,
+    migrationsDir: migration.migrationsDir,
+    database: migration.database,
+    routines: migration.routines,
   }, deps);
-  ctx.output.info('[deploy] Migrations complete — proceeding with rollout.');
+  ctx.output.info(`[deploy] ${phase} migrations complete.`);
 }
 
 /**
@@ -324,9 +334,9 @@ export function registerDeployRunCommand(
           //    so a migration failure aborts the deploy before any host is touched.
           //    --dry-run prints the plan without executing (no lease, no bundle apply);
           //    --skip-migrations bypasses the phase entirely.
-          await runMigrationPhase(config, configName, ctx, undefined, {
+          await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined, {
             dryRun: options.dryRun,
-            skipMigrations: options.skipMigrations,
+            run: !options.skipMigrations,
           });
           if (options.migrationsOnly) {
             ctx.output.success(
@@ -688,9 +698,9 @@ export function registerDeployRunCommand(
         // so existing deploy configs without migration settings are unaffected.
         // TODO(T9): validate migration config fields in deploy-config-validate.ts.
         // ═══════════════════════════════════════════════════════════════════
-        await runMigrationPhase(config, configName, ctx, undefined, {
+        await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined, {
           dryRun: options.dryRun,
-          skipMigrations: options.skipMigrations,
+          run: !options.skipMigrations,
         });
         if (options.migrationsOnly) {
           ctx.output.success(
