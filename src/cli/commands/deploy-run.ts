@@ -22,7 +22,13 @@ import {
   parseDeploymentStrategy,
   getStrategyDisplayName,
 } from '../types.js';
-import type { MigrationSkipReason } from '../post-gate.js';
+import {
+  type MigrationSkipReason,
+  computeNoFailures,
+  computeFullCoverage,
+  isScopedDeploy,
+  resolvePostSkipReason,
+} from '../post-gate.js';
 import { resolveDeployPlan } from '../deploy-plan.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { resolveStrategy } from '../strategy-executor.js';
@@ -320,11 +326,9 @@ export function registerDeployRunCommand(
         if (planError || !plan) { ctx.output.error(planError ?? 'invalid deploy plan'); process.exit(1); }
 
         // Required-block checks for -only flags (config-dependent, action-level).
-        if ((options.preOnly || options.migrationsOnly) && !config.migration && !options.postOnly) {
-          if (options.preOnly && !config.migration) {
-            ctx.output.error(`--pre-only requires a pre-deploy migration config; none set on '${configName}'. Use 'deploy config set-migration ${configName} --phase pre ...'.`);
-            process.exit(1);
-          }
+        if (options.preOnly && !config.migration) {
+          ctx.output.error(`--pre-only requires a pre-deploy migration config; none set on '${configName}'. Use 'deploy config set-migration ${configName} --phase pre ...'.`);
+          process.exit(1);
         }
         if (options.postOnly && !config.postMigration) {
           ctx.output.error(`--post-only requires a post-deploy migration config; none set on '${configName}'. Use 'deploy config set-migration ${configName} --phase post ...'.`);
@@ -396,10 +400,17 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
+        // Validate migration blocks before touching any host (flat path — SF6).
+        const flatReport = validateDeployConfig(config);
+        for (const w of flatReport.warnings) ctx.output.warn(w);
+        if (flatReport.errors.length > 0) { for (const e of flatReport.errors) ctx.output.error(e); process.exit(1); }
+
         // Single-host filter (--host / --only) — scope a config deploy to a
         // subset (e.g. a canary) without redeploying every host. Filters into a
         // COPY so the persisted store is never mutated.
         const hostFilter = [...options.host, ...options.only];
+        const configuredHostCount = config.hosts!.length; // pre --host-filter (B1b/B1 coverage baseline)
+        const configuredHosts = [...config.hosts!];
         if (hostFilter.length > 0) {
           const unknown = hostFilter.filter(h => !config!.hosts!.includes(h));
           if (unknown.length > 0) {
@@ -410,6 +421,9 @@ export function registerDeployRunCommand(
           config = { ...config, hosts: config.hosts!.filter(h => hostFilter.includes(h)) };
           ctx.output.info(`Scoped to ${config.hosts!.length} of host(s): ${config.hosts!.join(', ')}`);
         }
+        const flatIsScoped = hostFilter.length > 0
+          ? isScopedDeploy(configuredHosts, config.hosts!)
+          : false;
 
         // Resolve WAR path and get detailed info
         const warPath = resolve(config.warPath!);
@@ -645,6 +659,25 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
+        // ═══════════════════════════════════════════════════════════════════
+        // MIGRATION PHASE — PRE (guarded, runs once before any WAR swap)
+        //
+        // When `config.migration` is present, schema migrations are applied
+        // to the database BEFORE the rolling WAR rollout begins. This means:
+        //   - A migration failure aborts the deploy BEFORE any host is touched.
+        //   - The new schema serves the old WAR during the rolling window
+        //     (expand/contract forward-compat required — see spec §Forward-compat).
+        //
+        // When `config.migration` is absent, this block is skipped entirely
+        // so existing deploy configs without migration settings are unaffected.
+        // The -only shapes (no rollout) were already handled earlier and returned.
+        //
+        // Pre-deploy migrations run here — after both interactive cancel prompts,
+        // before the up-to-date/dry-run returns (so pre isn't silently skipped).
+        // ═══════════════════════════════════════════════════════════════════
+        await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined,
+          { dryRun: options.dryRun, run: plan.runPre });
+
         // Check if all hosts have no changes
         const hostsWithChanges = deployableHosts.filter(h => {
           const analysis = analysisMap.get(h);
@@ -657,6 +690,15 @@ export function registerDeployRunCommand(
           } else {
             ctx.output.success('All hosts up to date - no deployment needed');
           }
+          // No-op rollout: full coverage only if no configured host was dropped.
+          const fullCoverage = computeFullCoverage(deployableHosts.length, configuredHostCount);
+          const dropped = configuredHosts.filter((h) => !deployableHosts.includes(h));
+          const skipReason = resolvePostSkipReason({
+            runPost: plan.runPost, runPostFlag: options.skipMigrations ? '--skip-migrations' : '--skip-post',
+            isScoped: flatIsScoped, fullCoverage, noFailures: true, dropped,
+          });
+          await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
+            { dryRun: options.dryRun, run: skipReason === undefined, skipReason });
           return;
         }
 
@@ -691,6 +733,8 @@ export function registerDeployRunCommand(
               ctx.output.info(`  ${host}: ${describeHost(host)}`);
             }
           }
+          await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
+            { dryRun: true, run: plan.runPost });
           return;
         }
 
@@ -724,25 +768,6 @@ export function registerDeployRunCommand(
           }
         }
 
-        // ═══════════════════════════════════════════════════════════════════
-        // MIGRATION PHASE (Task 8 — guarded, runs once before any WAR swap)
-        //
-        // When `config.migration` is present, schema migrations are applied
-        // to the database BEFORE the rolling WAR rollout begins. This means:
-        //   - A migration failure aborts the deploy BEFORE any host is touched.
-        //   - The new schema serves the old WAR during the rolling window
-        //     (expand/contract forward-compat required — see spec §Forward-compat).
-        //
-        // When `config.migration` is absent, this block is skipped entirely
-        // so existing deploy configs without migration settings are unaffected.
-        // The -only shapes (no rollout) were already handled earlier and returned.
-        // TODO(T9): validate migration config fields in deploy-config-validate.ts.
-        // ═══════════════════════════════════════════════════════════════════
-        await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined, {
-          dryRun: options.dryRun,
-          run: plan.runPre,
-        });
-
         // Execute deployment using Listr2
         const deployResult = await executeListrDeployment(strategy, deployableHosts, {
           ctx,
@@ -760,6 +785,30 @@ export function registerDeployRunCommand(
 
         // Print final summary
         printDeploymentSummary(deployResult, deployableHosts.length, isPlain);
+
+        // ═══════════════════════════════════════════════════════════════════
+        // MIGRATION PHASE — POST (destructive; gated on full-coverage, no-failure rollout)
+        //
+        // Post-deploy migrations must NEVER run while any configured host still
+        // serves the old WAR. The gate below requires: not scoped to a subset,
+        // every configured host was deployed (no drops), and the rollout had no
+        // failures (incl. worker failures).
+        // ═══════════════════════════════════════════════════════════════════
+        const noFailures = computeNoFailures(deployResult);
+        const fullCoverage = computeFullCoverage(deployableHosts.length, configuredHostCount);
+        const dropped = configuredHosts.filter((h) => !deployableHosts.includes(h));
+        const postSkipReason = resolvePostSkipReason({
+          runPost: plan.runPost, runPostFlag: options.skipMigrations ? '--skip-migrations' : '--skip-post',
+          isScoped: flatIsScoped, fullCoverage, noFailures, dropped,
+        });
+        try {
+          await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
+            { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason });
+        } catch (postErr) {
+          ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
+          ctx.output.info(`Re-run just the post phase with: deploy run ${configName} --post-only`);
+          process.exit(1);
+        }
 
         if (deployResult.failed > 0 || deployResult.aborted || deployResult.healthCheckFailed > 0) {
           process.exit(1);
