@@ -49,6 +49,14 @@ export interface RunMigrationsOpts {
   database?: string;
   migrationsDir: string;
   /**
+   * Additional migration directories that share this deploy's schema_migrations
+   * history table (the OTHER phase's dir — e.g. the pre-deploy dir when running the
+   * post-deploy phase). Used ONLY to widen the planner's orphan/checksum integrity
+   * lookup so a migration applied by a sibling phase is not mistaken for a
+   * renamed/deleted file. Absent/empty = single-directory behavior (unchanged).
+   */
+  integrityDirs?: string[];
+  /**
    * Optional server-owned routine bundle to apply BEFORE minting the migrate
    * lease (Step 0). Helpers are provisioned by vault under the persistent
    * routines account — the ephemeral migrate user never owns them, so it
@@ -80,7 +88,7 @@ export interface RunMigrationsDeps {
     password: string;
     ssl: boolean;
   }): Promise<DbHandle>;
-  makeRunner(db: DbHandle, dir: string, appliedBy: string): { run(): Promise<unknown> };
+  makeRunner(db: DbHandle, dir: string, appliedBy: string, integrityDirs?: string[]): { run(): Promise<unknown> };
   /**
    * Override the settle delay applied after db.end() and before revokeOnce().
    * Set to 0 in tests to avoid real waiting.  Production always uses REVOKE_SETTLE_MS.
@@ -125,10 +133,10 @@ export function defaultDeps(client: { post<T>(path: string, body: unknown): Prom
   return {
     client: dynamicClient,
     openDb: openDb as RunMigrationsDeps['openDb'],
-    makeRunner(db, dir, appliedBy) {
+    makeRunner(db, dir, appliedBy, integrityDirs) {
       // In production the db is always a full Db handle (from openDb), so the cast is safe.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return new MigrationRunner(db as any, dir, appliedBy);
+      return new MigrationRunner(db as any, dir, appliedBy, integrityDirs ?? []);
     },
   };
 }
@@ -354,7 +362,7 @@ export async function runMigrations(
     // lease was even minted. run() only CALLs them and applies pending
     // migrations; a status-check short-circuit would still leave pending
     // migrations unapplied while reporting "up to date".
-    const result = await deps.makeRunner(db, opts.migrationsDir, appliedBy).run();
+    const result = await deps.makeRunner(db, opts.migrationsDir, appliedBy, opts.integrityDirs).run();
     info(`[run-migrations] Migrations complete: ${JSON.stringify(result)}`);
   } finally {
     // ── Step 5: Teardown — close DB (best-effort) then revoke ────────────────

@@ -191,13 +191,30 @@ export function validateClassHostOverride(
  * @param opts       - `dryRun` prints the plan only; `run: false` skips with a
  *                     reason-tagged log line built from `skipReason`.
  */
+/**
+ * The OTHER migration phase's directory (post's dir for the pre phase, and vice
+ * versa), as a one-element array for `integrityDirs` — or `[]` when the other phase
+ * is unconfigured or shares this phase's directory. Both phases write to the same
+ * schema_migrations table, so the planner's integrity check must know about the
+ * sibling dir to avoid flagging its rows as orphaned. Pure (zero I/O).
+ */
+export function siblingIntegrityDirs(
+  config: DeployConfig,
+  phase: 'pre-deploy' | 'post-deploy',
+): string[] {
+  const own = phase === 'pre-deploy' ? config.migration?.migrationsDir : config.postMigration?.migrationsDir;
+  const other = phase === 'pre-deploy' ? config.postMigration?.migrationsDir : config.migration?.migrationsDir;
+  if (!other || other === own) return [];
+  return [other];
+}
+
 export async function runMigrationPhase(
   migration: MigrationConfig | undefined,
   phase: 'pre-deploy' | 'post-deploy',
   configName: string,
   ctx: CLIPluginContext,
   deps = migrationDefaultDeps(ctx.client),
-  opts: { dryRun?: boolean; run?: boolean; skipReason?: MigrationSkipReason } = {},
+  opts: { dryRun?: boolean; run?: boolean; skipReason?: MigrationSkipReason; integrityDirs?: string[] } = {},
 ): Promise<void> {
   if (!migration) return;
 
@@ -239,6 +256,10 @@ export async function runMigrationPhase(
     roleId: migration.roleId,
     migrationsDir: migration.migrationsDir,
     database: migration.database,
+    // The sibling phase's dir shares the schema_migrations history table; pass it
+    // so the planner's integrity check treats sibling-applied rows as tracked, not
+    // as orphaned (renamed/deleted) files.
+    integrityDirs: opts.integrityDirs,
     routines: migration.routines,
   }, deps);
   ctx.output.info(`[deploy] ${phase} migrations complete.`);
@@ -356,9 +377,9 @@ export function registerDeployRunCommand(
           }
 
           await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined,
-            { dryRun: options.dryRun, run: plan.runPre });
+            { dryRun: options.dryRun, run: plan.runPre, integrityDirs: siblingIntegrityDirs(config, 'pre-deploy') });
           await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
-            { dryRun: options.dryRun, run: plan.runPost });
+            { dryRun: options.dryRun, run: plan.runPost, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
           ctx.output.success(
             options.dryRun
               ? `[deploy] --dry-run: nothing executed (${options.migrationsOnly ? 'both phases' : options.preOnly ? 'pre only' : 'post only'}).`
@@ -389,6 +410,7 @@ export function registerDeployRunCommand(
           await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined, {
             dryRun: options.dryRun,
             run: plan.runPre,
+            integrityDirs: siblingIntegrityDirs(config, 'pre-deploy'),
           });
           // 4. Run the multi-class deploy (helper below) and exit.
           const mcIsScoped =
@@ -682,7 +704,7 @@ export function registerDeployRunCommand(
         // before the up-to-date/dry-run returns (so pre isn't silently skipped).
         // ═══════════════════════════════════════════════════════════════════
         await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined,
-          { dryRun: options.dryRun, run: plan.runPre });
+          { dryRun: options.dryRun, run: plan.runPre, integrityDirs: siblingIntegrityDirs(config, 'pre-deploy') });
 
         // Check if all hosts have no changes
         const hostsWithChanges = deployableHosts.filter(h => {
@@ -704,7 +726,7 @@ export function registerDeployRunCommand(
             isScoped: flatIsScoped, fullCoverage, noFailures: true, dropped,
           });
           await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
-            { dryRun: options.dryRun, run: skipReason === undefined, skipReason });
+            { dryRun: options.dryRun, run: skipReason === undefined, skipReason, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
           return;
         }
 
@@ -740,7 +762,7 @@ export function registerDeployRunCommand(
             }
           }
           await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
-            { dryRun: true, run: plan.runPost });
+            { dryRun: true, run: plan.runPost, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
           return;
         }
 
@@ -809,7 +831,7 @@ export function registerDeployRunCommand(
         });
         try {
           await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
-            { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason });
+            { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
         } catch (postErr) {
           ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
           ctx.output.info(`Re-run just the post phase with: payara deploy run ${configName} --post-only`);
@@ -960,7 +982,7 @@ async function runMultiClassDeploy(
     );
     printMultiClassDryRun(resolved, effectiveStrategies, isPlain);
     await runMigrationPhase(config.postMigration, 'post-deploy', config.name, ctx, undefined,
-      { dryRun: true, run: plan.runPost });
+      { dryRun: true, run: plan.runPost, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
     return;
   }
 
@@ -1225,7 +1247,7 @@ async function runMultiClassDeploy(
   });
   try {
     await runMigrationPhase(config.postMigration, 'post-deploy', config.name, ctx, undefined,
-      { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason });
+      { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
   } catch (postErr) {
     ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
     ctx.output.info(`Re-run just the post phase with: payara deploy run ${config.name} --post-only`);

@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Db } from './db.js';
 import { preflight } from './db.js';
@@ -31,12 +31,42 @@ export interface RunResult {
 export class MigrationRunner {
   private repo: SchemaMigrationsRepo;
 
+  /**
+   * @param db             The DB handle.
+   * @param migrationsDir  The CURRENT phase's migrations directory — the one whose
+   *                       files are classified and applied.
+   * @param appliedBy      The applied-by identity recorded on each row.
+   * @param integrityDirs  Additional directories that share this DB's
+   *                       schema_migrations history (the OTHER migration phase's dir,
+   *                       e.g. the pre/ dir when this runner is running post/). Used
+   *                       only to widen the orphan/checksum integrity lookup so a row
+   *                       applied by a sibling phase is not mistaken for a
+   *                       renamed/deleted file. Defaults to none (single-dir configs).
+   */
   constructor(
     private readonly db: Db,
     private readonly migrationsDir: string,
     private readonly appliedBy: string,
+    private readonly integrityDirs: string[] = [],
   ) {
     this.repo = new SchemaMigrationsRepo(db);
+  }
+
+  /**
+   * Build the union of migration files across this phase's dir and any sibling
+   * integrity dirs (pre ∪ post), for the planner's integrity lookup. Missing dirs
+   * are skipped defensively (discover() throws on a non-existent path). If two dirs
+   * ever declare the same version prefix, the current phase's file wins the lookup.
+   */
+  private allTrackedFiles(phaseFiles: ReturnType<typeof discover>): ReturnType<typeof discover> {
+    const byVersion = new Map(phaseFiles.map((f) => [f.version, f]));
+    for (const dir of this.integrityDirs) {
+      if (dir === this.migrationsDir || !existsSync(dir)) continue;
+      for (const f of discover(dir)) {
+        if (!byVersion.has(f.version)) byVersion.set(f.version, f);
+      }
+    }
+    return [...byVersion.values()];
   }
 
   /**
@@ -47,7 +77,8 @@ export class MigrationRunner {
   async status(): Promise<{ applied: number; reconcile: number; pending: number }> {
     await preflight(this.db, false); // version-check only; skip read-only check
     await this.repo.ensureTable();
-    const p = plan(discover(this.migrationsDir), await this.repo.all());
+    const phaseFiles = discover(this.migrationsDir);
+    const p = plan(phaseFiles, await this.repo.all(), canonicalChecksumFile, this.allTrackedFiles(phaseFiles));
     return { applied: p.applied.length, reconcile: p.reconcile.length, pending: p.pending.length };
   }
 
@@ -96,8 +127,10 @@ export class MigrationRunner {
       // Step 4: Seed baseline rows for a virgin DB (schema_migrations is empty).
       const seeded = await this.seedBaselineIfVirgin(files);
 
-      // Step 5: Plan.
-      const p = plan(files, await this.repo.all());
+      // Step 5: Plan. Integrity lookup spans this dir ∪ the sibling phase dir(s)
+      // (they share one schema_migrations table); classification stays scoped to
+      // `files` (this phase only ever applies its own directory).
+      const p = plan(files, await this.repo.all(), canonicalChecksumFile, this.allTrackedFiles(files));
 
       // Step 6: Reconcile — asserts-first; re-run body only when asserts are absent
       // or one failed (indicating the migration was only partially applied).

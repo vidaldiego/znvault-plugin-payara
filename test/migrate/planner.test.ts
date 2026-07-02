@@ -68,4 +68,53 @@ describe('plan', () => {
     expect(p.reconcile).toHaveLength(0);
     expect(p.pending).toHaveLength(0);
   });
+
+  // ── Cross-phase integrity (pre/post migration split sharing one history table) ──
+  describe('allTrackedFiles (cross-phase integrity lookup)', () => {
+    it('a row tracked in the SIBLING phase dir is NOT an orphan when in allTrackedFiles', () => {
+      // The post-deploy phase scans only post/ (2026-07-01_002), but the shared
+      // schema_migrations table has rows for the pre/ migrations too. The integrity
+      // check must validate rows against the UNION (pre ∪ post), not just phaseFiles.
+      const phaseFiles = [f('2026-07-01_002')];                 // post/ only (what we apply)
+      const preFile = f('2026-06-30_001');                      // lives in pre/
+      const allTracked = [preFile, ...phaseFiles];              // pre ∪ post
+      const rows = [
+        row('2026-06-30_001_x.sql', true),                     // applied in the pre phase
+        row('2026-07-01_002_x.sql', false),                    // reconcile in this post phase
+      ];
+      // Without allTracked this throws OrphanTrackedRowError on 2026-06-30_001.
+      const p = plan(phaseFiles, rows, () => 'c', allTracked);
+      // Classify/apply is scoped to phaseFiles only — the pre file is NOT re-applied.
+      expect(p.reconcile.map((x) => x.prefix)).toEqual(['2026-07-01_002']);
+      expect(p.applied).toHaveLength(0);   // 2026-06-30_001 is not in phaseFiles → not classified
+      expect(p.pending).toHaveLength(0);
+    });
+
+    it('a GENUINE orphan (row in NEITHER dir) still throws even with allTrackedFiles', () => {
+      const phaseFiles = [f('2026-07-01_002')];
+      const allTracked = [f('2026-06-30_001'), ...phaseFiles];  // pre ∪ post
+      const rows = [
+        row('2026-06-30_001_x.sql', true),                     // ok — in allTracked
+        row('2026-05-01_099_x.sql', true),                     // orphan — in NEITHER dir
+      ];
+      expect(() => plan(phaseFiles, rows, () => 'c', allTracked)).toThrow(OrphanTrackedRowError);
+    });
+
+    it('checksum mismatch is validated against the sibling-dir file too', () => {
+      const phaseFiles = [f('2026-07-01_002')];
+      const preFile = f('2026-06-30_001'); // path '/x'
+      const allTracked = [preFile, ...phaseFiles];
+      const rows = [row('2026-06-30_001_x.sql', true, false, 'STORED')];
+      // The pre row's stored checksum differs from the (sibling) file's checksum → throw.
+      expect(() => plan(phaseFiles, rows, () => 'DIFFERENT', allTracked)).toThrow(ChecksumMismatchError);
+    });
+
+    it('defaults allTrackedFiles to phaseFiles (single-dir configs unchanged)', () => {
+      // When omitted, behavior is byte-identical to the pre-split single-dir path:
+      // a row with no file in phaseFiles is still an orphan.
+      const phaseFiles: ReturnType<typeof f>[] = [];
+      const rows = [row('2026-01-01_001_x.sql', true)];
+      expect(() => plan(phaseFiles, rows, () => 'c')).toThrow(OrphanTrackedRowError);
+    });
+  });
 });

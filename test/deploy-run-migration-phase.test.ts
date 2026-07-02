@@ -28,7 +28,7 @@
  * reason-tagged `skipReason` for accurate incident-log skip lines.
  */
 import { describe, it, expect, vi } from 'vitest';
-import { runMigrationPhase } from '../src/cli/commands/deploy-run.js';
+import { runMigrationPhase, siblingIntegrityDirs } from '../src/cli/commands/deploy-run.js';
 import type { RunMigrationsDeps } from '../src/run-migrations.js';
 import type { DeployConfig, CLIPluginContext } from '../src/cli/types.js';
 
@@ -54,7 +54,8 @@ function makeMockDeps(overrides: {
   return {
     client: { issueCredential: issue, revokeCredential: revoke },
     openDb: vi.fn().mockResolvedValue(mockDbHandle) as RunMigrationsDeps['openDb'],
-    makeRunner: () => ({ run }),
+    // vi.fn so tests can inspect the args forwarded to makeRunner (esp. integrityDirs).
+    makeRunner: vi.fn(() => ({ run })),
   };
 }
 
@@ -572,5 +573,54 @@ describe('runMigrationPhase — generalized (post + reasons)', () => {
     });
     const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
     expect(infoCalls.some((m) => /Skipping pre-deploy/i.test(m) && /--skip-migrations/.test(m))).toBe(true);
+  });
+});
+
+// ── Cross-phase integrity plumbing (pre/post share one schema_migrations table) ──
+
+describe('siblingIntegrityDirs', () => {
+  const cfg = (pre?: string, post?: string): DeployConfig => ({
+    name: 'c',
+    migration: pre ? { roleId: 'r', migrationsDir: pre } : undefined,
+    postMigration: post ? { roleId: 'r', migrationsDir: post } : undefined,
+  } as unknown as DeployConfig);
+
+  it('pre-deploy phase → the POST dir (and vice versa)', () => {
+    expect(siblingIntegrityDirs(cfg('db/pre', 'db/post'), 'pre-deploy')).toEqual(['db/post']);
+    expect(siblingIntegrityDirs(cfg('db/pre', 'db/post'), 'post-deploy')).toEqual(['db/pre']);
+  });
+
+  it('empty when the other phase is unconfigured', () => {
+    expect(siblingIntegrityDirs(cfg('db/pre', undefined), 'pre-deploy')).toEqual([]);
+    expect(siblingIntegrityDirs(cfg(undefined, 'db/post'), 'post-deploy')).toEqual([]);
+  });
+
+  it('empty when both phases share the same dir (no distinct sibling)', () => {
+    expect(siblingIntegrityDirs(cfg('db/same', 'db/same'), 'post-deploy')).toEqual([]);
+  });
+});
+
+describe('runMigrationPhase forwards integrityDirs to runMigrations → makeRunner', () => {
+  it('passes the sibling dir through to makeRunner (4th arg)', async () => {
+    const post = { roleId: 'zincdb-rw', migrationsDir: 'db/post' } as any;
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+    await runMigrationPhase(post, 'post-deploy', 'prod', ctx, deps, {
+      run: true, integrityDirs: ['db/pre'],
+    });
+    // makeRunner(db, dir, appliedBy, integrityDirs) — assert the 4th arg carried the union dir.
+    expect(deps.makeRunner).toHaveBeenCalledTimes(1);
+    const call = (deps.makeRunner as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[1]).toBe('db/post');      // the phase dir
+    expect(call[3]).toEqual(['db/pre']);  // integrityDirs (the sibling)
+  });
+
+  it('forwards undefined integrityDirs for a single-phase config (unchanged behavior)', async () => {
+    const pre = { roleId: 'zincdb-rw', migrationsDir: 'db/pre' } as any;
+    const ctx = makeMockCtx();
+    const deps = makeMockDeps();
+    await runMigrationPhase(pre, 'pre-deploy', 'prod', ctx, deps, { run: true });
+    const call = (deps.makeRunner as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(call[3]).toBeUndefined();
   });
 });

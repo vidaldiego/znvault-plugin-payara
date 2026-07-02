@@ -39,26 +39,39 @@ export class OrphanTrackedRowError extends Error {
  *  - Row with success=1 or baselined=1 → applied.
  *  - Row with success=0 and baselined=0 → reconcile (crashed mid-run).
  *
- * @param files       Discovered migration files (from discover()).
+ * @param files       Migration files for the CURRENT phase's directory (from
+ *                    discover()) — the set that gets classified into apply/reconcile/
+ *                    pending buckets.
  * @param rows        All rows from schema_migrations (from repo.all()).
  * @param checksumOf  Checksum function — injectable for unit tests (defaults to canonicalChecksumFile).
+ * @param allTrackedFiles  The UNION of every migration directory that shares this
+ *                    schema_migrations table (pre ∪ post). Used ONLY for the
+ *                    orphan/checksum integrity lookup, so a row applied in a sibling
+ *                    phase's directory is not mistaken for a renamed/deleted file.
+ *                    Defaults to `files` (single-directory configs are byte-identical
+ *                    to the pre-split behavior). Classification still uses `files`
+ *                    alone — the current phase only ever applies its own directory.
  */
 export function plan(
   files: MigrationFile[],
   rows: MigrationRow[],
   checksumOf: (path: string) => string = canonicalChecksumFile,
+  allTrackedFiles: MigrationFile[] = files,
 ): MigrationPlan {
-  // Build a version→file map for non-0000_ files only (helpers are never tracked).
-  const filesByVersion = new Map(
-    files.filter((f) => !f.version.startsWith('0000_')).map((f) => [f.version, f]),
+  // Integrity lookup spans the UNION of all phase dirs that share the history table.
+  // A shared schema_migrations table (pre/ then post/ against one DB) means the
+  // post phase legitimately sees rows for pre/ migrations whose files live in the
+  // sibling directory — those must NOT be flagged as orphans.
+  const integrityByVersion = new Map(
+    allTrackedFiles.filter((f) => !f.version.startsWith('0000_')).map((f) => [f.version, f]),
   );
 
-  // Integrity pass (matches Kotlin MigrationPlanner.plan exactly):
+  // Integrity pass (matches Kotlin MigrationPlanner.plan exactly, now union-scoped):
   // Iterate every tracked row (non-0000_); throw on the first orphan or mismatch.
   // This runs BEFORE bucket classification so no partially-classified plan is returned.
   for (const row of rows) {
     if (row.version.startsWith('0000_')) continue; // helpers are never tracked
-    const f = filesByVersion.get(row.version);
+    const f = integrityByVersion.get(row.version);
     if (!f) {
       throw new OrphanTrackedRowError(row.version);
     }
