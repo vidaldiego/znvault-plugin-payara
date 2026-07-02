@@ -29,7 +29,7 @@ import {
   isScopedDeploy,
   resolvePostSkipReason,
 } from '../post-gate.js';
-import { resolveDeployPlan } from '../deploy-plan.js';
+import { resolveDeployPlan, type DeployPlan } from '../deploy-plan.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { resolveStrategy } from '../strategy-executor.js';
 import { formatSize } from '../formatters.js';
@@ -54,6 +54,7 @@ import {
   executeMultiClassDeployment,
   printMultiClassDryRun,
   printMultiClassSummary,
+  type RunClassResult,
 } from '../multi-class-deploy.js';
 
 /** Default CA certificate path */
@@ -390,7 +391,12 @@ export function registerDeployRunCommand(
             run: plan.runPre,
           });
           // 4. Run the multi-class deploy (helper below) and exit.
-          await runMultiClassDeploy(ctx, config, options, { openTunnels, isPlain });
+          const mcIsScoped =
+            (options.class.length > 0 &&
+              options.class.length < config.classes!.length) ||
+            // per-class --host override on the single named class (B1c)
+            ((options.class.length === 1) && [...options.host, ...options.only].length > 0);
+          await runMultiClassDeploy(ctx, config, options, plan, mcIsScoped, { openTunnels, isPlain });
           return; // handled — do not fall through to the flat path
         }
 
@@ -865,22 +871,35 @@ interface DeployRunOptions {
  *
  * Wiring:
  * 1. `partitionSelectedClasses` → selected classes in config order.
- * 2. If single --class + scoped strategy/host, apply override to that class.
- * 3. For --dry-run: print plan and return.
+ * 2. If single --class + scoped strategy/host, apply override to that class
+ *    (capturing each class's PRE-override host count for the coverage gate).
+ * 3. For --dry-run: print plan, print the post-deploy plan line, and return.
  * 4. Warn if selected omits an upstream blocking class.
  * 5. Build `runClass(rc)` that per-class:
  *    - Opens tunnels (pushed into shared openTunnels[]).
  *    - Runs preflight for rc.hosts.
  *    - Calls executeListrDeployment with suppressMixedClassWarning:true.
+ *    - Returns `{ ctx, coverageOk }` — coverageOk computed at every return
+ *      path and carried on the return value (not a side-channel map), so
+ *      `executeMultiClassDeployment` can copy it onto `ClassOutcome.coverageOk`
+ *      regardless of how/whether runClass is invoked (e.g. when mocked).
  *    - Closes that class's tunnels in a finally.
  * 6. `executeMultiClassDeployment(resolved, runClass, ctx.output)`.
  * 7. `printMultiClassSummary(result, isPlain)`.
- * 8. `if (result.abortedAt) process.exit(1)`.
+ * 8. Gate + run the post-deploy migration phase: post-deploy migrations are
+ *    DESTRUCTIVE and must NEVER run while any host — in any class, including
+ *    a host dropped by a per-class `--host` override (B1c) — still serves the
+ *    old WAR. Requires: not scoped (`isScoped`), full per-class coverage
+ *    (read from `result.classes[i].coverageOk`), and no rollout failures
+ *    (incl. worker failures), mirroring the flat-path gate.
+ * 9. `if (result.abortedAt) process.exit(1)`.
  */
 async function runMultiClassDeploy(
   ctx: CLIPluginContext,
   config: DeployConfig,
   options: DeployRunOptions,
+  plan: DeployPlan,
+  isScoped: boolean,
   shared: { openTunnels: Tunnel[]; isPlain: boolean },
 ): Promise<void> {
   const { openTunnels, isPlain } = shared;
@@ -892,8 +911,17 @@ async function runMultiClassDeploy(
   // We track each class's scoped strategy override SEPARATELY from rc.strategy (the
   // config-file value) so that resolveClassStrategy() can apply the correct priority:
   //   explicit --class X --strategy  >  --sequential  >  class config strategy
+  //
+  // preOverrideClassHostCount: the PRE-override host count per class, captured
+  // BEFORE any per-class --host/--only filter shrinks rc.hosts. Post-deploy
+  // coverage must compare against this original count, not the shrunk one —
+  // otherwise a per-class --host override (B1c) would make a scoped/partial
+  // deploy look like "full coverage" and destructive post migrations could run
+  // while hosts dropped by the override still serve the old WAR.
+  const preOverrideClassHostCount = new Map<string, number>();
   const resolvedWithOverrides = selectedClasses.map(cls => {
     let rc = resolveClass(config, cls);
+    preOverrideClassHostCount.set(rc.name, rc.hosts.length);
     let scopedStrategyOverride: string | undefined;
 
     // Scoped per-class override: single --class + --strategy/--host.
@@ -914,6 +942,7 @@ async function runMultiClassDeploy(
           process.exit(1);
         }
         // Filter (preserving class order) instead of replacing with the raw array.
+        // preOverrideClassHostCount above was captured BEFORE this rewrite.
         rc = { ...rc, hosts: rc.hosts.filter(h => hostOverride.includes(h)) };
       }
     }
@@ -930,6 +959,8 @@ async function runMultiClassDeploy(
       resolveClassStrategy(rc.strategy, scopedStrategyOverride, options.sequential)
     );
     printMultiClassDryRun(resolved, effectiveStrategies, isPlain);
+    await runMigrationPhase(config.postMigration, 'post-deploy', config.name, ctx, undefined,
+      { dryRun: true, run: plan.runPost });
     return;
   }
 
@@ -959,7 +990,12 @@ async function runMultiClassDeploy(
   );
 
   // 5. Build runClass(rc) — per-class: tunnels + preflight + executeListrDeployment.
-  const runClass = async (rc: typeof resolved[0]) => {
+  // Returns { ctx, coverageOk }: coverageOk is true iff every PRE-override configured
+  // host for this class was deployed (computed at every return path below, including
+  // the early no-hosts/unreachable returns, which always resolve to false — the class
+  // did not fully deploy). Carried on the return value so executeMultiClassDeployment
+  // can copy it onto ClassOutcome.coverageOk — no side-channel map.
+  const runClass = async (rc: typeof resolved[0]): Promise<RunClassResult> => {
     const classTunnels: Tunnel[] = [];
 
     try {
@@ -999,8 +1035,11 @@ async function runMultiClassDeploy(
         ctx.output.error(`[${rc.name}] WAR file not found: ${warPath}`);
         // Return a failed DeployContext — don't throw (let the gate handle it).
         return {
-          results: new Map(), aborted: false, skipped: 0,
-          successful: 0, failed: rc.hosts.length, healthCheckFailed: 0, workerFailed: 0,
+          ctx: {
+            results: new Map(), aborted: false, skipped: 0,
+            successful: 0, failed: rc.hosts.length, healthCheckFailed: 0, workerFailed: 0,
+          },
+          coverageOk: false,
         };
       }
 
@@ -1043,8 +1082,11 @@ async function runMultiClassDeploy(
       if (reachableHosts.length === 0) {
         ctx.output.error(`[${rc.name}] No hosts reachable`);
         return {
-          results: new Map(), aborted: false, skipped: 0,
-          successful: 0, failed: rc.hosts.length, healthCheckFailed: 0, workerFailed: 0,
+          ctx: {
+            results: new Map(), aborted: false, skipped: 0,
+            successful: 0, failed: rc.hosts.length, healthCheckFailed: 0, workerFailed: 0,
+          },
+          coverageOk: false,
         };
       }
 
@@ -1053,8 +1095,11 @@ async function runMultiClassDeploy(
       if (deployableHosts.length === 0) {
         ctx.output.error(`[${rc.name}] No hosts available for deployment`);
         return {
-          results: new Map(), aborted: false, skipped: 0,
-          successful: 0, failed: rc.hosts.length, healthCheckFailed: 0, workerFailed: 0,
+          ctx: {
+            results: new Map(), aborted: false, skipped: 0,
+            successful: 0, failed: rc.hosts.length, healthCheckFailed: 0, workerFailed: 0,
+          },
+          coverageOk: false,
         };
       }
 
@@ -1071,8 +1116,11 @@ async function runMultiClassDeploy(
           ctx.output.success(`[${rc.name}] All hosts up to date — no deployment needed`);
         }
         return {
-          results: new Map(), aborted: false, skipped: 0,
-          successful: deployableHosts.length, failed: 0, healthCheckFailed: 0, workerFailed: 0,
+          ctx: {
+            results: new Map(), aborted: false, skipped: 0,
+            successful: deployableHosts.length, failed: 0, healthCheckFailed: 0, workerFailed: 0,
+          },
+          coverageOk: deployableHosts.length === (preOverrideClassHostCount.get(rc.name) ?? rc.hosts.length),
         };
       }
 
@@ -1086,8 +1134,11 @@ async function runMultiClassDeploy(
           }
           ctx.output.error(`[${rc.name}] Cannot reach all HAProxy hosts. Use --skip-drain to deploy without drain/ready.`);
           return {
-            results: new Map(), aborted: false, skipped: 0,
-            successful: 0, failed: hostsWithChanges.length, healthCheckFailed: 0, workerFailed: 0,
+            ctx: {
+              results: new Map(), aborted: false, skipped: 0,
+              successful: 0, failed: hostsWithChanges.length, healthCheckFailed: 0, workerFailed: 0,
+            },
+            coverageOk: deployableHosts.length === (preOverrideClassHostCount.get(rc.name) ?? rc.hosts.length),
           };
         }
       }
@@ -1106,8 +1157,11 @@ async function runMultiClassDeploy(
       } catch (err) {
         ctx.output.error(`[${rc.name}] ${getErrorMessage(err)}`);
         return {
-          results: new Map(), aborted: false, skipped: 0,
-          successful: 0, failed: hostsWithChanges.length, healthCheckFailed: 0, workerFailed: 0,
+          ctx: {
+            results: new Map(), aborted: false, skipped: 0,
+            successful: 0, failed: hostsWithChanges.length, healthCheckFailed: 0, workerFailed: 0,
+          },
+          coverageOk: deployableHosts.length === (preOverrideClassHostCount.get(rc.name) ?? rc.hosts.length),
         };
       }
 
@@ -1128,7 +1182,11 @@ async function runMultiClassDeploy(
         suppressMixedClassWarning: true,
       };
 
-      return await executeListrDeployment(strategy, deployableHosts, deployOpts);
+      const deployCtx = await executeListrDeployment(strategy, deployableHosts, deployOpts);
+      return {
+        ctx: deployCtx,
+        coverageOk: deployableHosts.length === (preOverrideClassHostCount.get(rc.name) ?? rc.hosts.length),
+      };
     } finally {
       // Close ONLY this class's tunnels; do NOT call clearAllEndpointOverrides()
       // mid-loop — other classes may still have their overrides active.
@@ -1144,6 +1202,35 @@ async function runMultiClassDeploy(
 
   // 7. Print summary.
   printMultiClassSummary(result, isPlain);
+
+  // ═══════════════════════════════════════════════════════════════════
+  // MIGRATION PHASE — POST (destructive; gated on full-coverage, no-failure rollout)
+  //
+  // Mirrors the flat-path gate: post-deploy migrations must NEVER run while
+  // any configured host — across every class, including one dropped by a
+  // per-class --host override (B1c) — still serves the old WAR.
+  // ═══════════════════════════════════════════════════════════════════
+  const noFailures = !result.abortedAt && result.classes.every(
+    (c) => !c.ctx || (c.ctx.failed === 0 && c.ctx.healthCheckFailed === 0 && c.ctx.workerFailed === 0 && !c.ctx.aborted),
+  );
+  // Coverage rides on ClassOutcome.coverageOk (set by executeMultiClassDeployment from
+  // runClass's return value) — NOT a closure side-map — so the gate reads real per-class
+  // data even when executeMultiClassDeployment is mocked. A class that ran must have
+  // coverageOk === true; undefined/false means a host was dropped pre-rollout.
+  const fullCoverage = result.classes.every((c) => !c.ran || c.coverageOk === true);
+  const dropped = result.classes.filter((c) => c.ran && c.coverageOk === false).map((c) => c.name);
+  const postSkipReason = resolvePostSkipReason({
+    runPost: plan.runPost, runPostFlag: options.skipMigrations ? '--skip-migrations' : '--skip-post',
+    isScoped, fullCoverage, noFailures, dropped,
+  });
+  try {
+    await runMigrationPhase(config.postMigration, 'post-deploy', config.name, ctx, undefined,
+      { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason });
+  } catch (postErr) {
+    ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
+    ctx.output.info(`Re-run just the post phase with: deploy run ${config.name} --post-only`);
+    process.exit(1);
+  }
 
   // 8. Exit 1 if aborted.
   if (result.abortedAt) {

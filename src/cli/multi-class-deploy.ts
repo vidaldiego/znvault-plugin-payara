@@ -14,6 +14,26 @@ export interface ClassOutcome {
   ran: boolean;
   ctx?: DeployContext;
   skippedReason?: 'no-hosts' | 'upstream-abort' | 'interrupted';
+  /**
+   * True iff every configured host of this class (measured BEFORE any
+   * per-class --host/--only override shrinks the host list) was deployed —
+   * i.e. no host was dropped ahead of the rollout. Undefined for classes
+   * that didn't run (`ran === false`).
+   *
+   * This gates the post-deploy migration phase: post-deploy migrations are
+   * DESTRUCTIVE, and running them while a dropped host still serves the old
+   * WAR is unsafe. It lives on the returned result (not a side-channel map)
+   * so the tail gate always reads real, per-class data regardless of how
+   * `runClass` is invoked (including when it's mocked in tests).
+   */
+  coverageOk?: boolean;
+}
+
+/** What the injected `runClass` callback must resolve to. */
+export interface RunClassResult {
+  ctx: DeployContext;
+  /** See `ClassOutcome.coverageOk` — computed by the caller-supplied runClass. */
+  coverageOk: boolean;
 }
 
 export interface MultiClassResult {
@@ -105,7 +125,7 @@ export function printMultiClassSummary(result: MultiClassResult, isPlain: boolea
 
 export async function executeMultiClassDeployment(
   resolvedClasses: ResolvedClass[],
-  runClass: (rc: ResolvedClass) => Promise<DeployContext>,
+  runClass: (rc: ResolvedClass) => Promise<RunClassResult>,
   log: { warn(m: string): void; info(m: string): void },
 ): Promise<MultiClassResult> {
   const result: MultiClassResult = { classes: [] };
@@ -123,8 +143,8 @@ export async function executeMultiClassDeployment(
       continue; // a skipped class never gates
     }
 
-    const ctx = await runClass(rc);
-    result.classes.push({ name: rc.name, blocking: rc.blocking, ran: true, ctx });
+    const { ctx, coverageOk } = await runClass(rc);
+    result.classes.push({ name: rc.name, blocking: rc.blocking, ran: true, ctx, coverageOk });
 
     const failed = classGateFailed(ctx);
     if (failed && rc.blocking) {
