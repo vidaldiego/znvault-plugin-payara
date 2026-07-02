@@ -122,7 +122,7 @@ describe('deploy run --skip-migrations (CLI wiring)', () => {
     ]);
 
     expect(exitCode).toBe(1);
-    expect(errors.some((m) => /mutually exclusive/i.test(m))).toBe(true);
+    expect(errors.some((m) => /cannot be combined/i.test(m))).toBe(true);
   });
 
   it('the mutual-exclusion guard does not mask a missing-config error', async () => {
@@ -138,6 +138,6 @@ describe('deploy run --skip-migrations (CLI wiring)', () => {
 
     expect(exitCode).toBe(1);
     expect(errors.some((m) => /not found/i.test(m))).toBe(true);
-    expect(errors.some((m) => /mutually exclusive/i.test(m))).toBe(false);
+    expect(errors.some((m) => /cannot be combined/i.test(m))).toBe(false);
   });
 });

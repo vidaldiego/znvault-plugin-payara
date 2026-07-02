@@ -23,6 +23,7 @@ import {
   getStrategyDisplayName,
 } from '../types.js';
 import type { MigrationSkipReason } from '../post-gate.js';
+import { resolveDeployPlan } from '../deploy-plan.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { resolveStrategy } from '../strategy-executor.js';
 import { formatSize } from '../formatters.js';
@@ -261,6 +262,10 @@ export function registerDeployRunCommand(
     .option('-y, --yes', 'Skip confirmation prompts')
     .option('--migrations-only', 'Run only the schema-migration phase, then stop (skip the WAR rollout)')
     .option('--skip-migrations', 'Deploy the WAR without running the schema-migration phase')
+    .option('--skip-pre', 'Skip the pre-deploy migration phase (still deploys + runs post)')
+    .option('--skip-post', 'Skip the post-deploy migration phase (still runs pre + deploys)')
+    .option('--pre-only', 'Run only the pre-deploy migration phase, then stop (no rollout)')
+    .option('--post-only', 'Run only the post-deploy migration phase, then stop (no rollout) — recovery')
     .action(async (configName: string, options: {
       force?: boolean;
       dryRun?: boolean;
@@ -276,6 +281,10 @@ export function registerDeployRunCommand(
       yes?: boolean;
       migrationsOnly?: boolean;
       skipMigrations?: boolean;
+      skipPre?: boolean;
+      skipPost?: boolean;
+      preOnly?: boolean;
+      postOnly?: boolean;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
       const isPlain = ctx.isPlainMode();
@@ -303,16 +312,54 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
-        // --migrations-only ("only migrate") and --skip-migrations ("never
-        // migrate") are contradictory. Reject before any host is touched.
-        if (options.migrationsOnly && options.skipMigrations) {
-          ctx.output.error('--migrations-only and --skip-migrations are mutually exclusive.');
+        // Resolve the six-flag plan (pure). Contradictions abort before any host.
+        const { plan, error: planError } = resolveDeployPlan({
+          skipMigrations: options.skipMigrations, skipPre: options.skipPre, skipPost: options.skipPost,
+          migrationsOnly: options.migrationsOnly, preOnly: options.preOnly, postOnly: options.postOnly,
+        });
+        if (planError || !plan) { ctx.output.error(planError ?? 'invalid deploy plan'); process.exit(1); }
+
+        // Required-block checks for -only flags (config-dependent, action-level).
+        if ((options.preOnly || options.migrationsOnly) && !config.migration && !options.postOnly) {
+          if (options.preOnly && !config.migration) {
+            ctx.output.error(`--pre-only requires a pre-deploy migration config; none set on '${configName}'. Use 'deploy config set-migration ${configName} --phase pre ...'.`);
+            process.exit(1);
+          }
+        }
+        if (options.postOnly && !config.postMigration) {
+          ctx.output.error(`--post-only requires a post-deploy migration config; none set on '${configName}'. Use 'deploy config set-migration ${configName} --phase post ...'.`);
+          process.exit(1);
+        }
+        if (options.migrationsOnly && !config.migration && !config.postMigration) {
+          ctx.output.error(`--migrations-only requires a migration config; none set on '${configName}'.`);
           process.exit(1);
         }
 
-        if (options.migrationsOnly && !config.migration) {
-          ctx.output.error(`--migrations-only requires a migration config; none set on '${configName}'. Use 'znvault deploy config set-migration ${configName} ...' first.`);
-          process.exit(1);
+        // ── No-rollout shape: the three -only flags. Handle early (before WAR
+        //    resolution / preflight) so --post-only needs no WAR or reachable hosts.
+        if (!plan.runRollout) {
+          // Validate first (parity with the multi-class rollout path).
+          const report = validateDeployConfig(config);
+          for (const w of report.warnings) ctx.output.warn(w);
+          for (const i of report.info) ctx.output.info(i);
+          if (report.errors.length > 0) { for (const e of report.errors) ctx.output.error(e); process.exit(1); }
+
+          // Reject stray scoping flags — meaningless without a rollout.
+          if ([...options.host, ...options.only, ...options.class].length > 0) {
+            ctx.output.error('--host/--only/--class have no effect with --pre-only/--post-only/--migrations-only.');
+            process.exit(1);
+          }
+
+          await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined,
+            { dryRun: options.dryRun, run: plan.runPre });
+          await runMigrationPhase(config.postMigration, 'post-deploy', configName, ctx, undefined,
+            { dryRun: options.dryRun, run: plan.runPost });
+          ctx.output.success(
+            options.dryRun
+              ? `[deploy] --dry-run: nothing executed (${options.migrationsOnly ? 'both phases' : options.preOnly ? 'pre only' : 'post only'}).`
+              : `[deploy] migrations complete (${options.migrationsOnly ? 'pre + post' : options.preOnly ? 'pre' : 'post'}); no rollout.`,
+          );
+          return;
         }
 
         // ── Multi-class branch (Spec §3, §4) ──
@@ -330,22 +377,14 @@ export function registerDeployRunCommand(
             classNames: options.class, strategy: options.strategy, host: [...options.host, ...options.only],
           });
           if (flagCheck.error) { ctx.output.error(flagCheck.error); process.exit(1); }
-          // 3. Run the migration phase (if configured) BEFORE any class rolls out,
-          //    so a migration failure aborts the deploy before any host is touched.
-          //    --dry-run prints the plan without executing (no lease, no bundle apply);
-          //    --skip-migrations bypasses the phase entirely.
+          // 3. Run the pre-deploy migration phase (if configured) BEFORE any class
+          //    rolls out, so a migration failure aborts the deploy before any host
+          //    is touched. --dry-run prints the plan without executing (no lease,
+          //    no bundle apply); the -only shapes were already handled above.
           await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined, {
             dryRun: options.dryRun,
-            run: !options.skipMigrations,
+            run: plan.runPre,
           });
-          if (options.migrationsOnly) {
-            ctx.output.success(
-              options.dryRun
-                ? '[deploy] --dry-run --migrations-only: nothing executed.'
-                : '[deploy] --migrations-only: migrations complete, skipping rollout.',
-            );
-            return;
-          }
           // 4. Run the multi-class deploy (helper below) and exit.
           await runMultiClassDeploy(ctx, config, options, { openTunnels, isPlain });
           return; // handled — do not fall through to the flat path
@@ -696,20 +735,13 @@ export function registerDeployRunCommand(
         //
         // When `config.migration` is absent, this block is skipped entirely
         // so existing deploy configs without migration settings are unaffected.
+        // The -only shapes (no rollout) were already handled earlier and returned.
         // TODO(T9): validate migration config fields in deploy-config-validate.ts.
         // ═══════════════════════════════════════════════════════════════════
         await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined, {
           dryRun: options.dryRun,
-          run: !options.skipMigrations,
+          run: plan.runPre,
         });
-        if (options.migrationsOnly) {
-          ctx.output.success(
-            options.dryRun
-              ? '[deploy] --dry-run --migrations-only: nothing executed.'
-              : '[deploy] --migrations-only: migrations complete, skipping rollout.',
-          );
-          return;
-        }
 
         // Execute deployment using Listr2
         const deployResult = await executeListrDeployment(strategy, deployableHosts, {
@@ -770,6 +802,12 @@ interface DeployRunOptions {
   only: string[];
   class: string[];
   yes?: boolean;
+  migrationsOnly?: boolean;
+  skipMigrations?: boolean;
+  skipPre?: boolean;
+  skipPost?: boolean;
+  preOnly?: boolean;
+  postOnly?: boolean;
 }
 
 /**
