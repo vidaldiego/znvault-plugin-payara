@@ -194,21 +194,61 @@ export function registerConfigCommands(
         } else {
           console.log(`\n  HAProxy: ${ANSI.dim}(not configured)${ANSI.reset}`);
         }
-        // Migration configuration — two phases, each rendered the same way.
-        const renderMigration = (block: MigrationConfig | undefined, label: string, absentNote: string): void => {
-          if (!block) { console.log(`\n  ${label}: ${ANSI.dim}(${absentNote})${ANSI.reset}`); return; }
-          console.log(`\n  ${label}:`);
-          console.log(`    Role:     ${block.roleId}`);
-          console.log(`    Dir:      ${block.migrationsDir}`);
-          console.log(block.database
-            ? `    Database: ${block.database} (override)`
-            : `    Database: ${ANSI.dim}(from Vault dynamic-secrets connection)${ANSI.reset}`);
-          console.log(block.routines
-            ? `    Routines: ${block.routines.bundle} v${block.routines.version} (applied before migrations)`
-            : `    Routines: ${ANSI.dim}(none — migration engine assumes helpers already exist)${ANSI.reset}`);
+        // Migration configuration — two phases. When both phases share the same
+        // role AND database, the shared settings are hoisted to a common
+        // `Migration:` header and each phase nests only its per-phase fields
+        // (dir + bundle); otherwise each phase is rendered standalone.
+        const renderMigrationSections = (): void => {
+          const pre = config.migration;
+          const post = config.postMigration;
+          const dbLine = (block: MigrationConfig, indent: string): string =>
+            block.database
+              ? `${indent}Database: ${block.database} (override)`
+              : `${indent}Database: ${ANSI.dim}(from Vault dynamic-secrets connection)${ANSI.reset}`;
+          // `pad` is the full padded label (e.g. 'Bundle:   ' or 'Bundle: ') so
+          // the caller controls column alignment for its context (standalone lines
+          // align to 'Database:'; nested lines align to 'Dir:'/'Bundle:').
+          const bundleLine = (block: MigrationConfig, indent: string, pad: string): string =>
+            block.routines
+              ? `${indent}${pad}${block.routines.bundle} v${block.routines.version} (applied before migrations)`
+              : `${indent}${pad}${ANSI.dim}(none — migration engine assumes helpers already exist)${ANSI.reset}`;
+
+          // Standalone render for a single phase (used when phases don't share
+          // settings, or only one phase is configured).
+          const renderStandalone = (block: MigrationConfig | undefined, label: string, absentNote: string): void => {
+            if (!block) { console.log(`\n  ${label}: ${ANSI.dim}(${absentNote})${ANSI.reset}`); return; }
+            console.log(`\n  ${label}:`);
+            console.log(`    Role:     ${block.roleId}`);
+            console.log(`    Dir:      ${block.migrationsDir}`);
+            console.log(dbLine(block, '    '));
+            console.log(bundleLine(block, '    ', 'Bundle:   ')); // aligns to 'Database:'
+          };
+
+          // Both phases present AND sharing the same role + database override →
+          // hoist the shared settings and nest the per-phase dir + bundle.
+          const sharesConnection =
+            !!pre && !!post &&
+            pre.roleId === post.roleId &&
+            (pre.database ?? undefined) === (post.database ?? undefined);
+
+          if (sharesConnection && pre && post) {
+            console.log(`\n  Migration:`);
+            console.log(`    Role:     ${pre.roleId}`);
+            console.log(dbLine(pre, '    '));
+            // Nested phase blocks: align 'Dir:' and 'Bundle:' to each other.
+            console.log(`    Pre-deploy:`);
+            console.log(`      Dir:    ${pre.migrationsDir}`);
+            console.log(bundleLine(pre, '      ', 'Bundle: '));
+            console.log(`    Post-deploy:`);
+            console.log(`      Dir:    ${post.migrationsDir}`);
+            console.log(bundleLine(post, '      ', 'Bundle: '));
+            return;
+          }
+
+          renderStandalone(pre, 'Migration (pre-deploy)', 'not configured — pre-deploy migrations will be skipped');
+          renderStandalone(post, 'Migration (post-deploy)', 'not configured — no post-deploy migrations');
         };
-        renderMigration(config.migration, 'Migration (pre-deploy)', 'not configured — pre-deploy migrations will be skipped');
-        renderMigration(config.postMigration, 'Migration (post-deploy)', 'not configured — no post-deploy migrations');
+        renderMigrationSections();
 
         // Node classes (multi-class configs). A multi-class config carries its
         // hosts/strategy/haproxy PER CLASS, so the flat "Hosts"/"HAProxy" sections
@@ -306,6 +346,11 @@ export function registerConfigCommands(
             ? '(no rollout in this config — runs via --post-only/--migrations-only)'
             : 'only if the rollout succeeded (all hosts on the new WAR, no failures)';
           console.log(`    ${step++}. Run post-deploy schema migrations (role ${config.postMigration.roleId}; ${annot})`);
+          // Point-of-no-return callout: post-deploy migrations are the rollback
+          // boundary — they may apply destructive/contract changes, after which
+          // rolling back to the previous application version may no longer be safe.
+          console.log(`       ${ANSI.yellow}⚠ point of no return: post-deploy migrations may apply destructive changes;${ANSI.reset}`);
+          console.log(`       ${ANSI.yellow}  rollback to the previous application version may no longer be possible.${ANSI.reset}`);
         }
 
         console.log();

@@ -274,21 +274,33 @@ out before any host is touched):
 | `--pre-only` | ✅ | ❌ | ❌ (stop) |
 | `--post-only` | ❌ | ✅ | ❌ (recovery) |
 
-`deploy config show <cfg>` renders both phases and the ordered execution plan:
+`deploy config show <cfg>` renders both phases and the ordered execution plan.
+When both phases use the same role + database, the shared settings are shown once
+under a common `Migration:` header, with each phase nested beneath it:
 
 ```
-  Migration (pre-deploy):
+  Migration:
     Role:     zincdb-rw
-    Dir:      docs/migrations/pre
-  Migration (post-deploy):
-    Role:     zincdb-rw
-    Dir:      docs/migrations/post
+    Database: (from Vault dynamic-secrets connection)
+    Pre-deploy:
+      Dir:    docs/migrations/pre
+      Bundle: znapi-helpers v1 (applied before migrations)
+    Post-deploy:
+      Dir:    docs/migrations/post
+      Bundle: znapi-helpers v1 (applied before migrations)
 
   Execution plan (what 'deploy run staging' does, in order):
-    1. Run pre-deploy schema migrations (role zincdb-rw; aborts the deploy on failure)
-    2. Roll out hosts (…)
-    3. Run post-deploy schema migrations (role zincdb-rw; only if the rollout succeeded)
+    1. Apply routine bundle znapi-helpers v1 (pre-deploy, before any host is touched; …)
+    2. Run pre-deploy schema migrations (role zincdb-rw; aborts the deploy on failure)
+    3. Roll out hosts (…)
+    4. Apply routine bundle znapi-helpers v1 (re-applied post-deploy before post-deploy migrations)
+    5. Run post-deploy schema migrations (role zincdb-rw; only if the rollout succeeded)
+       ⚠ point of no return: post-deploy migrations may apply destructive changes;
+         rollback to the previous application version may no longer be possible.
 ```
+
+(If the two phases use different roles or databases, each renders under its own
+`Migration (pre-deploy):` / `Migration (post-deploy):` section instead.)
 
 > In a **multi-class** config, scoping also counts when a per-class `--host`
 > override narrows the one named class — even if `--class` names every class — so

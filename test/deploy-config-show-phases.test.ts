@@ -14,6 +14,13 @@ vi.mock('../src/cli/config-store.js', () => ({
         migration: { roleId: 'rp', migrationsDir: 'db/pre', routines: { bundle: 'znapi-helpers', version: 1 } },
         postMigration: { roleId: 'rq', migrationsDir: 'db/post', routines: { bundle: 'znapi-helpers', version: 1 } },
       },
+      // Both phases share the same role (and both derive the DB from the same
+      // Vault connection) → the two-phase render deduplicates the shared settings.
+      shared: {
+        name: 'shared', hosts: ['h1'], warPath: '/x.war', strategy: 'sequential',
+        migration: { roleId: 'dbr_shared', migrationsDir: 'db/pre', routines: { bundle: 'znapi-helpers', version: 1 } },
+        postMigration: { roleId: 'dbr_shared', migrationsDir: 'db/post', routines: { bundle: 'znapi-helpers', version: 1 } },
+      },
       'pre-only': {
         name: 'pre-only', hosts: ['h1'], warPath: '/x.war', strategy: 'sequential',
         migration: { roleId: 'rp', migrationsDir: 'db/pre' },
@@ -62,6 +69,44 @@ describe('config show — two phases', () => {
     // "re-applied post-deploy" so it never reads as running the bundle twice.
     const all = await runShow('stg');
     expect(all).toMatch(/re-applied post-deploy before post-deploy migrations/);
+  });
+
+  it('names the routine field "Bundle:" (consistent with "Apply routine bundle")', async () => {
+    const all = await runShow('stg');
+    expect(all).toMatch(/Bundle:\s+znapi-helpers v1/);
+    expect(all).not.toMatch(/Routines:/); // renamed away from the old label
+  });
+
+  it('warns that post-deploy migrations are the point of no return', async () => {
+    const all = await runShow('stg');
+    expect(all).toMatch(/point of no return/i);
+    expect(all).toMatch(/rollback to the previous application version may no longer be possible/i);
+  });
+
+  it('deduplicates shared role + database under a common Migration section', async () => {
+    // Both phases share roleId 'dbr_shared' and derive the DB from the same
+    // connection → the render hoists Role/Database once and nests Pre-deploy/Post-deploy.
+    const all = await runShow('shared');
+    // A single common header, not two "Migration (pre-deploy)/(post-deploy)" headers.
+    expect(all).toMatch(/\n\s*Migration:/);
+    expect(all).not.toMatch(/Migration \(pre-deploy\)/);
+    expect(all).not.toMatch(/Migration \(post-deploy\)/);
+    // Within the MIGRATION CONFIG section (before the execution plan), the shared
+    // role is printed exactly once — the plan may still name the role per step.
+    const configSection = all.slice(0, all.indexOf('Execution plan'));
+    expect(configSection.match(/dbr_shared/g)?.length).toBe(1);
+    expect(all).toMatch(/Pre-deploy:/);
+    expect(all).toMatch(/Post-deploy:/);
+    // Each phase still shows its own dir + bundle.
+    expect(all).toMatch(/db\/pre/);
+    expect(all).toMatch(/db\/post/);
+  });
+
+  it('does NOT deduplicate when the two phases use different roles', async () => {
+    // 'stg' has roleId rp (pre) vs rq (post) → standalone render, both headers present.
+    const all = await runShow('stg');
+    expect(all).toMatch(/Migration \(pre-deploy\)/);
+    expect(all).toMatch(/Migration \(post-deploy\)/);
   });
 
   it('renders pre-only config with an absent post-deploy note and no post plan step', async () => {
