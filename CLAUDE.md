@@ -118,6 +118,50 @@ plan), class-scoped `--strategy`/`--host` (need exactly one `--class`),
 Guide: README → "Multi-class configs". Design:
 `../docs/superpowers/specs/2026-06-23-multi-class-deploy-design.md`.
 
+### Migration phases (`deploy run`, v1.28.0)
+
+A deploy config may carry **two** schema-migration blocks: `migration` (pre-deploy,
+runs BEFORE any host) and `postMigration` (post-deploy, runs ONLY after a fully
+successful rollout). Post-deploy exists for **destructive** changes (drop
+column/table, remove routines) that are unsafe while old-WAR instances are still
+live. Both are the same `MigrationConfig` shape (role, dir, optional database,
+optional routines). **Pre and post MUST use different `migrationsDir` folders** —
+the engine applies all-pending-per-dir, so a shared dir makes the post phase a
+silent no-op; `validateDeployConfig` warns on equal dirs.
+
+Ordered plan: apply pre routines → pre migrations → deploy all classes →
+post migrations.
+
+**The post-deploy gate (load-bearing, safety-critical):** post runs iff
+`noFailures && fullCoverage && !isScoped` — every configured host reached the new
+WAR with no failures, none dropped pre-rollout, and the deploy wasn't scoped.
+Unlike `classGateFailed` (the exit-code gate, which **excludes** `workerFailed`),
+the post gate's `noFailures` **includes** `workerFailed` and per-class `aborted` —
+a failed worker is a live old-WAR instance, so destructive SQL must not run.
+Skip-reason precedence (each logged): `flag > scoped-subset > partial-coverage >
+rollout-failed`. Coverage is captured BEFORE any `--host` filter (flat:
+`configuredHostCount`; multi-class: `preOverrideClassHostCount` before the per-class
+`--host` rewrite — closes the B1c "name all classes but narrow via `--host`"
+footgun) and rides on `ClassOutcome.coverageOk`.
+
+**Six flags** → resolved once by `resolveDeployPlan` to `{runPre,runPost,runRollout}`:
+`--skip-migrations` (skip both), `--skip-pre`, `--skip-post`, `--migrations-only`
+(run BOTH phases, no rollout), `--pre-only`, `--post-only` (recovery: post only, no
+rollout). Contradictory combos error before any host is touched. `-only` flags take
+an early no-rollout branch (need no WAR/preflight).
+
+**Key files** — `deploy-plan.ts` (`resolveDeployPlan`, pure six-flag resolver),
+`post-gate.ts` (`computeNoFailures`, `computeFullCoverage`, `isScopedDeploy`,
+`resolvePostSkipReason`, pure), `runMigrationPhase` + the flat/multi-class gate
+wiring in `commands/deploy-run.ts`, `ClassOutcome.coverageOk` in
+`multi-class-deploy.ts`.
+
+**CLI:** `deploy config set-migration <cfg> --phase pre|post --role <r> --dir <d>`
+(`--clear` is phase-scoped); the six `deploy run` flags above; `deploy config show`
+renders both phases + the execution plan. Guide: README → migration flags. Design:
+`../docs/superpowers/specs/2026-07-02-post-deploy-migration-phase-design.md`; runbook:
+`../docs/superpowers/runbooks/2026-07-02-post-deploy-migration-phase-rollout.md`.
+
 ## Testing
 
 Tests use **Vitest** with mocked Payara/agent dependencies.

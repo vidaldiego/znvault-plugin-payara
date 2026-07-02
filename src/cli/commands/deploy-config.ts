@@ -734,8 +734,8 @@ export function registerConfigCommands(
     .option('--database <db>', 'DB name override (normally Vault connection provides it)')
     .option('--routines-bundle <name>', 'Routine bundle name to apply before migrations (requires --routines-version)')
     .option('--routines-version <n>', 'Routine bundle version to apply before migrations (requires --routines-bundle)')
-    .option('--clear', 'Remove the migration config from this deploy config')
-    .option('--phase <pre|post>', 'Which migration phase to set (pre = before rollout, post = after successful rollout)', 'pre')
+    .option('--clear', 'Remove the migration config for the selected --phase (pre by default)')
+    .option('--phase <pre|post>', 'Which migration phase to set or clear (pre = before rollout, post = after successful rollout)', 'pre')
     .action(async (name: string, options: {
       role?: string;
       dir?: string;

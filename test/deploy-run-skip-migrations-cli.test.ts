@@ -110,7 +110,7 @@ describe('deploy run --skip-migrations (CLI wiring)', () => {
 
     const opt = run.options.find((o) => o.long === '--skip-migrations');
     expect(opt).toBeDefined();
-    expect(opt!.description).toMatch(/without running the schema-migration phase/i);
+    expect(opt!.description).toMatch(/without running any schema migrations/i);
   });
 
   it('rejects --migrations-only + --skip-migrations with exit 1 and a clear message', async () => {

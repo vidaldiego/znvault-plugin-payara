@@ -209,25 +209,13 @@ znvault deploy to staging --dry-run
 # Sequential deployment (one host at a time)
 znvault deploy to staging --sequential
 
-# Skip the schema-migration phase (deploy the WAR without running migrations).
-# Only relevant when the config has a migration block; otherwise a no-op.
-# Mutually exclusive with --migrations-only.
+# Skip ALL schema migrations (deploy the WAR without running any migrations).
+# No-op unless the config has a migration/postMigration block.
 znvault deploy to staging --skip-migrations
 
 # Post-deploy migrations: run destructive schema changes AFTER a successful
-# rollout (they run only when every host is on the new WAR). Configure a
-# separate directory:
+# rollout (see the "Migration phases" section below for the full rules).
 znvault deploy config set-migration staging --phase post --role zincdb-rw --dir docs/migrations/post
-
-# Migration phase flags (deploy run):
-#   --skip-migrations   deploy WARs only, no migrations
-#   --skip-pre          skip pre-deploy migrations (still deploy + post)
-#   --skip-post         skip post-deploy migrations (still pre + deploy)
-#   --migrations-only   run both phases, no rollout
-#   --pre-only          run only pre-deploy migrations, no rollout
-#   --post-only         run only post-deploy migrations, no rollout (recovery)
-# Post-deploy migrations are skipped (with a reason) on a scoped deploy
-# (--host/--class), a dropped/unreachable host, or any rollout failure.
 znvault deploy to staging --skip-post
 
 # Manage configs
@@ -237,6 +225,74 @@ znvault deploy config add-host staging 172.16.220.58
 znvault deploy config set staging war /new/path.war
 znvault deploy config delete staging
 ```
+
+### Migration phases (`deploy run`)
+
+A deploy config may carry **two** schema-migration blocks:
+
+- **`migration`** (pre-deploy) — runs **before** any host is deployed. A failure
+  aborts the deploy before any host is touched. Set with `--phase pre` (default).
+- **`postMigration`** (post-deploy) — runs **only after a fully successful
+  rollout**. Use it for **destructive** changes (drop column/table, remove
+  routines) that are unsafe while old-WAR instances are still serving. Set with
+  `--phase post`.
+
+The full execution order is: apply pre routines → **pre migrations** → deploy all
+hosts/classes → **post migrations**.
+
+> ⚠️ **Pre and post MUST use different `migrationsDir` folders.** The migration
+> engine applies *all pending files* in a directory and records what it applied,
+> so pointing both phases at the same folder makes the post phase a **silent
+> no-op** (the pre phase already applied everything). `znvault deploy config
+> validate <cfg>` warns when the two dirs match.
+
+**Post-deploy migrations are skipped (with a logged reason) when it is unsafe to
+run destructive SQL** — i.e. when any host might still be on the old WAR:
+
+| Skip reason | When |
+|-------------|------|
+| `scoped-subset` | The deploy was scoped with `--host`/`--only`/`--class` to a proper subset. |
+| `partial-coverage` | A configured host was dropped pre-rollout (unreachable / failed analysis), even with `-y` and no flag. |
+| `rollout-failed` | Any host failed — **including a non-blocking worker node**. |
+
+> Note: the post-deploy gate is *stricter* than the deploy's own exit code. A
+> failed **worker** node does not abort the rollout or change the exit code, but it
+> **does** skip post-deploy migrations, because that worker is still running the old
+> WAR. `--post-only` is the sanctioned way to run the post phase later, once every
+> host is current.
+
+**Migration flags on `deploy run`** (resolved together; contradictory combos error
+out before any host is touched):
+
+| Flag | Pre | Post | Rollout |
+|------|:---:|:---:|:---:|
+| *(none)* | ✅ | ✅ (if rollout OK) | ✅ |
+| `--skip-migrations` | ❌ | ❌ | ✅ |
+| `--skip-pre` | ❌ | ✅ | ✅ |
+| `--skip-post` | ✅ | ❌ | ✅ |
+| `--migrations-only` | ✅ | ✅ | ❌ (stop) |
+| `--pre-only` | ✅ | ❌ | ❌ (stop) |
+| `--post-only` | ❌ | ✅ | ❌ (recovery) |
+
+`deploy config show <cfg>` renders both phases and the ordered execution plan:
+
+```
+  Migration (pre-deploy):
+    Role:     zincdb-rw
+    Dir:      docs/migrations/pre
+  Migration (post-deploy):
+    Role:     zincdb-rw
+    Dir:      docs/migrations/post
+
+  Execution plan (what 'deploy run staging' does, in order):
+    1. Run pre-deploy schema migrations (role zincdb-rw; aborts the deploy on failure)
+    2. Roll out hosts (…)
+    3. Run post-deploy schema migrations (role zincdb-rw; only if the rollout succeeded)
+```
+
+> In a **multi-class** config, scoping also counts when a per-class `--host`
+> override narrows the one named class — even if `--class` names every class — so
+> post-deploy is still skipped as `scoped-subset` in that case.
 
 ### Tunneled Deployment (`tunnel: true`)
 
@@ -748,6 +804,12 @@ npm run lint
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v1.28.0
+- **Post-deploy migration phase.** A deploy config may now carry a second migration block, `postMigration`, that runs **only after a fully successful, unscoped rollout** — for **destructive** schema changes (drop column/table, remove routines) that are unsafe while old-WAR instances are still serving. Full execution order: pre routines → **pre migrations** → deploy all hosts/classes → **post migrations**. The post-deploy gate is deliberately stricter than the deploy's exit code: it skips (with a logged reason — `scoped-subset`, `partial-coverage`, or `rollout-failed`) whenever any host might still be on the old WAR, **including a failed non-blocking worker** or a host dropped pre-rollout. Six flags control which phases run: `--skip-migrations` (skip both), `--skip-pre`, `--skip-post`, `--migrations-only` (run both phases, no rollout), `--pre-only`, `--post-only` (recovery); contradictory combos error before any host is touched. Author phases with `deploy config set-migration <cfg> --phase pre|post …`; `deploy config show` renders both phases + the execution plan. **Pre and post must use separate `migrationsDir` folders** (`deploy config validate` warns if they match). **Existing single-`migration` configs are unchanged** (full back-compat). See [Migration phases](#migration-phases-deploy-run).
+
+### v1.27.0
+- **`--skip-migrations` flag.** `znvault deploy run` gained `--skip-migrations` to deploy the WAR without running the schema-migration phase, even when the config declares one (no-op when it doesn't). Mutually exclusive with `--migrations-only`. Superseded/expanded by the six-flag model in v1.28.0.
 
 ### v1.22.0
 - **Multi-class deploy.** A deploy config may now carry an ordered `classes` block so `znvault deploy run <env>` deploys **every node class** (api, worker, future) as ordered phases of one deploy. Each class is self-describing — its own `strategy`, `blocking`, `haproxy` (drain), `quiesce`, and may override shared config-level defaults (`warPath`, `port`, `tunnel`, `ssh`, `tls`, `healthCheck`). Classes deploy in array order with a **blocking gate**: a blocking class (default: has a non-empty `haproxy.serverMap`) must succeed — including health checks — before the next class runs; a non-blocking class (e.g. a scheduler worker) warns on failure but never aborts the run. New CLI: `--class <name>` (repeatable, scopes to a subset in config order), per-class `--dry-run` plan, class-scoped `--strategy`/`--host`, and `znvault deploy config validate <cfg>` (static, zero-network checks). **Flat configs are unchanged** (full back-compat); `classes` is mutually exclusive with a top-level `hosts`. `quiesce`/`hostConfigs` are per-class only. Authoring multi-class configs is hand-edit-JSON for now (`validate` is the safety net). See [Multi-class configs](#multi-class-configs). Builds on the v1.21.1 per-node-class model.
