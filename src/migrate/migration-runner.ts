@@ -9,6 +9,7 @@ import { canonicalChecksumFile } from './checksum.js';
 import { splitStatements } from './sql-splitter.js';
 import { plan } from './migration-planner.js';
 import * as lock from './migration-lock.js';
+import { readScaffoldingSql, dropDefinerObjects } from './scaffolding.js';
 
 export interface RunResult {
   seeded: number;
@@ -42,12 +43,21 @@ export class MigrationRunner {
    *                       only to widen the orphan/checksum integrity lookup so a row
    *                       applied by a sibling phase is not mistaken for a
    *                       renamed/deleted file. Defaults to none (single-dir configs).
+   * @param scaffolding    Optional migration-helper scaffolding config for THIS phase.
+   *                       When set, `run()` applies `<migrationsDir>/<filename>` at the
+   *                       start of the phase (after discover(), before seeding/reconcile/
+   *                       pending) and, unconditionally, drops every object the given
+   *                       `leaseUser` defined once the reconcile+pending work concludes
+   *                       (success or failure) — see the ordering note on run(). Undefined
+   *                       (the default) means no scaffolding: byte-identical to the
+   *                       pre-scaffolding runner.
    */
   constructor(
     private readonly db: Db,
     private readonly migrationsDir: string,
     private readonly appliedBy: string,
     private readonly integrityDirs: string[] = [],
+    private readonly scaffolding?: { filename: string; leaseUser: string },
   ) {
     this.repo = new SchemaMigrationsRepo(db);
   }
@@ -89,10 +99,16 @@ export class MigrationRunner {
    *  1. preflight(requireWritePrimary=true) — refuse read-only replicas.
    *  2. ensureTable() BEFORE the lock (the only pre-lock mutation, per Kotlin parity).
    *  3. acquire(db) — GET_LOCK.
+   *  3a. scaffolding (if configured) — apply THIS phase's helper objects (migration_utils.sql
+   *      or equivalent) before any seeding/reconcile/pending work touches the DB.
    *  4. seedBaselineIfVirgin — seed baselined rows when schema_migrations is empty.
    *  5. plan() — classify remaining files.
    *  6. reconcile — asserts-first; re-run body only when unmet or no asserts.
    *  7. pending — claim(success=0) → exec → markSuccess(success=1).
+   *  7a. finally (nested, scoped to 6+7): scaffolding cleanup — if configured and the
+   *      lock is still held, drop every object the lease user defined
+   *      (dropDefinerObjects), unconditionally — runs whether 6/7 succeeded or threw.
+   *      A cleanup failure is logged, never rethrown (must not mask a primary error).
    *  8. finally: release lock; if release was not clean and no primary error, throw tripwire.
    *
    * The `zn_*` helper procedures (0000_ files) are NO LONGER created here. They are
@@ -124,6 +140,17 @@ export class MigrationRunner {
       // them too, so they are inert as far as this engine is concerned. See the
       // class doc comment on run() for why per-run creation was removed.
 
+      // Step 3a: Scaffolding — create THIS phase's migration-helper objects (dropped
+      // after reconcile+pending, unconditionally — see the finally block below).
+      // Applied before any seeding/reconcile/pending work so bodies can CALL them.
+      if (this.scaffolding) {
+        const { statements } = readScaffoldingSql(this.migrationsDir, this.scaffolding.filename);
+        for (const stmt of statements) {
+          await this.requireLockHeld();
+          await this.db.query(stmt);
+        }
+      }
+
       // Step 4: Seed baseline rows for a virgin DB (schema_migrations is empty).
       const seeded = await this.seedBaselineIfVirgin(files);
 
@@ -132,27 +159,49 @@ export class MigrationRunner {
       // `files` (this phase only ever applies its own directory).
       const p = plan(files, await this.repo.all(), canonicalChecksumFile, this.allTrackedFiles(files));
 
-      // Step 6: Reconcile — asserts-first; re-run body only when asserts are absent
-      // or one failed (indicating the migration was only partially applied).
       let reconciled = 0;
-      for (const f of p.reconcile) {
-        await this.requireLockHeld();
-        await this.reconcile(f.path);
-        reconciled++;
-      }
-
-      // Step 7: Pending — claim(success=0) → execute body → markSuccess(success=1).
-      // A throw in executeStatements leaves the row at success=0 for later reconcile.
       let applied = 0;
-      for (const f of p.pending) {
-        await this.requireLockHeld();
-        const checksum = canonicalChecksumFile(f.path);
-        await this.repo.claim(f.version, checksum, this.appliedBy); // autocommit → durable
-        const start = Date.now();
-        await this.executeStatements(f.path); // throws → row stays success=0
-        await this.requireLockHeld();
-        await this.repo.markSuccess(f.version, Date.now() - start);
-        applied++;
+      try {
+        // Step 6: Reconcile — asserts-first; re-run body only when asserts are absent
+        // or one failed (indicating the migration was only partially applied).
+        for (const f of p.reconcile) {
+          await this.requireLockHeld();
+          await this.reconcile(f.path);
+          reconciled++;
+        }
+
+        // Step 7: Pending — claim(success=0) → execute body → markSuccess(success=1).
+        // A throw in executeStatements leaves the row at success=0 for later reconcile.
+        for (const f of p.pending) {
+          await this.requireLockHeld();
+          const checksum = canonicalChecksumFile(f.path);
+          await this.repo.claim(f.version, checksum, this.appliedBy); // autocommit → durable
+          const start = Date.now();
+          await this.executeStatements(f.path); // throws → row stays success=0
+          await this.requireLockHeld();
+          await this.repo.markSuccess(f.version, Date.now() - start);
+          applied++;
+        }
+      } finally {
+        // Step 7a: Scaffolding cleanup — drop every object the lease user defined,
+        // so the ephemeral migrate user is never left a DEFINER (ER-4006). Runs
+        // whether the reconcile/pending block above succeeded or threw (unconditional),
+        // but ONLY when scaffolding is configured AND the lock is still held (a lost
+        // lock means another runner may be concurrently active — do not touch the DB).
+        if (this.scaffolding && (await this.lockHeld())) {
+          try {
+            await dropDefinerObjects(this.db, this.scaffolding.leaseUser);
+          } catch (cleanupErr) {
+            // Log but do not rethrow — this must never mask a primary phase error.
+            // A failed/partial sweep surfaces later via the eventual DROP USER
+            // re-hitting ER-4006, which is visible and actionable.
+            console.warn(
+              `scaffolding cleanup (dropDefinerObjects) failed for lease user '${this.scaffolding.leaseUser}': ${
+                cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)
+              }`,
+            );
+          }
+        }
       }
 
       return { seeded, reconciled, applied, pendingRemaining: 0 };
@@ -183,6 +232,15 @@ export class MigrationRunner {
         'Lost the migration lock mid-run (session killed or reconnected). Aborting to avoid concurrent DDL.',
       );
     }
+  }
+
+  /**
+   * Non-throwing counterpart to requireLockHeld() — used by cleanup paths (e.g.
+   * scaffolding's finally block) that must NOT touch the DB once the lock is lost,
+   * but also must not themselves throw while already unwinding another error.
+   */
+  private async lockHeld(): Promise<boolean> {
+    return lock.isHeld(this.db);
   }
 
   /**
