@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { readScaffoldingSql, dropDefinerObjects } from '../../src/migrate/scaffolding.js';
 
 const SQL = [
@@ -30,6 +30,32 @@ describe('readScaffoldingSql', () => {
   it('throws a clear error when the file is missing', () => {
     const dir = tmpDirWith('present.sql', SQL);
     expect(() => readScaffoldingSql(dir, 'absent.sql')).toThrow(/scaffolding file.*absent\.sql/i);
+  });
+});
+
+describe('readScaffoldingSql absolute path', () => {
+  it('reads an absolute path directly, ignoring migrationsDir', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'scaffold-abs-'));
+    const abs = join(dir, 'shared-helpers.sql');
+    writeFileSync(abs, 'DROP PROCEDURE IF EXISTS zn_x;\nDELIMITER //\nCREATE PROCEDURE zn_x() SQL SECURITY INVOKER BEGIN SELECT 1; END //\nDELIMITER ;');
+    // migrationsDir is a DIFFERENT, unrelated dir — must be ignored when filename is absolute
+    const otherDir = mkdtempSync(join(tmpdir(), 'scaffold-other-'));
+    const { path, statements } = readScaffoldingSql(otherDir, abs);
+    expect(isAbsolute(abs)).toBe(true);
+    expect(path).toBe(abs); // read from the absolute path, not join(otherDir, abs)
+    expect(statements.some((s) => /CREATE PROCEDURE zn_x/.test(s))).toBe(true);
+  });
+
+  it('still resolves a bare filename against migrationsDir (unchanged)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'scaffold-bare-'));
+    writeFileSync(join(dir, 'helpers.sql'), 'CREATE PROCEDURE zn_y() SQL SECURITY INVOKER BEGIN SELECT 1; END;');
+    const { path } = readScaffoldingSql(dir, 'helpers.sql');
+    expect(path).toBe(join(dir, 'helpers.sql'));
+  });
+
+  it('error names the absolute path when an absolute file is missing', () => {
+    expect(() => readScaffoldingSql('/unused', '/nonexistent/abs/helpers.sql'))
+      .toThrow(/\/nonexistent\/abs\/helpers\.sql/);
   });
 });
 

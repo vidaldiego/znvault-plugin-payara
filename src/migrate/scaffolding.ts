@@ -1,19 +1,22 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { splitStatements } from './sql-splitter.js';
 
 /**
  * Read and split the scaffolding SQL file (migration-helper procedures/functions).
- * The file lives at <migrationsDir>/<filename> (filename is a bare name, validated
- * config-side). Returns the absolute path and the executable statements.
+ * `filename` may be a bare name resolved against <migrationsDir>, OR an absolute
+ * path (used as-is, ignoring migrationsDir — lets one shared file serve both the
+ * pre and post phases, which have different migrationsDirs). Validation of the
+ * bare-vs-absolute distinction happens config-side (deploy-config-validate.ts).
+ * Returns the resolved absolute path and the executable statements.
  */
 export function readScaffoldingSql(
   migrationsDir: string,
   filename: string,
 ): { path: string; statements: string[] } {
-  const path = join(migrationsDir, filename);
+  const path = isAbsolute(filename) ? filename : join(migrationsDir, filename);
   if (!existsSync(path)) {
-    throw new Error(`scaffolding file not found: ${filename} (looked in ${migrationsDir})`);
+    throw new Error(`scaffolding file not found: ${path}`);
   }
   const sql = readFileSync(path, 'utf8');
   return { path, statements: splitStatements(sql) };
