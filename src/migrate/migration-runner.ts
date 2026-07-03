@@ -109,6 +109,9 @@ export class MigrationRunner {
    *      lock is still held, drop every object the lease user defined
    *      (dropDefinerObjects), unconditionally — runs whether 6/7 succeeded or threw.
    *      A cleanup failure is logged, never rethrown (must not mask a primary error).
+   *      The lock-held check itself (lockHeld()) is also non-throwing — a dead
+   *      connection can make the underlying IS_USED_LOCK query reject rather than
+   *      resolve false, and this guard must not mask a primary error either.
    *  8. finally: release lock; if release was not clean and no primary error, throw tripwire.
    *
    * The `zn_*` helper procedures (0000_ files) are NO LONGER created here. They are
@@ -238,9 +241,27 @@ export class MigrationRunner {
    * Non-throwing counterpart to requireLockHeld() — used by cleanup paths (e.g.
    * scaffolding's finally block) that must NOT touch the DB once the lock is lost,
    * but also must not themselves throw while already unwinding another error.
+   *
+   * `lock.isHeld()` runs `SELECT IS_USED_LOCK(...)`, which can itself REJECT on a
+   * dead connection (killed session / proxy reconnect — exactly the scenario this
+   * guard exists for), not just resolve to false. Since callers await this from a
+   * `finally` block, an unswallowed rejection here would replace/mask whatever
+   * primary error is already in flight (a throwing `finally` overrides the pending
+   * exception). Treat any error the same as "lock not held": skip the guarded
+   * cleanup rather than risk touching a possibly-dead connection or masking the
+   * real error.
    */
   private async lockHeld(): Promise<boolean> {
-    return lock.isHeld(this.db);
+    try {
+      return await lock.isHeld(this.db);
+    } catch (e) {
+      console.warn(
+        `lock.isHeld() failed while checking scaffolding cleanup eligibility (treating as lock-not-held): ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+      return false;
+    }
   }
 
   /**
