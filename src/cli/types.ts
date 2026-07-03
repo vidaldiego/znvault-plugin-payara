@@ -396,6 +396,19 @@ export interface MigrationConfig {
 }
 
 /**
+ * Regression guard: `test/config-types.test.ts` is NOT covered by `tsc --noEmit`
+ * (tsconfig.json excludes `test/`), so a runtime test there cannot fail if
+ * `scaffoldingFile` is removed from `MigrationConfig` — TS types erase at runtime
+ * and an extra property on an object literal doesn't error. This assertion lives
+ * in a file `npm run typecheck` DOES check: if `scaffoldingFile` is removed (or
+ * its type widens beyond `string | undefined`), this line fails to compile.
+ * Do not remove without an equivalent guard elsewhere.
+ */
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+type _AssertMigrationConfigHasScaffoldingFile =
+  MigrationConfig['scaffoldingFile'] extends string | undefined ? true : never;
+
+/**
  * Deployment configuration store
  */
 export interface DeployConfigStore {
