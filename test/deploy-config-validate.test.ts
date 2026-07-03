@@ -155,4 +155,28 @@ describe('validateDeployConfig — migration.scaffoldingFile', () => {
     const { errors } = validateDeployConfig(cfg);
     expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(false);
   });
+
+  it('accepts an absolute scaffoldingFile path', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/pre', scaffoldingFile: '/repo/docs/migrations/0000_migration-helpers.sql' },
+    });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(false);
+  });
+
+  it('still rejects a RELATIVE scaffoldingFile containing a path separator', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/pre', scaffoldingFile: 'sub/helpers.sql' },
+    });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(true);
+  });
+
+  it('still rejects an empty scaffoldingFile', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/pre', scaffoldingFile: '' },
+    });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(true);
+  });
 });
