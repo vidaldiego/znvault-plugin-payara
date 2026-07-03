@@ -376,6 +376,15 @@ export interface MigrationConfig {
   /** Absolute path to the migrations directory (the flat `docs/migrations` folder). */
   migrationsDir: string;
   /**
+   * Optional filename (relative to migrationsDir) of the scaffolding SQL file —
+   * migration-helper procedures/functions (e.g. zn_assert_*, zn_drop_column_if_exists)
+   * that exist ONLY to run migrations. The runner applies this file at the start of
+   * the phase and drops everything the migrate user defines after reconcile, so the
+   * ephemeral user is never left a definer (MySQL 8.4 ER-4006). No magic-prefix
+   * fallback: if unset, the phase has no scaffolding step.
+   */
+  scaffoldingFile?: string;
+  /**
    * Optional server-owned routine bundle to apply BEFORE the migrate lease is
    * minted (run-migrations.ts Step 0). Helper procedures (e.g. `zn_assert_*`)
    * are provisioned by vault under the persistent routines account — NOT by
