@@ -110,7 +110,6 @@ describe('runMigrationPhase', () => {
       migration: {
         roleId: 'zincdb-rw',
         migrationsDir: 'docs/migrations',
-        routines: { bundle: 'znapi-helpers', version: 1 },
       },
     } as unknown as DeployConfig;
 
@@ -121,10 +120,10 @@ describe('runMigrationPhase', () => {
 
     // Nothing executed: no lease minted, no runner invoked.
     expect(deps.client.issueCredential).not.toHaveBeenCalled();
-    // A dry-run plan line was printed (mentions the routines bundle + that it's a dry run).
+    // A dry-run plan line was printed (mentions the role/dir + that it's a dry run).
     const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
     expect(infoCalls.some((m) => /dry.?run/i.test(m))).toBe(true);
-    expect(infoCalls.some((m) => m.includes('znapi-helpers') && m.includes('1'))).toBe(true);
+    expect(infoCalls.some((m) => m.includes('zincdb-rw') && m.includes('docs/migrations'))).toBe(true);
     // The "Migrations complete" line (which only fires after a real run) must NOT appear.
     expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] pre-deploy migrations complete.');
   });
@@ -152,81 +151,6 @@ describe('runMigrationPhase', () => {
     // which proves the full runMigrations call completed successfully.
     expect(ctx.output.info).toHaveBeenCalledWith('[deploy] Running pre-deploy schema migrations...');
     expect(ctx.output.info).toHaveBeenCalledWith('[deploy] pre-deploy migrations complete.');
-  });
-
-  it('forwards config.migration.routines to runMigrations opts (C3 pass-through)', async () => {
-    // Regression guard for the C2 handoff bug: runMigrationPhase must forward the
-    // routines selector through to runMigrations — otherwise a saved deploy config's
-    // routines selector never reaches the migration engine and Step 0 never runs.
-    const runMigrationsSpy = vi.fn().mockResolvedValue(undefined);
-    vi.doMock('../src/run-migrations.js', async () => {
-      const actual = await vi.importActual<typeof import('../src/run-migrations.js')>('../src/run-migrations.js');
-      return {
-        ...actual,
-        runMigrations: runMigrationsSpy,
-      };
-    });
-
-    // Re-import runMigrationPhase with the mocked run-migrations module.
-    vi.resetModules();
-    const { runMigrationPhase: runMigrationPhaseMocked } = await import('../src/cli/commands/deploy-run.js');
-
-    const config: DeployConfig = {
-      name: 'production',
-      hosts: ['10.0.0.1'],
-      migration: {
-        roleId: 'zincdb-rw',
-        migrationsDir: 'docs/migrations',
-        routines: { bundle: 'zn_helpers', version: 2 },
-      },
-    } as unknown as DeployConfig;
-
-    const ctx = makeMockCtx();
-    const deps = makeMockDeps();
-
-    await runMigrationPhaseMocked(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true });
-
-    expect(runMigrationsSpy).toHaveBeenCalledTimes(1);
-    const [, opts] = runMigrationsSpy.mock.calls[0];
-    expect(opts.routines).toEqual({ bundle: 'zn_helpers', version: 2 });
-
-    vi.doUnmock('../src/run-migrations.js');
-    vi.resetModules();
-  });
-
-  it('forwards undefined routines when config.migration.routines is absent', async () => {
-    const runMigrationsSpy = vi.fn().mockResolvedValue(undefined);
-    vi.doMock('../src/run-migrations.js', async () => {
-      const actual = await vi.importActual<typeof import('../src/run-migrations.js')>('../src/run-migrations.js');
-      return {
-        ...actual,
-        runMigrations: runMigrationsSpy,
-      };
-    });
-
-    vi.resetModules();
-    const { runMigrationPhase: runMigrationPhaseMocked } = await import('../src/cli/commands/deploy-run.js');
-
-    const config: DeployConfig = {
-      name: 'production',
-      hosts: ['10.0.0.1'],
-      migration: {
-        roleId: 'zincdb-rw',
-        migrationsDir: 'docs/migrations',
-      },
-    } as unknown as DeployConfig;
-
-    const ctx = makeMockCtx();
-    const deps = makeMockDeps();
-
-    await runMigrationPhaseMocked(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true });
-
-    expect(runMigrationsSpy).toHaveBeenCalledTimes(1);
-    const [, opts] = runMigrationsSpy.mock.calls[0];
-    expect(opts.routines).toBeUndefined();
-
-    vi.doUnmock('../src/run-migrations.js');
-    vi.resetModules();
   });
 
   it('runs with correct runner invocation (runner.run is called once)', async () => {
@@ -300,7 +224,6 @@ describe('runMigrationPhase — --skip-migrations', () => {
       migration: {
         roleId: 'zincdb-rw',
         migrationsDir: 'docs/migrations',
-        routines: { bundle: 'znapi-helpers', version: 1 },
       },
     } as unknown as DeployConfig;
 
@@ -350,7 +273,6 @@ describe('runMigrationPhase — --skip-migrations', () => {
       migration: {
         roleId: 'zincdb-rw',
         migrationsDir: 'docs/migrations',
-        routines: { bundle: 'znapi-helpers', version: 1 },
       },
     } as unknown as DeployConfig;
 

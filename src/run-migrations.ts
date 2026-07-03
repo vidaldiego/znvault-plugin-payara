@@ -8,17 +8,15 @@
  * Design decisions (spec §run-migrations.ts + Codex):
  *  - 4h TTL (not 600s): Vault's cleanup job KILLs active DB sessions when a
  *    lease expires mid-DDL. A generous TTL + explicit revoke-on-exit is safer.
- *  - Step 0 (if `opts.routines` configured): apply the vault-owned routine
- *    bundle BEFORE minting the lease. Helper procedures are no longer created
- *    by the migration engine (removed post-B1) — they are provisioned by vault
- *    under the persistent routines account, so the ephemeral migrate user
- *    never owns a routine and revokes cleanly. A bundle-apply failure aborts
- *    the deploy before any lease/host/DB change (same posture as mint failure).
+ *  - Migration-helper scaffolding (if `opts.scaffoldingFile` configured) is
+ *    applied by the runner at the start of the phase, against the just-minted
+ *    lease's own ephemeral user, and cleaned up (definer objects dropped)
+ *    after reconcile — so the ephemeral migrate user never owns a routine
+ *    past the phase and revokes cleanly.
  *  - ALWAYS call runner.run() — never short-circuit on status (CRITICAL F4.1):
  *    run() unconditionally executes pending migrations on every invocation; a
  *    status check short-circuit would leave pending migrations unapplied while
- *    reporting "up to date". (Helper procedure refresh is now Step 0, above —
- *    NOT part of run().)
+ *    reporting "up to date".
  *  - revokeOnce: single guarded revoke with 3× retry + backoff; 404/non-ACTIVE
  *    treated as success (Codex F6.1). Signal handlers await the revoke (5s cap)
  *    before exiting (Codex F6.4) so the in-flight HTTP request isn't aborted.
@@ -57,13 +55,6 @@ export interface RunMigrationsOpts {
    */
   integrityDirs?: string[];
   /**
-   * Optional server-owned routine bundle to apply BEFORE minting the migrate
-   * lease (Step 0). Helpers are provisioned by vault under the persistent
-   * routines account — the ephemeral migrate user never owns them, so it
-   * revokes cleanly (see B1/C1). Absent = today's behavior (no bundle applied).
-   */
-  routines?: { bundle: string; version: number };
-  /**
    * Optional migration-helper scaffolding SQL file, applied at the start of the
    * migration phase and cleaned up (definer objects dropped) after reconcile.
    * The cleanup target is the lease's own minted username — see where this is
@@ -77,7 +68,6 @@ export interface RunMigrationsOpts {
 export interface DynamicSecretsClient {
   issueCredential(roleId: string, opts: { ttlSeconds: number }): Promise<Lease>;
   revokeCredential(leaseId: string, opts: { reason: string }): Promise<void>;
-  applyRoutines(roleId: string, opts: { bundle: string; version: number }): Promise<void>;
 }
 
 /** Minimal DB handle exposed by openDb (for injection / testing). */
@@ -280,9 +270,6 @@ function withTimeout(p: Promise<void>, ms: number): Promise<void> {
 /**
  * Run schema migrations as a deploy phase.
  *
- * 0. If `opts.routines` is configured, apply the vault-owned routine bundle
- *    BEFORE minting any lease. Failure aborts the deploy here — no lease is
- *    minted, no host/DB change has happened yet.
  * 1. Mint a dynamic-secrets lease (TTL 4h).
  * 2. Install signal handlers that await revoke (5s cap) before exiting.
  * 3. Open a MySQL connection with the ephemeral credentials.
@@ -290,8 +277,7 @@ function withTimeout(p: Promise<void>, ms: number): Promise<void> {
  * 5. In finally: close DB + revokeOnce + remove signal handlers.
  *
  * @param ctx    - CLI plugin context (used for logging; pass {} as `any` in tests).
- * @param opts   - env, roleId, migrationsDir, an optional database override, and
- *                 an optional routines bundle applied before the lease is minted.
+ * @param opts   - env, roleId, migrationsDir, and an optional database override.
  *                 host/port/database come from the Vault dynamic-secrets lease.
  * @param deps   - Injectable deps (real = defaultDeps(ctx.client); tests pass mocks).
  */
@@ -316,15 +302,6 @@ export async function runMigrations(
       console.info(msg);
     }
   };
-
-  // ── Step 0: Apply the server-owned routine bundle (if configured), BEFORE any lease. ──
-  // Helpers are provisioned by vault (owned by the persistent routines account), NOT created
-  // by the migration engine (see B1). Failure aborts the deploy before any host/DB change —
-  // same posture as lease-mint failure. Must run before issueCredential.
-  if (opts.routines) {
-    await deps.client.applyRoutines(opts.roleId, opts.routines);
-    info(`[run-migrations] Routine bundle applied: ${opts.routines.bundle} v${opts.routines.version}`);
-  }
 
   // ── Step 1: Mint lease (4h TTL). Failure aborts deploy before any host change. ──
   const LEASE_TTL_SECONDS = 4 * 3600; // 14400 — NOT 600; see spec §run-migrations.ts
@@ -381,11 +358,9 @@ export async function runMigrations(
       : undefined;
 
     // ALWAYS run() — NEVER short-circuit on status (CRITICAL F4.1).
-    // Helper procedures are NOT refreshed here anymore (post-B1): they are
-    // provisioned by the vault routines bundle in Step 0, above, before this
-    // lease was even minted. run() only CALLs them and applies pending
-    // migrations; a status-check short-circuit would still leave pending
-    // migrations unapplied while reporting "up to date".
+    // run() applies the scaffolding (if configured) and pending migrations;
+    // a status-check short-circuit would leave pending migrations unapplied
+    // while reporting "up to date".
     const result = await deps
       .makeRunner(db, opts.migrationsDir, appliedBy, opts.integrityDirs, scaffolding)
       .run();

@@ -11,15 +11,15 @@ vi.mock('../src/cli/config-store.js', () => ({
     configs: {
       stg: {
         name: 'stg', hosts: ['h1'], warPath: '/x.war', strategy: 'sequential',
-        migration: { roleId: 'rp', migrationsDir: 'db/pre', routines: { bundle: 'znapi-helpers', version: 1 } },
-        postMigration: { roleId: 'rq', migrationsDir: 'db/post', routines: { bundle: 'znapi-helpers', version: 1 } },
+        migration: { roleId: 'rp', migrationsDir: 'db/pre' },
+        postMigration: { roleId: 'rq', migrationsDir: 'db/post' },
       },
       // Both phases share the same role (and both derive the DB from the same
       // Vault connection) → the two-phase render deduplicates the shared settings.
       shared: {
         name: 'shared', hosts: ['h1'], warPath: '/x.war', strategy: 'sequential',
-        migration: { roleId: 'dbr_shared', migrationsDir: 'db/pre', routines: { bundle: 'znapi-helpers', version: 1 } },
-        postMigration: { roleId: 'dbr_shared', migrationsDir: 'db/post', routines: { bundle: 'znapi-helpers', version: 1 } },
+        migration: { roleId: 'dbr_shared', migrationsDir: 'db/pre' },
+        postMigration: { roleId: 'dbr_shared', migrationsDir: 'db/post' },
       },
       'pre-only': {
         name: 'pre-only', hosts: ['h1'], warPath: '/x.war', strategy: 'sequential',
@@ -62,19 +62,6 @@ describe('config show — two phases', () => {
     expect(all).not.toMatch(/Run schema migrations \(/); // no bare "Run schema migrations"
     expect(all).toMatch(/Run post-deploy schema migrations/);
     expect(all).toMatch(/only if the rollout succeeded/);
-  });
-
-  it('labels the post-deploy routine step as a re-apply (not a second execution)', async () => {
-    // 'stg' fixture carries routines on both phases; the post routine line must say
-    // "re-applied post-deploy" so it never reads as running the bundle twice.
-    const all = await runShow('stg');
-    expect(all).toMatch(/re-applied post-deploy before post-deploy migrations/);
-  });
-
-  it('names the routine field "Bundle:" (consistent with "Apply routine bundle")', async () => {
-    const all = await runShow('stg');
-    expect(all).toMatch(/Bundle:\s+znapi-helpers v1/);
-    expect(all).not.toMatch(/Routines:/); // renamed away from the old label
   });
 
   it('warns that post-deploy migrations are the point of no return', async () => {

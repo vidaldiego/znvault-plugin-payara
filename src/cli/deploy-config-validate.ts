@@ -39,21 +39,6 @@ function validateMigrationBlock(
       errors.push(`config '${configName}' ${label}.scaffoldingFile must be a bare filename (relative to migrationsDir) or an absolute path — a relative path with separators is not allowed.`);
     }
   }
-  if (block.routines) {
-    const { bundle, version } = block.routines;
-    const bundleValid = !!bundle && bundle.trim() !== '';
-    const versionValid = Number.isInteger(version) && version >= 1;
-    if (!bundleValid) {
-      errors.push(`config '${configName}' ${label}.routines is missing bundle (the routine bundle name).`);
-    }
-    if (!versionValid) {
-      errors.push(`config '${configName}' ${label}.routines.version must be an integer >= 1.`);
-    }
-    if (bundleValid && versionValid) {
-      const beforeWhat = isPre ? 'migrations' : `${label} migrations`;
-      info.push(`config '${configName}' will apply routine bundle ${bundle} v${version} before ${beforeWhat}.`);
-    }
-  }
 }
 
 export function validateDeployConfig(config: DeployConfig): ValidationReport {

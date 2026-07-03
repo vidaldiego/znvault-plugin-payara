@@ -242,8 +242,8 @@ A deploy config may carry **two** schema-migration blocks:
   routines) that are unsafe while old-WAR instances are still serving. Set with
   `--phase post`.
 
-The full execution order is: apply pre routines → **pre migrations** → deploy all
-hosts/classes → **post migrations**.
+The full execution order is: **pre migrations** → deploy all hosts/classes →
+**post migrations**.
 
 > ⚠️ **Pre and post MUST use different `migrationsDir` folders.** The migration
 > engine applies *all pending files* in a directory and records what it applied,
@@ -289,17 +289,13 @@ under a common `Migration:` header, with each phase nested beneath it:
     Database: (from Vault dynamic-secrets connection)
     Pre-deploy:
       Dir:    docs/migrations/pre
-      Bundle: znapi-helpers v1 (applied before migrations)
     Post-deploy:
       Dir:    docs/migrations/post
-      Bundle: znapi-helpers v1 (applied before migrations)
 
   Execution plan (what 'payara deploy run staging' does, in order):
-    1. Apply routine bundle znapi-helpers v1 (pre-deploy, before any host is touched; …)
-    2. Run pre-deploy schema migrations (role zincdb-rw; aborts the deploy on failure)
-    3. Roll out hosts (…)
-    4. Apply routine bundle znapi-helpers v1 (re-applied post-deploy before post-deploy migrations)
-    5. Run post-deploy schema migrations (role zincdb-rw; only if the rollout succeeded)
+    1. Run pre-deploy schema migrations (role zincdb-rw; aborts the deploy on failure)
+    2. Roll out hosts (…)
+    3. Run post-deploy schema migrations (role zincdb-rw; only if the rollout succeeded)
        ⚠ point of no return: post-deploy migrations may apply destructive changes;
          rollback to the previous application version may no longer be possible.
 ```
@@ -361,11 +357,7 @@ convention-based lookup: if `scaffoldingFile` is unset, the phase runs with no
 scaffolding step at all, byte-identical to a config without this field.
 
 Scaffolding is a *phase-scoped, disposable* concept — a scaffolding file's
-objects are meant to be destroyed at the end of every run of that phase. It is
-unrelated to the persistent, vault-provisioned routine bundle (`--routines-bundle`
-/ `--routines-version`, applied under a separate, persistent routines account
-before the migrate lease is even minted) — see the routine bundle notes in
-[Migration phases](#migration-phases-deploy-run) above.
+objects are meant to be destroyed at the end of every run of that phase.
 
 #### The persistent-definer-object rule (app authorship)
 
