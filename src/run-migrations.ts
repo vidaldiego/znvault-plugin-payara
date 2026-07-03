@@ -63,6 +63,14 @@ export interface RunMigrationsOpts {
    * revokes cleanly (see B1/C1). Absent = today's behavior (no bundle applied).
    */
   routines?: { bundle: string; version: number };
+  /**
+   * Optional migration-helper scaffolding SQL file, applied at the start of the
+   * migration phase and cleaned up (definer objects dropped) after reconcile.
+   * The cleanup target is the lease's own minted username — see where this is
+   * consumed below for the {filename, leaseUser} construction. Absent = no
+   * scaffolding (today's behavior, byte-identical).
+   */
+  scaffoldingFile?: string;
 }
 
 /** Shape of a minimal dynamic-secrets client (for injection / testing). */
@@ -88,7 +96,13 @@ export interface RunMigrationsDeps {
     password: string;
     ssl: boolean;
   }): Promise<DbHandle>;
-  makeRunner(db: DbHandle, dir: string, appliedBy: string, integrityDirs?: string[]): { run(): Promise<unknown> };
+  makeRunner(
+    db: DbHandle,
+    dir: string,
+    appliedBy: string,
+    integrityDirs?: string[],
+    scaffolding?: { filename: string; leaseUser: string },
+  ): { run(): Promise<unknown> };
   /**
    * Override the settle delay applied after db.end() and before revokeOnce().
    * Set to 0 in tests to avoid real waiting.  Production always uses REVOKE_SETTLE_MS.
@@ -133,10 +147,10 @@ export function defaultDeps(client: { post<T>(path: string, body: unknown): Prom
   return {
     client: dynamicClient,
     openDb: openDb as RunMigrationsDeps['openDb'],
-    makeRunner(db, dir, appliedBy, integrityDirs) {
+    makeRunner(db, dir, appliedBy, integrityDirs, scaffolding) {
       // In production the db is always a full Db handle (from openDb), so the cast is safe.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return new MigrationRunner(db as any, dir, appliedBy, integrityDirs ?? []);
+      return new MigrationRunner(db as any, dir, appliedBy, integrityDirs ?? [], scaffolding);
     },
   };
 }
@@ -356,13 +370,25 @@ export async function runMigrations(
     });
 
     const appliedBy = `${os.userInfo().username}@${os.hostname()}`;
+
+    // Scaffolding cleanup must target the lease's OWN minted username — that is
+    // the ephemeral identity that will own any definer objects created while the
+    // scaffolding file is applied, and the one whose leftover objects need
+    // dropping after reconcile. Absent opts.scaffoldingFile = no scaffolding
+    // (byte-identical to pre-scaffolding behavior).
+    const scaffolding = opts.scaffoldingFile
+      ? { filename: opts.scaffoldingFile, leaseUser: lease.username }
+      : undefined;
+
     // ALWAYS run() — NEVER short-circuit on status (CRITICAL F4.1).
     // Helper procedures are NOT refreshed here anymore (post-B1): they are
     // provisioned by the vault routines bundle in Step 0, above, before this
     // lease was even minted. run() only CALLs them and applies pending
     // migrations; a status-check short-circuit would still leave pending
     // migrations unapplied while reporting "up to date".
-    const result = await deps.makeRunner(db, opts.migrationsDir, appliedBy, opts.integrityDirs).run();
+    const result = await deps
+      .makeRunner(db, opts.migrationsDir, appliedBy, opts.integrityDirs, scaffolding)
+      .run();
     info(`[run-migrations] Migrations complete: ${JSON.stringify(result)}`);
   } finally {
     // ── Step 5: Teardown — close DB (best-effort) then revoke ────────────────

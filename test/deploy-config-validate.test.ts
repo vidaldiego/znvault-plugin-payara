@@ -130,3 +130,29 @@ describe('validateDeployConfig — postMigration', () => {
     expect(errors).toHaveLength(0);
   });
 });
+
+describe('validateDeployConfig — migration.scaffoldingFile', () => {
+  it('errors when scaffoldingFile contains a path separator', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/pre', scaffoldingFile: 'utils/helpers.sql' },
+    });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(true);
+  });
+
+  it('errors when scaffoldingFile is empty', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/pre', scaffoldingFile: '' },
+    });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(true);
+  });
+
+  it('does not error on a valid bare scaffoldingFile', () => {
+    const cfg = base({
+      migration: { roleId: 'r', migrationsDir: 'db/pre', scaffoldingFile: 'migration_utils.sql' },
+    });
+    const { errors } = validateDeployConfig(cfg);
+    expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(false);
+  });
+});

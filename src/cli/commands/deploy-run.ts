@@ -261,6 +261,7 @@ export async function runMigrationPhase(
     // as orphaned (renamed/deleted) files.
     integrityDirs: opts.integrityDirs,
     routines: migration.routines,
+    scaffoldingFile: migration.scaffoldingFile,
   }, deps);
   ctx.output.info(`[deploy] ${phase} migrations complete.`);
 }
