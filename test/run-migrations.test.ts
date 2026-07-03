@@ -519,4 +519,42 @@ describe('runMigrations', () => {
     expect(run).toHaveBeenCalledTimes(1);
     expect(revoke).toHaveBeenCalledTimes(1);
   });
+
+  // ─── scaffoldingFile threading (lease username → runner's scaffolding param) ──
+
+  it('constructs the runner with scaffolding {filename, leaseUser} when scaffoldingFile is set', async () => {
+    const { deps, opts } = harness();
+    const issue = vi.fn().mockResolvedValue({
+      leaseId: 'L',
+      username: 'v_migrate_xyz',
+      password: 'p',
+      host: 'vault-host.example.com',
+      port: 6446,
+      database: 'zincdb',
+    });
+    deps.client.issueCredential = issue;
+    const run = vi.fn().mockResolvedValue({});
+    const makeRunner = vi.fn().mockReturnValue({ run });
+    deps.makeRunner = makeRunner;
+    const ctx = makeCtx();
+
+    await runMigrations(ctx, { ...opts, scaffoldingFile: 'migration_utils.sql' }, deps);
+
+    // makeRunner signature: (db, dir, appliedBy, integrityDirs, scaffolding)
+    const call = makeRunner.mock.calls[0];
+    expect(call[4]).toEqual({ filename: 'migration_utils.sql', leaseUser: 'v_migrate_xyz' });
+  });
+
+  it('constructs the runner without scaffolding when scaffoldingFile is absent', async () => {
+    const { deps, opts } = harness();
+    const run = vi.fn().mockResolvedValue({});
+    const makeRunner = vi.fn().mockReturnValue({ run });
+    deps.makeRunner = makeRunner;
+    const ctx = makeCtx();
+
+    await runMigrations(ctx, opts, deps);
+
+    const call = makeRunner.mock.calls[0];
+    expect(call[4]).toBeUndefined();
+  });
 });
