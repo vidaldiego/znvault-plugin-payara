@@ -31,6 +31,13 @@ function validateMigrationBlock(
     const suffix = isPre ? `; host/port/database come from the Vault dynamic-secrets connection.` : `.`;
     info.push(`config '${configName}' will run schema migrations ${when} (role '${block.roleId}', dir '${block.migrationsDir}')${suffix}`);
   }
+  if (block.scaffoldingFile !== undefined) {
+    if (typeof block.scaffoldingFile !== 'string' || block.scaffoldingFile.length === 0) {
+      errors.push(`config '${configName}' ${label}.scaffoldingFile must be a non-empty filename.`);
+    } else if (block.scaffoldingFile.includes('/') || block.scaffoldingFile.includes('\\')) {
+      errors.push(`config '${configName}' ${label}.scaffoldingFile must be a bare filename relative to migrationsDir, not a path.`);
+    }
+  }
   if (block.routines) {
     const { bundle, version } = block.routines;
     const bundleValid = !!bundle && bundle.trim() !== '';

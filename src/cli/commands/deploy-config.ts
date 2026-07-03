@@ -221,6 +221,7 @@ export function registerConfigCommands(
             console.log(`    Role:     ${block.roleId}`);
             console.log(`    Dir:      ${block.migrationsDir}`);
             console.log(dbLine(block, '    '));
+            if (block.scaffoldingFile) console.log(`    Scaffolding: ${block.scaffoldingFile}`);
             console.log(bundleLine(block, '    ', 'Bundle:   ')); // aligns to 'Database:'
           };
 
@@ -238,9 +239,11 @@ export function registerConfigCommands(
             // Nested phase blocks: align 'Dir:' and 'Bundle:' to each other.
             console.log(`    Pre-deploy:`);
             console.log(`      Dir:    ${pre.migrationsDir}`);
+            if (pre.scaffoldingFile) console.log(`      Scaffolding: ${pre.scaffoldingFile}`);
             console.log(bundleLine(pre, '      ', 'Bundle: '));
             console.log(`    Post-deploy:`);
             console.log(`      Dir:    ${post.migrationsDir}`);
+            if (post.scaffoldingFile) console.log(`      Scaffolding: ${post.scaffoldingFile}`);
             console.log(bundleLine(post, '      ', 'Bundle: '));
             return;
           }
@@ -777,6 +780,7 @@ export function registerConfigCommands(
     .option('--role <roleId>', 'Dynamic-secrets role ID for the migration DB user (write role)')
     .option('--dir <path>', 'Migrations directory (e.g. docs/migrations)')
     .option('--database <db>', 'DB name override (normally Vault connection provides it)')
+    .option('--scaffolding-file <filename>', 'Scaffolding SQL filename (relative to --dir): migration-helper procs/functions applied at phase start and dropped after reconcile')
     .option('--routines-bundle <name>', 'Routine bundle name to apply before migrations (requires --routines-version)')
     .option('--routines-version <n>', 'Routine bundle version to apply before migrations (requires --routines-bundle)')
     .option('--clear', 'Remove the migration config for the selected --phase (pre by default)')
@@ -785,6 +789,7 @@ export function registerConfigCommands(
       role?: string;
       dir?: string;
       database?: string;
+      scaffoldingFile?: string;
       routinesBundle?: string;
       routinesVersion?: string;
       clear?: boolean;
@@ -836,6 +841,7 @@ export function registerConfigCommands(
           roleId: options.role,
           migrationsDir: options.dir,
           ...(options.database ? { database: options.database } : {}),
+          ...(options.scaffoldingFile ? { scaffoldingFile: options.scaffoldingFile } : {}),
           ...(options.routinesBundle && options.routinesVersion
             ? { routines: { bundle: options.routinesBundle, version: Number(options.routinesVersion) } }
             : {}),
@@ -851,6 +857,9 @@ export function registerConfigCommands(
           ctx.output.info(`  Database: ${migration.database} (override)`);
         } else {
           ctx.output.info(`  Database: (from Vault dynamic-secrets connection via the lease)`);
+        }
+        if (migration.scaffoldingFile) {
+          ctx.output.info(`  Scaffolding: ${migration.scaffoldingFile}`);
         }
         if (migration.routines) {
           ctx.output.info(`  Routines: ${migration.routines.bundle} v${migration.routines.version} (applied before migrations)`);
