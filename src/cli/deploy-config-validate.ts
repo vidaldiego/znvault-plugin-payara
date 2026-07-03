@@ -2,6 +2,7 @@
 // Pure static validation of a DeployConfig — flat or multi-class.
 // errors.length > 0 ⇒ a hard violation (deploy must abort before touching hosts).
 
+import { isAbsolute } from 'node:path';
 import type { DeployConfig, MigrationConfig } from './types.js';
 import { resolveClass, hasActiveServerMap } from './deploy-class.js';
 
@@ -33,9 +34,9 @@ function validateMigrationBlock(
   }
   if (block.scaffoldingFile !== undefined) {
     if (typeof block.scaffoldingFile !== 'string' || block.scaffoldingFile.length === 0) {
-      errors.push(`config '${configName}' ${label}.scaffoldingFile must be a non-empty filename.`);
-    } else if (block.scaffoldingFile.includes('/') || block.scaffoldingFile.includes('\\')) {
-      errors.push(`config '${configName}' ${label}.scaffoldingFile must be a bare filename relative to migrationsDir, not a path.`);
+      errors.push(`config '${configName}' ${label}.scaffoldingFile must be a non-empty filename or absolute path.`);
+    } else if (!isAbsolute(block.scaffoldingFile) && (block.scaffoldingFile.includes('/') || block.scaffoldingFile.includes('\\'))) {
+      errors.push(`config '${configName}' ${label}.scaffoldingFile must be a bare filename (relative to migrationsDir) or an absolute path — a relative path with separators is not allowed.`);
     }
   }
   if (block.routines) {

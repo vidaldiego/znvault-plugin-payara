@@ -326,7 +326,21 @@ znvault payara config set-migration staging \
 
 | Flag | Required | Description |
 |------|:---:|-------------|
-| `--scaffolding-file <filename>` | No | Filename of the scaffolding SQL file, **relative to `--dir`** (a bare filename — not a path; `/` or `\` fails validation). Applied at the start of the phase and cleaned up after reconcile. |
+| `--scaffolding-file <path>` | No | The scaffolding SQL file: either a bare filename **relative to `--dir`** (a relative path with `/` or `\` fails validation), or an **absolute path**. Applied at the start of the phase and cleaned up after reconcile. |
+
+An absolute path can be used so a single helper file serves **both** the pre-
+and post-deploy phases — which normally have different `migrationsDir`s, so a
+bare filename resolves against two different directories:
+
+```bash
+znvault payara config set-migration staging \
+  --phase pre --role zincdb-rw --dir docs/migrations/pre \
+  --scaffolding-file /path/to/docs/migrations/0000_migration-helpers.sql
+
+znvault payara config set-migration staging \
+  --phase post --role zincdb-rw --dir docs/migrations/post \
+  --scaffolding-file /path/to/docs/migrations/0000_migration-helpers.sql
+```
 
 **What the runner does:** if `scaffoldingFile` is set, the runner applies that
 file's statements immediately after acquiring the migration lock — before any

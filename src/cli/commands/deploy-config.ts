@@ -780,7 +780,7 @@ export function registerConfigCommands(
     .option('--role <roleId>', 'Dynamic-secrets role ID for the migration DB user (write role)')
     .option('--dir <path>', 'Migrations directory (e.g. docs/migrations)')
     .option('--database <db>', 'DB name override (normally Vault connection provides it)')
-    .option('--scaffolding-file <filename>', 'Scaffolding SQL filename (relative to --dir): migration-helper procs/functions applied at phase start and dropped after reconcile')
+    .option('--scaffolding-file <path>', 'Scaffolding SQL file: a bare filename (relative to --dir) OR an absolute path (lets one shared file serve both phases). Applied at phase start; its objects are dropped after reconcile.')
     .option('--routines-bundle <name>', 'Routine bundle name to apply before migrations (requires --routines-version)')
     .option('--routines-version <n>', 'Routine bundle version to apply before migrations (requires --routines-bundle)')
     .option('--clear', 'Remove the migration config for the selected --phase (pre by default)')
