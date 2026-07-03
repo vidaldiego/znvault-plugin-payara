@@ -311,6 +311,77 @@ under a common `Migration:` header, with each phase nested beneath it:
 > override narrows the one named class — even if `--class` names every class — so
 > post-deploy is still skipped as `scoped-subset` in that case.
 
+### Migration scaffolding
+
+A migration phase (`migration` or `postMigration`) can carry a **scaffolding file** —
+a SQL file of migration-helper procedures/functions (e.g. `zn_assert_*`,
+`zn_drop_column_if_exists`) that exist only to support the migrations in that
+directory. Set it with `--scaffolding-file` on `config set-migration`:
+
+```bash
+znvault payara config set-migration staging \
+  --phase pre --role zincdb-rw --dir docs/migrations/pre \
+  --scaffolding-file migration_utils.sql
+```
+
+| Flag | Required | Description |
+|------|:---:|-------------|
+| `--scaffolding-file <filename>` | No | Filename of the scaffolding SQL file, **relative to `--dir`** (a bare filename — not a path; `/` or `\` fails validation). Applied at the start of the phase and cleaned up after reconcile. |
+
+**What the runner does:** if `scaffoldingFile` is set, the runner applies that
+file's statements immediately after acquiring the migration lock — before any
+seeding, reconcile, or pending work — so migration bodies can `CALL` the helpers
+it defines. After the phase's reconcile + pending work finishes (whether it
+succeeded or threw), the runner unconditionally sweeps every procedure,
+function, trigger, and event whose `DEFINER` is the ephemeral migrate lease
+user and drops it (`DROP ... IF EXISTS`), scoped to that lease user only. This
+is what makes the migrate lease's later `DROP USER` immune to MySQL 8.4's
+`ER 4006` ("account is referenced as a definer") — once the lease user is the
+definer of nothing, the drop cannot fail on that account.
+
+**No magic-name fallback.** Earlier revisions of the migration engine created
+a fixed set of `zn_*` helper procedures on every run (owned by whichever
+ephemeral user happened to run the migration) — that's the exact pattern that
+caused the ER-4006 leftover-user bug. There is no default filename and no
+convention-based lookup: if `scaffoldingFile` is unset, the phase runs with no
+scaffolding step at all, byte-identical to a config without this field.
+
+Scaffolding is a *phase-scoped, disposable* concept — a scaffolding file's
+objects are meant to be destroyed at the end of every run of that phase. It is
+unrelated to the persistent, vault-provisioned routine bundle (`--routines-bundle`
+/ `--routines-version`, applied under a separate, persistent routines account
+before the migrate lease is even minted) — see the routine bundle notes in
+[Migration phases](#migration-phases-deploy-run) above.
+
+#### The persistent-definer-object rule (app authorship)
+
+Scaffolding cleanup drops **every** object owned by the migrate lease user —
+it cannot distinguish "this was a throwaway helper" from "this was meant to
+outlive the migration." That means migration authors have a hard obligation:
+
+> **Any object a migration creates that must survive the deploy — a view, a
+> persistent procedure/function the application calls at runtime, a trigger —
+> and that carries a `DEFINER`, must be created `SQL SECURITY INVOKER` or with
+> an explicit `DEFINER = '<persistent-account>'@'%'`. It must never be left
+> owned by the ephemeral migrate user.**
+
+If a persistent object is left DEFINER'd as the migrate user, one of two bad
+outcomes happens:
+
+- **With scaffolding configured:** the object is a definer-carrying object
+  owned by the migrate user, so the end-of-phase sweep drops it — the
+  migration silently destroys the very object it just created.
+- **Without scaffolding configured (or if the sweep is somehow bypassed):**
+  the object survives, but now the migrate lease's `DROP USER` on revoke hits
+  the same `ER 4006` this whole mechanism exists to prevent — a leftover
+  account that can never be cleanly revoked.
+
+This rule is **not enforced by vault or by this plugin** — it is app-repo
+authorship discipline. Recommend adding an INVOKER / no-transient-DEFINER lint
+to the app repo's migration CI (e.g. reject any `CREATE {VIEW|PROCEDURE|
+FUNCTION|TRIGGER}` in a migration file that lacks `SQL SECURITY INVOKER` and
+lacks an explicit, non-migrate `DEFINER=`) so this can't regress silently.
+
 ### Tunneled Deployment (`tunnel: true`)
 
 Deploy agents bind their `:9100` deploy/health server to loopback only, so it
