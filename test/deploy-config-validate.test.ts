@@ -106,12 +106,6 @@ describe('validateDeployConfig — postMigration', () => {
     expect(errors.some((e) => /postMigration/i.test(e) && /migrationsDir/i.test(e))).toBe(true);
   });
 
-  it('errors on malformed postMigration.routines', () => {
-    const cfg = base({ postMigration: { roleId: 'r', migrationsDir: 'db/post', routines: { bundle: '', version: 0 } } as any });
-    const { errors } = validateDeployConfig(cfg);
-    expect(errors.some((e) => /postMigration.*routines/i.test(e))).toBe(true);
-  });
-
   it('warns when pre and post share the same migrationsDir', () => {
     const cfg = base({
       migration: { roleId: 'r', migrationsDir: 'db/all' },

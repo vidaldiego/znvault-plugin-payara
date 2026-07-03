@@ -124,13 +124,12 @@ A deploy config may carry **two** schema-migration blocks: `migration` (pre-depl
 runs BEFORE any host) and `postMigration` (post-deploy, runs ONLY after a fully
 successful rollout). Post-deploy exists for **destructive** changes (drop
 column/table, remove routines) that are unsafe while old-WAR instances are still
-live. Both are the same `MigrationConfig` shape (role, dir, optional database,
-optional routines). **Pre and post MUST use different `migrationsDir` folders** —
+live. Both are the same `MigrationConfig` shape (role, dir, optional database).
+**Pre and post MUST use different `migrationsDir` folders** —
 the engine applies all-pending-per-dir, so a shared dir makes the post phase a
 silent no-op; `validateDeployConfig` warns on equal dirs.
 
-Ordered plan: apply pre routines → pre migrations → deploy all classes →
-post migrations.
+Ordered plan: pre migrations → deploy all classes → post migrations.
 
 **The post-deploy gate (load-bearing, safety-critical):** post runs iff
 `noFailures && fullCoverage && !isScoped` — every configured host reached the new
