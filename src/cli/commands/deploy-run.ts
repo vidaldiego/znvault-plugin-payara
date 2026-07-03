@@ -242,11 +242,6 @@ export async function runMigrationPhase(
       `[deploy] [dry-run] would run ${phase} schema migrations ` +
         `(role '${migration.roleId}', dir '${migration.migrationsDir}')`,
     );
-    if (migration.routines) {
-      ctx.output.info(
-        `[deploy] [dry-run] would apply routine bundle ${migration.routines.bundle} v${migration.routines.version} before ${phase} migrations`,
-      );
-    }
     return;
   }
 
@@ -260,7 +255,6 @@ export async function runMigrationPhase(
     // so the planner's integrity check treats sibling-applied rows as tracked, not
     // as orphaned (renamed/deleted) files.
     integrityDirs: opts.integrityDirs,
-    routines: migration.routines,
     scaffoldingFile: migration.scaffoldingFile,
   }, deps);
   ctx.output.info(`[deploy] ${phase} migrations complete.`);

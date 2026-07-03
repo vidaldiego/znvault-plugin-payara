@@ -205,13 +205,6 @@ export function registerConfigCommands(
             block.database
               ? `${indent}Database: ${block.database} (override)`
               : `${indent}Database: ${ANSI.dim}(from Vault dynamic-secrets connection)${ANSI.reset}`;
-          // `pad` is the full padded label (e.g. 'Bundle:   ' or 'Bundle: ') so
-          // the caller controls column alignment for its context (standalone lines
-          // align to 'Database:'; nested lines align to 'Dir:'/'Bundle:').
-          const bundleLine = (block: MigrationConfig, indent: string, pad: string): string =>
-            block.routines
-              ? `${indent}${pad}${block.routines.bundle} v${block.routines.version} (applied before migrations)`
-              : `${indent}${pad}${ANSI.dim}(none — migration engine assumes helpers already exist)${ANSI.reset}`;
 
           // Standalone render for a single phase (used when phases don't share
           // settings, or only one phase is configured).
@@ -222,7 +215,6 @@ export function registerConfigCommands(
             console.log(`    Dir:      ${block.migrationsDir}`);
             console.log(dbLine(block, '    '));
             if (block.scaffoldingFile) console.log(`    Scaffolding: ${block.scaffoldingFile}`);
-            console.log(bundleLine(block, '    ', 'Bundle:   ')); // aligns to 'Database:'
           };
 
           // Both phases present AND sharing the same role + database override →
@@ -236,15 +228,13 @@ export function registerConfigCommands(
             console.log(`\n  Migration:`);
             console.log(`    Role:     ${pre.roleId}`);
             console.log(dbLine(pre, '    '));
-            // Nested phase blocks: align 'Dir:' and 'Bundle:' to each other.
+            // Nested phase blocks: align 'Dir:' to each other.
             console.log(`    Pre-deploy:`);
             console.log(`      Dir:    ${pre.migrationsDir}`);
             if (pre.scaffoldingFile) console.log(`      Scaffolding: ${pre.scaffoldingFile}`);
-            console.log(bundleLine(pre, '      ', 'Bundle: '));
             console.log(`    Post-deploy:`);
             console.log(`      Dir:    ${post.migrationsDir}`);
             if (post.scaffoldingFile) console.log(`      Scaffolding: ${post.scaffoldingFile}`);
-            console.log(bundleLine(post, '      ', 'Bundle: '));
             return;
           }
 
@@ -287,9 +277,6 @@ export function registerConfigCommands(
         console.log(`\n  ${ANSI.bold}Execution plan${ANSI.reset} ${ANSI.dim}(what 'payara deploy run ${config.name}' does, in order)${ANSI.reset}:`);
         let step = 1;
         if (config.migration) {
-          if (config.migration.routines) {
-            console.log(`    ${step++}. Apply routine bundle ${config.migration.routines.bundle} v${config.migration.routines.version} (pre-deploy, before any host is touched; aborts the deploy on failure)`);
-          }
           console.log(`    ${step++}. Run pre-deploy schema migrations (role ${config.migration.roleId}; aborts the deploy on failure)`);
         }
 
@@ -342,9 +329,6 @@ export function registerConfigCommands(
 
         if (config.postMigration) {
           const noRollout = phases.length === 0;
-          if (config.postMigration.routines) {
-            console.log(`    ${step++}. Apply routine bundle ${config.postMigration.routines.bundle} v${config.postMigration.routines.version} (re-applied post-deploy before post-deploy migrations)`);
-          }
           const annot = noRollout
             ? '(no rollout in this config — runs via --post-only/--migrations-only)'
             : 'only if the rollout succeeded (all hosts on the new WAR, no failures)';
@@ -781,8 +765,6 @@ export function registerConfigCommands(
     .option('--dir <path>', 'Migrations directory (e.g. docs/migrations)')
     .option('--database <db>', 'DB name override (normally Vault connection provides it)')
     .option('--scaffolding-file <path>', 'Scaffolding SQL file: a bare filename (relative to --dir) OR an absolute path (lets one shared file serve both phases). Applied at phase start; its objects are dropped after reconcile.')
-    .option('--routines-bundle <name>', 'Routine bundle name to apply before migrations (requires --routines-version)')
-    .option('--routines-version <n>', 'Routine bundle version to apply before migrations (requires --routines-bundle)')
     .option('--clear', 'Remove the migration config for the selected --phase (pre by default)')
     .option('--phase <pre|post>', 'Which migration phase to set or clear (pre = before rollout, post = after successful rollout)', 'pre')
     .action(async (name: string, options: {
@@ -790,8 +772,6 @@ export function registerConfigCommands(
       dir?: string;
       database?: string;
       scaffoldingFile?: string;
-      routinesBundle?: string;
-      routinesVersion?: string;
       clear?: boolean;
       phase?: string;
     }) => {
@@ -831,20 +811,11 @@ export function registerConfigCommands(
           process.exit(1);
         }
 
-        if ((options.routinesBundle && !options.routinesVersion) || (!options.routinesBundle && options.routinesVersion)) {
-          ctx.output.error('--routines-bundle and --routines-version are required together');
-          ctx.output.info('Usage: znvault payara config set-migration <name> --role <roleId> --dir <path> --routines-bundle <name> --routines-version <n>');
-          process.exit(1);
-        }
-
         const migration: MigrationConfig = {
           roleId: options.role,
           migrationsDir: options.dir,
           ...(options.database ? { database: options.database } : {}),
           ...(options.scaffoldingFile ? { scaffoldingFile: options.scaffoldingFile } : {}),
-          ...(options.routinesBundle && options.routinesVersion
-            ? { routines: { bundle: options.routinesBundle, version: Number(options.routinesVersion) } }
-            : {}),
         };
 
         config[key] = migration;
@@ -860,9 +831,6 @@ export function registerConfigCommands(
         }
         if (migration.scaffoldingFile) {
           ctx.output.info(`  Scaffolding: ${migration.scaffoldingFile}`);
-        }
-        if (migration.routines) {
-          ctx.output.info(`  Routines: ${migration.routines.bundle} v${migration.routines.version} (applied before migrations)`);
         }
         ctx.output.info(`  Note: host/port/database otherwise come from the Vault dynamic-secrets connection referenced by the role.`);
       }, 'Failed to set migration config');

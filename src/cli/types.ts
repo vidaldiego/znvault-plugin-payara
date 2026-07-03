@@ -384,15 +384,6 @@ export interface MigrationConfig {
    * fallback: if unset, the phase has no scaffolding step.
    */
   scaffoldingFile?: string;
-  /**
-   * Optional server-owned routine bundle to apply BEFORE the migrate lease is
-   * minted (run-migrations.ts Step 0). Helper procedures (e.g. `zn_assert_*`)
-   * are provisioned by vault under the persistent routines account — NOT by
-   * the migration engine — so the ephemeral migrate user never owns a routine
-   * and revokes cleanly (MySQL 8.4 `ER 4006` DEFINER-reference guard). Absent
-   * = no bundle is applied and behavior is byte-identical to today.
-   */
-  routines?: { bundle: string; version: number };
 }
 
 /**
