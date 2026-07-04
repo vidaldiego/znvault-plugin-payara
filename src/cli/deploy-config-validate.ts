@@ -5,6 +5,7 @@
 import { isAbsolute } from 'node:path';
 import type { DeployConfig, MigrationConfig } from './types.js';
 import { resolveClass, hasActiveServerMap } from './deploy-class.js';
+import { expandTilde } from './deploy-config-paths.js';
 
 export interface ValidationReport {
   errors: string[];
@@ -19,6 +20,7 @@ function validateMigrationBlock(
   label: 'migration' | 'postMigration',
   errors: string[],
   info: string[],
+  hasRoot: boolean,
 ): void {
   const isPre = label === 'migration';
   if (!block.roleId || block.roleId.trim() === '') {
@@ -35,16 +37,54 @@ function validateMigrationBlock(
   if (block.scaffoldingFile !== undefined) {
     if (typeof block.scaffoldingFile !== 'string' || block.scaffoldingFile.length === 0) {
       errors.push(`config '${configName}' ${label}.scaffoldingFile must be a non-empty filename or absolute path.`);
-    } else if (!isAbsolute(block.scaffoldingFile) && (block.scaffoldingFile.includes('/') || block.scaffoldingFile.includes('\\'))) {
+    } else if (!hasRoot && !isAbsolute(block.scaffoldingFile) && (block.scaffoldingFile.includes('/') || block.scaffoldingFile.includes('\\'))) {
+      // When rootDir is set, a relative scaffoldingFile (with separators) is
+      // valid — it resolves against rootDir. Only enforce the bare-filename rule
+      // on the no-root path.
       errors.push(`config '${configName}' ${label}.scaffoldingFile must be a bare filename (relative to migrationsDir) or an absolute path — a relative path with separators is not allowed.`);
     }
   }
+}
+
+/** True if a value (after tilde-expansion) is a relative path. */
+function isRelativeAfterTilde(value: string): boolean {
+  return !isAbsolute(expandTilde(value));
 }
 
 export function validateDeployConfig(config: DeployConfig): ValidationReport {
   const errors: string[] = [];
   const warnings: string[] = [];
   const info: string[] = [];
+
+  // ── rootDir + relative-local-path validation ──
+  const rootDir = config.rootDir;
+  // A relative rootDir has nothing to anchor to → hard error.
+  if (rootDir !== undefined && rootDir !== '' && isRelativeAfterTilde(rootDir)) {
+    errors.push(`config '${config.name}' rootDir must be an absolute path (or start with ~/): '${rootDir}'.`);
+  }
+  const hasRoot = rootDir !== undefined && rootDir !== '';
+
+  // The 5 local fields, each with a label for the message.
+  const localFields: Array<{ label: string; value: string | undefined }> = [
+    { label: 'warPath', value: config.warPath },
+    { label: 'migration.migrationsDir', value: config.migration?.migrationsDir },
+    { label: 'migration.scaffoldingFile', value: config.migration?.scaffoldingFile },
+    { label: 'postMigration.migrationsDir', value: config.postMigration?.migrationsDir },
+    { label: 'postMigration.scaffoldingFile', value: config.postMigration?.scaffoldingFile },
+  ];
+  if (Array.isArray(config.classes)) {
+    for (const c of config.classes) {
+      if (c.warPath !== undefined) localFields.push({ label: `classes[${c.name}].warPath`, value: c.warPath });
+    }
+  }
+  // Relative local path + no rootDir → WARNING (not error). Today these resolve
+  // against cwd and are accepted (58+ existing fixtures rely on this); a hard
+  // error would be a breaking change. Guide the user without failing validation.
+  for (const f of localFields) {
+    if (f.value !== undefined && f.value !== '' && !hasRoot && isRelativeAfterTilde(f.value)) {
+      warnings.push(`config '${config.name}' ${f.label} is a relative path ('${f.value}') and no rootDir is configured — it will resolve against the current working directory; set rootDir for a stable base.`);
+    }
+  }
 
   const hasClasses = Array.isArray(config.classes);
 
@@ -125,10 +165,10 @@ export function validateDeployConfig(config: DeployConfig): ValidationReport {
 
   // ── Migration config validation (applies to BOTH flat and multi-class) ──
   if (config.migration) {
-    validateMigrationBlock(config.name, config.migration, 'migration', errors, info);
+    validateMigrationBlock(config.name, config.migration, 'migration', errors, info, hasRoot);
   }
   if (config.postMigration) {
-    validateMigrationBlock(config.name, config.postMigration, 'postMigration', errors, info);
+    validateMigrationBlock(config.name, config.postMigration, 'postMigration', errors, info, hasRoot);
   }
   if (
     config.migration?.migrationsDir &&

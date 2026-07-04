@@ -282,6 +282,14 @@ export type DeployClass = SharedDeployDefaults & {
  */
 export interface DeployConfig {
   name: string;
+  /**
+   * Optional root directory for RELATIVE local filesystem paths. When set,
+   * a relative warPath / migrationsDir / scaffoldingFile is resolved against
+   * this root; an absolute one is used as-is. A leading `~/` in rootDir (or in
+   * any local path field) expands to the home dir. Does NOT affect
+   * healthCheck.path or haproxy.socketPath (those are remote/URL paths).
+   */
+  rootDir?: string;
   hosts?: string[];                 // optional: absent on multi-class configs
   warPath?: string;                 // optional: may live per-class
   port?: number;                    // optional: may live per-class

@@ -174,3 +174,69 @@ describe('validateDeployConfig — migration.scaffoldingFile', () => {
     expect(errors.some((e) => /scaffoldingFile/i.test(e))).toBe(true);
   });
 });
+
+describe('rootDir validation', () => {
+  const mk = (over: Record<string, unknown>): any => ({ name: 'c', warPath: '/abs/app.war', ...over });
+
+  // rootDir itself: relative rootDir is a hard ERROR (nothing to anchor to).
+  it('rootDir that is relative → error', () => {
+    const r = validateDeployConfig(mk({ rootDir: 'rel/root' }));
+    expect(r.errors.some((e) => /rootDir must be an absolute path/.test(e))).toBe(true);
+  });
+
+  it('rootDir with leading ~ is accepted (expands to absolute)', () => {
+    const r = validateDeployConfig(mk({ rootDir: '~/Drive/x' }));
+    expect(r.errors.some((e) => /rootDir must be an absolute path/.test(e))).toBe(false);
+  });
+
+  // Relative local field WITHOUT rootDir is a WARNING, not an error
+  // (backward-compat: today these resolve against cwd and are accepted).
+  it('relative warPath with NO rootDir → WARNING (not error)', () => {
+    const r = validateDeployConfig(mk({ warPath: 'war/app.war' }));
+    expect(r.errors.some((e) => /warPath is a relative path/.test(e))).toBe(false);
+    expect(r.warnings.some((w) => /warPath is a relative path.*no rootDir/.test(w))).toBe(true);
+  });
+
+  it('relative warPath WITH rootDir → no warning', () => {
+    const r = validateDeployConfig(mk({ rootDir: '/root', warPath: 'war/app.war' }));
+    expect(r.warnings.some((w) => /warPath is a relative path/.test(w))).toBe(false);
+  });
+
+  it('relative migration.migrationsDir with NO rootDir → WARNING (not error)', () => {
+    const r = validateDeployConfig(mk({
+      migration: { roleId: 'r', migrationsDir: 'docs/pre' },
+    }));
+    expect(r.errors.some((e) => /migrationsDir is a relative path/.test(e))).toBe(false);
+    expect(r.warnings.some((w) => /migration\.migrationsDir is a relative path.*no rootDir/.test(w))).toBe(true);
+  });
+
+  it('rootDir set: relative scaffoldingFile WITH separators is VALID (supersedes the old rule)', () => {
+    const r = validateDeployConfig(mk({
+      rootDir: '/root',
+      migration: { roleId: 'r', migrationsDir: 'docs/pre', scaffoldingFile: 'docs/0000.sql' },
+    }));
+    expect(r.errors.some((e) => /scaffoldingFile must be a bare filename/.test(e))).toBe(false);
+  });
+
+  it('no rootDir: relative scaffoldingFile WITH separators still rejected (existing rule)', () => {
+    const r = validateDeployConfig(mk({
+      migration: { roleId: 'r', migrationsDir: '/abs/pre', scaffoldingFile: 'sub/0000.sql' },
+    }));
+    expect(r.errors.some((e) => /scaffoldingFile must be a bare filename/.test(e))).toBe(true);
+  });
+
+  it('existing all-absolute config with no rootDir stays valid (no errors)', () => {
+    const r = validateDeployConfig(mk({
+      migration: { roleId: 'r', migrationsDir: '/abs/pre', scaffoldingFile: '/abs/0000.sql' },
+    }));
+    expect(r.errors.length).toBe(0);
+  });
+
+  it('BACKWARD-COMPAT: existing relative-migrationsDir fixture (docs/migrations, no root) still has NO errors', () => {
+    // This is the shape of 58+ existing fixtures — must not become an error.
+    const r = validateDeployConfig(mk({
+      migration: { roleId: 'zincdb-rw', migrationsDir: 'docs/migrations' },
+    }));
+    expect(r.errors.length).toBe(0); // warning is allowed; error is not
+  });
+});

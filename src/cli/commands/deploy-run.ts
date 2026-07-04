@@ -50,6 +50,7 @@ import { openTunnel, type Tunnel } from '../ssh-tunnel.js';
 import { getUnmappedHosts, testHAProxyConnectivity } from '../haproxy.js';
 import { resolveClass, partitionSelectedClasses } from '../deploy-class.js';
 import { validateDeployConfig } from '../deploy-config-validate.js';
+import { resolveConfigPaths } from '../deploy-config-paths.js';
 import {
   executeMultiClassDeployment,
   printMultiClassDryRun,
@@ -336,6 +337,25 @@ export function registerDeployRunCommand(
           process.exit(1);
         }
 
+        // Validate the AS-STORED config (so relative-path / rootDir messages
+        // quote what the user wrote + emit the relative-without-root warning),
+        // then resolve every local filesystem path to absolute against rootDir
+        // (+ tilde expansion). Everything downstream — runMigrationPhase,
+        // siblingIntegrityDirs, the WAR deployer, the multi-class executor, and
+        // the migrate library — receives ABSOLUTE paths and needs no rootDir
+        // awareness. (The existing per-branch validateDeployConfig calls remain
+        // and re-emit info lines on the resolved config; this early pass adds the
+        // hard-error gate + surfaces the as-stored warnings once.)
+        {
+          const preReport = validateDeployConfig(config);
+          for (const w of preReport.warnings) ctx.output.warn(w);
+          if (preReport.errors.length > 0) {
+            for (const e of preReport.errors) ctx.output.error(e);
+            process.exit(1);
+          }
+        }
+        config = resolveConfigPaths(config);
+
         // Resolve the six-flag plan (pure). Contradictions abort before any host.
         const { plan, error: planError } = resolveDeployPlan({
           skipMigrations: options.skipMigrations, skipPre: options.skipPre, skipPost: options.skipPost,
@@ -361,8 +381,9 @@ export function registerDeployRunCommand(
         //    resolution / preflight) so --post-only needs no WAR or reachable hosts.
         if (!plan.runRollout) {
           // Validate first (parity with the multi-class rollout path).
+          // Warnings were already surfaced by the pre-resolve pass above (on the
+          // as-stored paths); only re-emit info + re-check the error gate here.
           const report = validateDeployConfig(config);
-          for (const w of report.warnings) ctx.output.warn(w);
           for (const i of report.info) ctx.output.info(i);
           if (report.errors.length > 0) { for (const e of report.errors) ctx.output.error(e); process.exit(1); }
 
@@ -387,8 +408,8 @@ export function registerDeployRunCommand(
         // ── Multi-class branch (Spec §3, §4) ──
         if (detectConfigShape(config) === 'multi-class') {
           // 1. Validate (zero network I/O) — hard violation aborts before any host.
+          // Warnings already surfaced by the pre-resolve pass; re-emit info + error gate only.
           const report = validateDeployConfig(config);
-          for (const w of report.warnings) ctx.output.warn(w);
           for (const i of report.info) ctx.output.info(i);
           if (report.errors.length > 0) {
             for (const e of report.errors) ctx.output.error(e);
@@ -425,8 +446,8 @@ export function registerDeployRunCommand(
         }
 
         // Validate migration blocks before touching any host (flat path — SF6).
+        // Warnings already surfaced by the pre-resolve pass; error gate only.
         const flatReport = validateDeployConfig(config);
-        for (const w of flatReport.warnings) ctx.output.warn(w);
         if (flatReport.errors.length > 0) { for (const e of flatReport.errors) ctx.output.error(e); process.exit(1); }
 
         // Single-host filter (--host / --only) — scope a config deploy to a
