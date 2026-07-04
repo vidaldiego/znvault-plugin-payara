@@ -60,6 +60,7 @@ Add the plugin to your agent's `config.json`:
 | `secrets` | object | No | Environment variables to write to `setenv.conf` |
 | `fileSourceRoot` | string | No | Allowlist root for `file:` secret sources (default `/etc/zn-agent/node/`). A `file:` path is resolved under this root; outside-root paths are rejected and the env var omitted. |
 | `watchSecrets` | string[] | No | Secret aliases to watch for changes |
+| `rootDir` | string | No | Absolute path (or `~/`-prefixed) base for RELATIVE local paths (`warPath`, `migrationsDir`, `scaffoldingFile`). Leading `~/` expands to home; absolute values used as-is. Does NOT affect `healthCheck.path` or `haproxy.socketPath` (remote/URL paths). (v2.5.0) |
 
 ### Secrets Configuration
 
@@ -231,6 +232,89 @@ znvault payara config set staging war /new/path.war
 znvault payara config delete staging
 ```
 
+### Config templates & rootDir (portable configs)
+
+A deploy config's local paths (`warPath`, each phase's `migrationsDir` and
+`scaffoldingFile`) are normally absolute — fine on the machine that authored the
+config, but not portable to another checkout or another engineer's laptop.
+**`rootDir`** makes them relative: it is a config-level base that RELATIVE local
+paths resolve against, so a config can be checked into a repo and used anywhere.
+
+Resolution is per-path:
+
+- a leading `~/` (or bare `~`) expands to the home directory;
+- an **absolute path wins** — it is used as-is and `rootDir` is ignored;
+- a **relative path joins `rootDir`**.
+
+`rootDir` only anchors *local* paths (`warPath` + each class's `warPath`, and each
+migration phase's `migrationsDir` + `scaffoldingFile`). It never touches
+`healthCheck.path` or `haproxy.socketPath` — those are remote/URL paths on the
+Payara host. Set it on a saved config with:
+
+```bash
+znvault payara config set staging rootdir /Users/me/dev/zincapi-parent
+# (an empty value clears it)
+```
+
+`znvault payara config show <cfg>` renders a `Root:` line when `rootDir` is set.
+
+**Validation** (`config validate <cfg>`, also run before every import/deploy):
+
+- A relative local path with **no `rootDir`** configured → a **WARNING**: it still
+  works (it resolves against the current working directory), but the base is
+  unstable. Set `rootDir` for a stable anchor.
+- A **relative `rootDir` itself** → a hard **ERROR**: an anchor has nothing to
+  anchor to, so `rootDir` must be absolute or start with `~/`.
+
+#### Exporting a portable template
+
+```bash
+znvault payara config export staging [file]
+```
+
+Writes a saved config out to a portable template file with **`rootDir` stripped**
+(it is machine-specific — you supply it on the other side with `--with-root`). The
+default output file is `<name>.payara.json`.
+
+#### Importing a template
+
+```bash
+znvault payara config import <file> [--with-root <dir>] [--name <n>] [-f|--force]
+```
+
+Reads a template into the saved-config store. `--with-root <dir>` sets (or
+overrides) the config's `rootDir` to the resolved directory — `--with-root .`
+anchors it to the current directory. `--name` overrides the stored name (defaults
+to the file's `name` field). The config is **validated before it is saved** (a hard
+error aborts the import). Importing over an existing config is an *upgrade*: on a
+TTY you are prompted to confirm; `--force` skips the prompt; a non-TTY import over
+an existing name without `--force` errors.
+
+#### Deploying directly from a file
+
+```bash
+znvault payara deploy run <file> [--with-root <dir>]
+```
+
+When the positional argument looks like a **file path** — it contains `/`, `\`, or
+ends in `.json` — `deploy run` reads that config from the file and deploys it
+**ephemerally**: the config is never written to the store. This is a purely lexical
+decision, so a saved config name (which never contains a separator or `.json`) is
+never misclassified. `--with-root` also works on a **saved** config name — it
+overrides that config's `rootDir` **for this single run only** (it operates on a
+copy; the stored config is never mutated).
+
+#### Example: move a config between machines
+
+```bash
+# Machine A — export the staging config to a portable template and check it in
+znvault payara config export staging
+git add staging.payara.json && git commit -m "chore: portable staging deploy config"
+
+# Machine B — import it, anchoring relative paths to the repo checkout
+znvault payara config import staging.payara.json --with-root .
+```
+
 ### Migration phases (`payara deploy run`)
 
 A deploy config may carry **two** schema-migration blocks:
@@ -322,7 +406,7 @@ znvault payara config set-migration staging \
 
 | Flag | Required | Description |
 |------|:---:|-------------|
-| `--scaffolding-file <path>` | No | The scaffolding SQL file: either a bare filename **relative to `--dir`** (a relative path with `/` or `\` fails validation), or an **absolute path**. Applied at the start of the phase and cleaned up after reconcile. |
+| `--scaffolding-file <path>` | No | The scaffolding SQL file: either a bare filename **relative to `--dir`** (a relative path with `/` or `\` fails validation *unless `rootDir` is set*), an **absolute path**, or — when the config has a `rootDir` — a **relative path with separators** (it resolves against `rootDir`). Applied at the start of the phase and cleaned up after reconcile. |
 
 An absolute path can be used so a single helper file serves **both** the pre-
 and post-deploy phases — which normally have different `migrationsDir`s, so a
@@ -635,6 +719,14 @@ Runs all structural checks — duplicate hosts, class names, `serverMap` integri
 
 Multi-class configs are authored by **editing `~/.znvault/payara/configs.json` directly**. There is no CLI command to create or modify a `classes` block in v1 — use `payara config validate <name>` as the safety net after each edit. The worked example above is the canonical starting point for a two-class api + worker environment.
 
+> **File-based portability (v2.6.0).** You no longer have to hand-edit the live
+> store in place: `payara config export <name>` writes a config (multi-class
+> `classes` block included) to a standalone template file you can edit and check
+> into a repo, and `payara config import <file> [--with-root .]` reads it back into
+> the store (validated before saving). See
+> [Config templates & rootDir](#config-templates--rootdir-portable-configs) — this
+> is the recommended way to move or version a multi-class config across machines.
+
 #### How it works (per host)
 
 Within the serving batch (and within the final worker batch), each host runs the following sequence:
@@ -898,6 +990,36 @@ npm run lint
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v2.6.0
+- **Config templates: `export` / `import` + deploy-from-file.** A saved deploy
+  config can now be moved between checkouts and machines as a portable template.
+  `payara config export <name> [file]` writes the config to `<name>.payara.json`
+  (default) with the machine-specific `rootDir` **stripped**;
+  `payara config import <file> [--with-root <dir>] [--name <n>] [-f|--force]` reads
+  a template into the store, stamping in a `rootDir` via `--with-root` (`.` = the
+  current dir), validating before it saves, and treating an import over an existing
+  name as an upgrade (TTY confirm; `--force` to skip; non-TTY without `--force`
+  errors). `payara deploy run <file> [--with-root <dir>]` deploys **ephemerally**
+  straight from a file when the argument looks like a path (contains `/`, `\`, or
+  ends `.json`) — never saved; `--with-root` on a **saved** config name overrides
+  its `rootDir` for that single run only (the stored config is untouched). See
+  [Config templates & rootDir](#config-templates--rootdir-portable-configs).
+
+### v2.5.0
+- **Config-level `rootDir` for relative local paths.** A deploy config may set
+  `rootDir` — an absolute (or `~/`-prefixed) base that RELATIVE local paths resolve
+  against, making a config portable instead of hard-coding absolute paths. It
+  anchors `warPath` (top-level + per-class) and each migration phase's
+  `migrationsDir` + `scaffoldingFile`; it never touches `healthCheck.path` or
+  `haproxy.socketPath` (remote/URL paths). Per-path rule: leading `~/` expands to
+  home, an absolute path wins (used as-is), a relative path joins `rootDir`. Paths
+  resolve **exactly once** before rollout (the config is validated as-stored, then
+  run fully absolute). Validation: a relative local path with no `rootDir` → a
+  **warning** (resolves against cwd; back-compat preserved); a relative `rootDir`
+  itself → a hard **error**. Set it with `payara config set <name> rootdir <path>`;
+  `payara config show` renders a `Root:` line. See
+  [Config templates & rootDir](#config-templates--rootdir-portable-configs).
 
 ### v2.0.1
 - **Fix: post-deploy migrations no longer fail with `OrphanTrackedRowError`.** The pre/post

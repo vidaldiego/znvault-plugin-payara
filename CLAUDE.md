@@ -91,7 +91,8 @@ to v1.21.1. Two layers:
    deploys every node class (api, worker, future) as **ordered phases**, each
    self-describing (own `strategy`, `blocking`, `haproxy` drain, `quiesce`, and
    overridable shared defaults incl. a per-class WAR). Classes deploy in array
-   order behind a **blocking gate**.
+   order behind a **blocking gate**. (Relative `warPath`s — top-level or per-class —
+   are anchored by config-level `rootDir`; see "Config templates & rootDir" below.)
 
 **Key files** — `deploy-class.ts` (`resolveClass`, `partitionSelectedClasses`,
 `hasActiveServerMap`), `deploy-config-validate.ts` (`validateDeployConfig`),
@@ -124,8 +125,9 @@ A deploy config may carry **two** schema-migration blocks: `migration` (pre-depl
 runs BEFORE any host) and `postMigration` (post-deploy, runs ONLY after a fully
 successful rollout). Post-deploy exists for **destructive** changes (drop
 column/table, remove routines) that are unsafe while old-WAR instances are still
-live. Both are the same `MigrationConfig` shape (role, dir, optional database).
-**Pre and post MUST use different `migrationsDir` folders** —
+live. Both are the same `MigrationConfig` shape (role, dir, optional database; a relative
+`migrationsDir`/`scaffoldingFile` is anchored by config-level `rootDir` — see "Config
+templates & rootDir" below). **Pre and post MUST use different `migrationsDir` folders** —
 the engine applies all-pending-per-dir, so a shared dir makes the post phase a
 silent no-op; `validateDeployConfig` warns on equal dirs.
 
@@ -160,6 +162,44 @@ wiring in `commands/deploy-run.ts`, `ClassOutcome.coverageOk` in
 renders both phases + the execution plan. Guide: README → migration flags. Design:
 `../docs/superpowers/specs/2026-07-02-post-deploy-migration-phase-design.md`; runbook:
 `../docs/superpowers/runbooks/2026-07-02-post-deploy-migration-phase-rollout.md`.
+
+### Config templates & rootDir (v2.5.0 / v2.6.0)
+
+`DeployConfig.rootDir?: string` (`types.ts`) **anchors RELATIVE local paths** in a
+config so a template is portable across checkouts/machines. Anchored: `warPath` +
+each class's `warPath`, and the `migration`/`postMigration` `migrationsDir` +
+`scaffoldingFile`. **NEVER anchored:** `healthCheck.path` (remote, on the Payara
+host) and `haproxy.socketPath` (remote). Per-path rule (`resolveConfigPath`): a
+leading `~/` tilde-expands to `$HOME`; an **absolute path WINS** (used as-is,
+ignores `rootDir`); a **relative path joins `rootDir`**. Resolution happens
+**exactly once** in `commands/deploy-run.ts` — validate the config **as-stored**,
+then `resolveConfigPaths` → run with everything absolute. So the downstream
+`@zincapp/znvault-migrate` runner only ever sees absolute paths and is untouched by
+this feature.
+
+**Validation** (`deploy-config-validate.ts`): a relative local path with **no
+`rootDir`** set → **WARNING** only (backward-compat — existing cwd-relative configs
+keep working). A **relative `rootDir`** itself → **ERROR** (an anchor must be
+absolute/`~`).
+
+**Commands** — `payara config export <name> [file]` **strips `rootDir`** → a
+portable template (relative paths, no machine-specific anchor). `payara config
+import <file> --with-root <dir> [--name] [--force]` stamps a `rootDir` in on import
+(TTY-gated upgrade-confirm before overwriting an existing config; `--force` skips).
+`payara deploy run <file> --with-root <dir>` runs an **ephemeral** file-config
+(never saved). File-vs-saved-name is a **lexical** decision via
+`config-arg.ts`→`isConfigFilePath` (treated as a **file** iff the arg contains `/`,
+`\`, or ends `.json`; otherwise a saved config name). `--with-root` on a **saved
+name** overrides that config's `rootDir` **for the run only** (operates on a
+non-mutating copy — the stored config is unchanged).
+
+**Key files** — `deploy-config-paths.ts` (`expandTilde`, `resolveConfigPath`,
+`resolveConfigPaths`), `config-file.ts` (`loadConfigFromFile(filePath, withRoot?)`),
+`config-arg.ts` (`isConfigFilePath`); commands in `commands/deploy-config.ts` +
+`commands/deploy-run.ts`.
+
+Design: `../docs/superpowers/specs/2026-07-04-payara-deploy-config-rootdir-design.md`
++ `../docs/superpowers/specs/2026-07-04-payara-config-templates-import-export-design.md`.
 
 ## Testing
 
