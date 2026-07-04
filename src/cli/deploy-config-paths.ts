@@ -47,7 +47,7 @@ export function resolveConfigPath(
  * Task 2) so this module compiles standalone ahead of that change.
  */
 export function resolveConfigPaths(config: DeployConfig): DeployConfig {
-  const root = (config as { rootDir?: string }).rootDir;
+  const root = config.rootDir;
   const out: DeployConfig = { ...config };
 
   const war = resolveConfigPath(config.warPath, root);
