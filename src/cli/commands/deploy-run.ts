@@ -50,6 +50,7 @@ import { openTunnel, type Tunnel } from '../ssh-tunnel.js';
 import { getUnmappedHosts, testHAProxyConnectivity } from '../haproxy.js';
 import { resolveClass, partitionSelectedClasses } from '../deploy-class.js';
 import { validateDeployConfig } from '../deploy-config-validate.js';
+import { resolveConfigPaths } from '../deploy-config-paths.js';
 import {
   executeMultiClassDeployment,
   printMultiClassDryRun,
@@ -335,6 +336,25 @@ export function registerDeployRunCommand(
           ctx.output.info('Use "znvault payara config list" to see available configs');
           process.exit(1);
         }
+
+        // Validate the AS-STORED config (so relative-path / rootDir messages
+        // quote what the user wrote + emit the relative-without-root warning),
+        // then resolve every local filesystem path to absolute against rootDir
+        // (+ tilde expansion). Everything downstream — runMigrationPhase,
+        // siblingIntegrityDirs, the WAR deployer, the multi-class executor, and
+        // the migrate library — receives ABSOLUTE paths and needs no rootDir
+        // awareness. (The existing per-branch validateDeployConfig calls remain
+        // and re-emit info lines on the resolved config; this early pass adds the
+        // hard-error gate + surfaces the as-stored warnings once.)
+        {
+          const preReport = validateDeployConfig(config);
+          for (const w of preReport.warnings) ctx.output.warn(w);
+          if (preReport.errors.length > 0) {
+            for (const e of preReport.errors) ctx.output.error(e);
+            process.exit(1);
+          }
+        }
+        config = resolveConfigPaths(config);
 
         // Resolve the six-flag plan (pure). Contradictions abort before any host.
         const { plan, error: planError } = resolveDeployPlan({
