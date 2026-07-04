@@ -29,7 +29,7 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { runMigrationPhase, siblingIntegrityDirs } from '../src/cli/commands/deploy-run.js';
-import type { RunMigrationsDeps } from '../src/run-migrations.js';
+import type { RunMigrationsDeps } from '@zincapp/znvault-migrate';
 import type { DeployConfig, CLIPluginContext } from '../src/cli/types.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -53,7 +53,7 @@ function makeMockDeps(overrides: {
   const mockDbHandle = { end: vi.fn().mockResolvedValue(undefined) };
   return {
     client: { issueCredential: issue, revokeCredential: revoke },
-    openDb: vi.fn().mockResolvedValue(mockDbHandle) as RunMigrationsDeps['openDb'],
+    openConnection: vi.fn().mockResolvedValue(mockDbHandle) as RunMigrationsDeps['openConnection'],
     // vi.fn so tests can inspect the args forwarded to makeRunner (esp. integrityDirs).
     makeRunner: vi.fn(() => ({ run })),
   };

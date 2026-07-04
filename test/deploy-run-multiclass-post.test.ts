@@ -5,8 +5,8 @@ vi.mock('../src/cli/multi-class-deploy.js', async () => {
   const actual = await vi.importActual<typeof import('../src/cli/multi-class-deploy.js')>('../src/cli/multi-class-deploy.js');
   return { ...actual, executeMultiClassDeployment: vi.fn(async () => mcResult), printMultiClassSummary: vi.fn(), printMultiClassDryRun: vi.fn() };
 });
-vi.mock('../src/run-migrations.js', async () => {
-  const actual = await vi.importActual<typeof import('../src/run-migrations.js')>('../src/run-migrations.js');
+vi.mock('@zincapp/znvault-migrate', async () => {
+  const actual = await vi.importActual<typeof import('@zincapp/znvault-migrate')>('@zincapp/znvault-migrate');
   return { ...actual, runMigrations: vi.fn().mockResolvedValue(undefined) };
 });
 vi.mock('../src/cli/config-store.js', () => ({
