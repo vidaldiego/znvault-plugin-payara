@@ -12,8 +12,8 @@ vi.mock('../src/cli/config-store.js', () => ({
   }),
 }));
 // Stub the migration engine so --post-only/--pre-only don't hit a DB.
-vi.mock('../src/run-migrations.js', async () => {
-  const actual = await vi.importActual<typeof import('../src/run-migrations.js')>('../src/run-migrations.js');
+vi.mock('@zincapp/znvault-migrate', async () => {
+  const actual = await vi.importActual<typeof import('@zincapp/znvault-migrate')>('@zincapp/znvault-migrate');
   return { ...actual, runMigrations: vi.fn().mockResolvedValue(undefined) };
 });
 

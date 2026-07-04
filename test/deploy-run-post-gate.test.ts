@@ -5,8 +5,8 @@ vi.mock('../src/cli/listr-deploy.js', async () => {
   const actual = await vi.importActual<typeof import('../src/cli/listr-deploy.js')>('../src/cli/listr-deploy.js');
   return { ...actual, executeListrDeployment: vi.fn(async () => deployResult), printDeploymentSummary: vi.fn() };
 });
-vi.mock('../src/run-migrations.js', async () => {
-  const actual = await vi.importActual<typeof import('../src/run-migrations.js')>('../src/run-migrations.js');
+vi.mock('@zincapp/znvault-migrate', async () => {
+  const actual = await vi.importActual<typeof import('@zincapp/znvault-migrate')>('@zincapp/znvault-migrate');
   return { ...actual, runMigrations: vi.fn().mockResolvedValue(undefined) };
 });
 // Preflight must return all hosts reachable + analyzed with changes by

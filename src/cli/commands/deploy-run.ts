@@ -2,7 +2,7 @@
 // Deploy run command - multi-host deployment using saved configurations
 
 import type { Command } from 'commander';
-import { runMigrations, defaultDeps as migrationDefaultDeps } from '../../run-migrations.js';
+import { runMigrations, defaultDeps as migrationDefaultDeps, mysqlAdapter } from '@zincapp/znvault-migrate';
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -213,7 +213,7 @@ export async function runMigrationPhase(
   phase: 'pre-deploy' | 'post-deploy',
   configName: string,
   ctx: CLIPluginContext,
-  deps = migrationDefaultDeps(ctx.client),
+  deps = migrationDefaultDeps(ctx.client, mysqlAdapter),
   opts: { dryRun?: boolean; run?: boolean; skipReason?: MigrationSkipReason; integrityDirs?: string[] } = {},
 ): Promise<void> {
   if (!migration) return;
@@ -248,6 +248,7 @@ export async function runMigrationPhase(
   ctx.output.info(`[deploy] Running ${phase} schema migrations...`);
   await runMigrations(ctx, {
     env: configName,
+    engine: 'mysql',
     roleId: migration.roleId,
     migrationsDir: migration.migrationsDir,
     database: migration.database,
