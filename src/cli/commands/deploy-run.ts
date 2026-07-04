@@ -3,12 +3,14 @@
 
 import type { Command } from 'commander';
 import { runMigrations, defaultDeps as migrationDefaultDeps, mysqlAdapter } from '@zincapp/znvault-migrate';
-import { resolve } from 'node:path';
+import { resolve, join, basename } from 'node:path';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { calculateWarHashes } from '../../war-deployer.js';
 import { loadDeployConfigs } from '../config-store.js';
+import { isConfigFilePath } from '../config-arg.js';
+import { loadConfigFromFile } from '../config-file.js';
+import { expandTilde } from '../deploy-config-paths.js';
 import {
   getWarInfo,
   ProgressReporter,
@@ -291,6 +293,7 @@ export function registerDeployRunCommand(
     .option('--skip-post', 'Skip the post-deploy migration phase (still runs pre + deploys)')
     .option('--pre-only', 'Run only the pre-deploy migration phase, then stop (no rollout)')
     .option('--post-only', 'Run only the post-deploy migration phase, then stop (no rollout) — recovery')
+    .option('--with-root <dir>', 'Base dir for relative local paths in the config (sets/overrides rootDir for this deploy)')
     .action(async (configName: string, options: {
       force?: boolean;
       dryRun?: boolean;
@@ -310,6 +313,7 @@ export function registerDeployRunCommand(
       skipPost?: boolean;
       preOnly?: boolean;
       postOnly?: boolean;
+      withRoot?: string;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
       const isPlain = ctx.isPlainMode();
@@ -328,13 +332,32 @@ export function registerDeployRunCommand(
       process.on('exit', killTunnelsSync);
 
       try {
-        const store = await loadDeployConfigs();
-        config = store.configs[configName];
-
-        if (!config) {
-          ctx.output.error(`Deployment config '${configName}' not found`);
-          ctx.output.info('Use "znvault payara config list" to see available configs');
-          process.exit(1);
+        if (isConfigFilePath(configName)) {
+          // Deploy directly from a file — ephemeral, never written to the store.
+          // loadConfigFromFile applies --with-root (sets rootDir) inside the helper.
+          config = loadConfigFromFile(configName, options.withRoot);
+          // Ensure a non-empty name/label so downstream logging/validation never
+          // prints 'config undefined'. The file basename (minus .json) is a fine
+          // ephemeral label; only cosmetic (a log/env string).
+          if (!config.name) config.name = basename(configName, '.json');
+          configName = config.name;
+        } else {
+          const store = await loadDeployConfigs();
+          config = store.configs[configName];
+          if (!config) {
+            ctx.output.error(`Deployment config '${configName}' not found`);
+            ctx.output.info('Use "znvault payara config list" to see available configs');
+            process.exit(1);
+          }
+          // --with-root on a SAVED name overrides its rootDir for THIS run only
+          // (never persisted — deploy-run never calls saveDeployConfigs). Copy
+          // rather than mutate the store's object (the store may cache/reuse it
+          // across calls). This must land BEFORE the pre-resolve
+          // validateDeployConfig below so both validate and resolveConfigPaths
+          // see the overridden root.
+          if (options.withRoot) {
+            config = { ...config, rootDir: resolve(expandTilde(options.withRoot)) };
+          }
         }
 
         // Validate the AS-STORED config (so relative-path / rootDir messages

@@ -1,12 +1,14 @@
 // Path: src/cli/commands/deploy-config.ts
 // Deploy config management commands
 
+import { writeFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import type { CLIPluginContext, DeployConfig, HealthCheckConfig, HAProxyConfig, MigrationConfig } from '../types.js';
 import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
 import { getConfigOrExit, confirmPrompt, withErrorHandling } from './helpers.js';
 import { validateDeployConfig } from '../deploy-config-validate.js';
+import { loadConfigFromFile } from '../config-file.js';
 import { resolveClass, hasActiveServerMap } from '../deploy-class.js';
 import { parseDeploymentStrategy } from '../types.js';
 
@@ -345,6 +347,70 @@ export function registerConfigCommands(
 
         console.log();
       }, 'Failed to show config');
+    });
+
+  // deploy config export <name> [file]
+  configCmd
+    .command('export <name> [file]')
+    .description('Write a saved config to a portable template file (rootDir stripped)')
+    .action(async (name: string, file: string | undefined) => {
+      await withErrorHandling(ctx, async () => {
+        const { config } = await getConfigOrExit(ctx, name);
+        // Portability transform: strip the machine-specific rootDir. Safe as a
+        // shallow copy because rootDir is a top-level-only field and we mutate
+        // nothing nested before JSON.stringify.
+        const copy = { ...config };
+        delete copy.rootDir;
+        const outPath = file ?? `${name}.payara.json`;
+        writeFileSync(outPath, JSON.stringify(copy, null, 2) + '\n');
+        ctx.output.success(
+          `Exported '${name}' → ${outPath} (rootDir stripped — supply it on import/deploy with --with-root).`,
+        );
+      }, 'Failed to export config');
+    });
+
+  // deploy config import <file>
+  configCmd
+    .command('import <file>')
+    .description('Import a config template file into the saved-config store')
+    .option('--with-root <dir>', 'Base dir for relative local paths (sets/overrides rootDir; e.g. --with-root .)')
+    .option('--name <name>', 'Override the config name (defaults to the file\'s "name" field)')
+    .option('-f, --force', 'Overwrite an existing config without prompting')
+    .action(async (file: string, options: { withRoot?: string; name?: string; force?: boolean }) => {
+      await withErrorHandling(ctx, async () => {
+        const config = loadConfigFromFile(file, options.withRoot);
+        const name = options.name ?? config.name;
+        if (!name) {
+          ctx.output.error('config file has no "name" field; pass --name <name>');
+          process.exit(1);
+        }
+        config.name = name; // keep the object's name aligned with its store key
+
+        const report = validateDeployConfig(config);
+        for (const w of report.warnings) ctx.output.warn(w);
+        if (report.errors.length > 0) {
+          for (const e of report.errors) ctx.output.error(e);
+          process.exit(1);
+        }
+
+        const store = await loadDeployConfigs();
+        const existed = Boolean(store.configs[name]);
+        if (existed && !options.force) {
+          if (process.stdin.isTTY) {
+            const ok = await confirmPrompt(`Config '${name}' already exists. Overwrite (upgrade)?`, false);
+            if (!ok) { ctx.output.info('Import aborted.'); return; }
+          } else {
+            ctx.output.error(`config '${name}' exists; pass --force to overwrite`);
+            process.exit(1);
+          }
+        }
+
+        store.configs[name] = config;
+        await saveDeployConfigs(store);
+        ctx.output.success(
+          `Imported '${name}' (${existed ? 'upgraded' : 'created'}). rootDir = ${config.rootDir ?? '(none — paths must be absolute or set one)'}`,
+        );
+      }, 'Failed to import config');
     });
 
   // deploy config delete <name>
