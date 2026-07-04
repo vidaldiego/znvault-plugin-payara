@@ -126,6 +126,9 @@ export function registerConfigCommands(
           console.log(`  Description: ${config.description}`);
         }
         console.log(`  WAR Path:    ${config.warPath || ANSI.dim + '(not set)' + ANSI.reset}`);
+        if (config.rootDir) {
+          console.log(`  Root:        ${config.rootDir}`);
+        }
         console.log(`  Port:        ${config.port}`);
         // A multi-class config carries hosts/strategy/haproxy PER CLASS; the flat
         // top-level fields are defaults (often unset), so present them accordingly.
@@ -421,7 +424,7 @@ export function registerConfigCommands(
   // deploy config set <name> <key> <value>
   configCmd
     .command('set <name> <key> <value>')
-    .description('Set a configuration value (war, port, strategy, parallel, tunnel, description, tls, tls-port)')
+    .description('Set a configuration value (war, port, strategy, parallel, tunnel, description, tls, tls-port, rootdir)')
     .action(async (name: string, key: string, value: string) => {
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
@@ -430,6 +433,16 @@ export function registerConfigCommands(
           case 'war':
           case 'warpath':
             config.warPath = value;
+            break;
+          case 'rootdir':
+            // Store the raw value (tilde NOT expanded here — expansion happens
+            // at deploy-resolve time so the stored config stays portable).
+            // An empty string clears rootDir.
+            if (value === '') {
+              delete config.rootDir;
+            } else {
+              config.rootDir = value;
+            }
             break;
           case 'port':
             config.port = parsePort(value);
