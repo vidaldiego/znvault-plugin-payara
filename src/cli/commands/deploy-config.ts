@@ -1,6 +1,7 @@
 // Path: src/cli/commands/deploy-config.ts
 // Deploy config management commands
 
+import { writeFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import type { CLIPluginContext, DeployConfig, HealthCheckConfig, HAProxyConfig, MigrationConfig } from '../types.js';
 import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
@@ -345,6 +346,26 @@ export function registerConfigCommands(
 
         console.log();
       }, 'Failed to show config');
+    });
+
+  // deploy config export <name> [file]
+  configCmd
+    .command('export <name> [file]')
+    .description('Write a saved config to a portable template file (rootDir stripped)')
+    .action(async (name: string, file: string | undefined) => {
+      await withErrorHandling(ctx, async () => {
+        const { config } = await getConfigOrExit(ctx, name);
+        // Portability transform: strip the machine-specific rootDir. Safe as a
+        // shallow copy because rootDir is a top-level-only field and we mutate
+        // nothing nested before JSON.stringify.
+        const copy = { ...config };
+        delete copy.rootDir;
+        const outPath = file ?? `${name}.payara.json`;
+        writeFileSync(outPath, JSON.stringify(copy, null, 2) + '\n');
+        ctx.output.success(
+          `Exported '${name}' → ${outPath} (rootDir stripped — supply it on import/deploy with --with-root).`,
+        );
+      }, 'Failed to export config');
     });
 
   // deploy config delete <name>
