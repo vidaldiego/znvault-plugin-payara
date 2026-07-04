@@ -93,3 +93,27 @@ describe('resolveConfigPaths', () => {
     expect(r.migration!.scaffoldingFile).toBe('/a/0000.sql');
   });
 });
+
+describe('rootDir equivalence (purely ergonomic)', () => {
+  it('rootDir + relative resolves identically to the all-absolute config (real staging paths)', () => {
+    const ROOT = '/Users/diegovidal/Drive/zincapi-parent';
+    const withRoot = resolveConfigPaths({
+      name: 'staging',
+      rootDir: ROOT,
+      warPath: 'znapi/build/libs/zincapi-staging.war',
+      migration: { roleId: 'r', migrationsDir: 'docs/migrations/pre', scaffoldingFile: 'docs/migrations/0000_migration-helpers.sql' },
+      postMigration: { roleId: 'r', migrationsDir: 'docs/migrations/post', scaffoldingFile: 'docs/migrations/0000_migration-helpers.sql' },
+    } as unknown as DeployConfig);
+
+    const allAbsolute = resolveConfigPaths({
+      name: 'staging',
+      warPath: `${ROOT}/znapi/build/libs/zincapi-staging.war`,
+      migration: { roleId: 'r', migrationsDir: `${ROOT}/docs/migrations/pre`, scaffoldingFile: `${ROOT}/docs/migrations/0000_migration-helpers.sql` },
+      postMigration: { roleId: 'r', migrationsDir: `${ROOT}/docs/migrations/post`, scaffoldingFile: `${ROOT}/docs/migrations/0000_migration-helpers.sql` },
+    } as unknown as DeployConfig);
+
+    expect(withRoot.warPath).toBe(allAbsolute.warPath);
+    expect(withRoot.migration).toEqual(allAbsolute.migration);
+    expect(withRoot.postMigration).toEqual(allAbsolute.postMigration);
+  });
+});
