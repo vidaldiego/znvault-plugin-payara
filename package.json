@@ -82,7 +82,7 @@
     "@typescript-eslint/parser": "^8.53.1",
     "@vitest/coverage-v8": "^4.0.17",
     "@zincapp/zn-vault-agent": "^1.17.3",
-    "@zincapp/znvault-migrate": ">=1",
+    "@zincapp/znvault-migrate": "^1.0.0",
     "commander": "^14.0.2",
     "eslint": "^9.39.2",
     "fastify": "^5.7.1",
