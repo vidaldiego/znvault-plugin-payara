@@ -5,7 +5,7 @@ import type { Command } from 'commander';
 import type { CLIPluginContext } from '../types.js';
 import { loadDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
-import { agentGet, configureTLS } from '../http-client.js';
+import { agentGet, configureTLS } from '@zincapp/znvault-deploy-core';
 import { getErrorMessage } from '../../utils/error.js';
 import { withErrorHandling } from './helpers.js';
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';

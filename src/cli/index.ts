@@ -53,8 +53,8 @@ export {
   agentPostWithStatus,
   pollDeploymentStatus,
   buildPluginUrl,
-} from './http-client.js';
-export type { ProgressCallback } from './http-client.js';
+} from '@zincapp/znvault-deploy-core';
+export type { ProgressCallback } from '@zincapp/znvault-deploy-core';
 
 // Formatters
 export {
@@ -64,7 +64,7 @@ export {
   progressBar,
   truncatePath,
   formatCount,
-} from './formatters.js';
+} from '@zincapp/znvault-deploy-core';
 
 // Progress reporter
 export {
@@ -91,28 +91,28 @@ export {
   triggerPluginUpdate,
   checkHostReachable,
   performHealthCheck,
-} from './host-checks.js';
+} from '@zincapp/znvault-deploy-core';
 
 // Strategy executor
 export {
   executeStrategy,
   resolveStrategy,
-} from './strategy-executor.js';
+} from '@zincapp/znvault-deploy-core';
 export type {
   StrategyExecutionResult,
   StrategyExecutorOptions,
-} from './strategy-executor.js';
+} from '@zincapp/znvault-deploy-core';
 
 // Unified progress
 export {
   UnifiedProgress,
-} from './unified-progress.js';
+} from '@zincapp/znvault-deploy-core';
 export type {
   HostState,
   HostStatus,
   HostAnalysis,
   UnifiedProgressOptions,
-} from './unified-progress.js';
+} from '@zincapp/znvault-deploy-core';
 
 // HAProxy drain/ready operations
 export {
@@ -120,11 +120,11 @@ export {
   readyServer,
   testHAProxyConnectivity,
   getUnmappedHosts,
-} from './haproxy.js';
+} from '@zincapp/znvault-deploy-core';
 export type {
   SSHExecResult,
   HAProxyOperationResult,
-} from './haproxy.js';
+} from '@zincapp/znvault-deploy-core';
 
 // Listr-based deployment (concurrent progress)
 export {

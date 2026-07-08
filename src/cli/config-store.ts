@@ -1,10 +1,41 @@
 // Path: src/cli/config-store.ts
-// Deployment configuration storage
+// Deployment configuration storage — payara-specific shim over
+// @zincapp/znvault-deploy-core's target-agnostic config-store.
+//
+// Why this stays a local reimplementation rather than a pure delegation:
+// deploy-core's `loadDeployConfigs`/`saveDeployConfigs` work with a FLAT
+// `Record<string, DeployConfig>` file body (`JSON.parse(content)` as-is —
+// no wrapper). Payara's real on-disk `configs.json` (hand-edited by
+// operators — see README "Authoring multi-class configs") has ALWAYS been
+// the WRAPPED `DeployConfigStore` shape: `{ "configs": { name: {...} } }`,
+// optionally with `vaultEnabled`/`vaultAlias` alongside `configs`. Pointing
+// deploy-core's file reader directly at that file would parse `"configs"`
+// as if it were itself a config NAME — silently corrupting every existing
+// prod config file. So the wrapper-aware file I/O below is kept local
+// (byte-identical to the pre-Task-5 implementation); only the exported
+// function SIGNATURES match payara's original zero-arg, throw-on-miss API
+// so the ~70 existing call sites are untouched. `getConfig`/`configExists`/
+// `listConfigNames` are composed from `loadDeployConfigs()` exactly as
+// before (deploy-core's versions of those three take the same flat-file
+// assumption as its `loadDeployConfigs` and so have the same incompatibility
+// with payara's wrapped file).
+//
+// `@zincapp/znvault-deploy-core`'s `ConfigStoreLocation` type is imported
+// for documentation/consistency even though its I/O functions aren't used
+// here directly.
 
 import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import type { DeployConfig, DeployConfigStore } from './types.js';
 import { PAYARA_CONFIG_DIR, CONFIG_FILE, LEGACY_CONFIG_FILE } from './constants.js';
+import type { ConfigStoreLocation } from '@zincapp/znvault-deploy-core';
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+type _AssertLocationShapeCompatible = ConfigStoreLocation extends {
+  configFile: string;
+  legacyConfigFile?: string;
+  configDir: string;
+} ? true : never;
 
 /**
  * One-time, non-destructive migration from the pre-v2 shared config location

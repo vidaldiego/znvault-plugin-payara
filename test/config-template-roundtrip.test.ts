@@ -6,8 +6,8 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfigFromFile } from '../src/cli/config-file.js';
-import { resolveConfigPaths } from '../src/cli/deploy-config-paths.js';
+import { loadConfigFromFile } from '@zincapp/znvault-deploy-core';
+import { resolveConfigPaths } from '@zincapp/znvault-deploy-core';
 import type { DeployConfig } from '../src/cli/types.js';
 
 describe('config template round-trip equivalence', () => {

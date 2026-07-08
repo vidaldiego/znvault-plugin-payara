@@ -7,7 +7,7 @@ import type { WarFileHashes, ChunkedDeployResponse } from '../../types.js';
 import { calculateWarHashes, calculateDiff } from '../../war-deployer.js';
 import type { CLIPluginContext, DeployOperationResult } from '../types.js';
 import { ProgressReporter, progressBar } from '../progress.js';
-import type { HostAnalysis } from '../unified-progress.js';
+import type { HostAnalysis } from '@zincapp/znvault-deploy-core';
 import {
   CHUNK_SIZE,
   MAX_RETRIES,
@@ -21,7 +21,7 @@ import {
   agentPostWithStatus,
   pollDeploymentStatus,
   buildPluginUrl,
-} from '../http-client.js';
+} from '@zincapp/znvault-deploy-core';
 import { getErrorMessage } from '../../utils/error.js';
 
 // Re-export type for backwards compatibility

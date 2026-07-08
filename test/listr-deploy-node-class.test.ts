@@ -22,52 +22,49 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ---------------------------------------------------------------------------
-// Mock scheduler-quiesce BEFORE importing anything that depends on it
+// Mock @zincapp/znvault-deploy-core BEFORE importing anything that depends on it
+// (scheduler-quiesce, haproxy, host-checks, and http-client all now live here)
 // ---------------------------------------------------------------------------
-vi.mock('../src/scheduler-quiesce.js', () => ({
-  quiesceScheduler: vi.fn(),
-  schedulerStatus: vi.fn(),
-  resumeScheduler: vi.fn(),
-  pollUntilDrained: vi.fn(),
-}));
-
-// Mock haproxy drainServer / readyServer
-vi.mock('../src/cli/haproxy.js', () => ({
-  drainServer: vi.fn(),
-  readyServer: vi.fn(),
-  testHAProxyConnectivity: vi.fn(),
-  getUnmappedHosts: vi.fn(() => []),
-}));
+vi.mock('@zincapp/znvault-deploy-core', async (importActual) => {
+  const actual = await importActual<typeof import('@zincapp/znvault-deploy-core')>();
+  return {
+    ...actual,
+    // scheduler-quiesce
+    quiesceScheduler: vi.fn(),
+    schedulerStatus: vi.fn(),
+    resumeScheduler: vi.fn(),
+    pollUntilDrained: vi.fn(),
+    // haproxy
+    drainServer: vi.fn(),
+    readyServer: vi.fn(),
+    testHAProxyConnectivity: vi.fn(),
+    getUnmappedHosts: vi.fn(() => []),
+    // host-checks
+    performHealthCheck: vi.fn(),
+    // http-client
+    agentGet: vi.fn(),
+    agentPost: vi.fn(),
+    agentPostWithStatus: vi.fn(),
+    buildPluginUrl: vi.fn((host: string, port: number) => `http://${host}:${port}/plugins/payara`),
+    setEndpointOverride: vi.fn(),
+    clearEndpointOverride: vi.fn(),
+    clearAllEndpointOverrides: vi.fn(),
+    configureTLS: vi.fn(),
+    getTLSConfig: vi.fn(() => ({ verify: true })),
+    getTLSIndicator: vi.fn(() => ''),
+  };
+});
 
 // Mock deployToHost — this is where we observe deploy order per host
 vi.mock('../src/cli/commands/deploy.js', () => ({
   deployToHost: vi.fn(),
 }));
 
-// Mock performHealthCheck
-vi.mock('../src/cli/host-checks.js', () => ({
-  performHealthCheck: vi.fn(),
-}));
-
-// Mock http-client (getTLSIndicator etc.)
-vi.mock('../src/cli/http-client.js', () => ({
-  agentGet: vi.fn(),
-  agentPost: vi.fn(),
-  agentPostWithStatus: vi.fn(),
-  buildPluginUrl: vi.fn((host: string, port: number) => `http://${host}:${port}/plugins/payara`),
-  setEndpointOverride: vi.fn(),
-  clearEndpointOverride: vi.fn(),
-  clearAllEndpointOverrides: vi.fn(),
-  configureTLS: vi.fn(),
-  getTLSConfig: vi.fn(() => ({ verify: true })),
-  getTLSIndicator: vi.fn(() => ''),
-}));
-
 // ---------------------------------------------------------------------------
 // Import after mocking
 // ---------------------------------------------------------------------------
-import * as schedulerMod from '../src/scheduler-quiesce.js';
-import * as haproxyMod from '../src/cli/haproxy.js';
+import * as schedulerMod from '@zincapp/znvault-deploy-core';
+import * as haproxyMod from '@zincapp/znvault-deploy-core';
 import * as deployMod from '../src/cli/commands/deploy.js';
 import { executeListrDeployment, printDeploymentSummary, partitionHostsByClass, type ListrDeployOptions, type DeployContext } from '../src/cli/listr-deploy.js';
 import { parseDeploymentStrategy } from '../src/cli/types.js';

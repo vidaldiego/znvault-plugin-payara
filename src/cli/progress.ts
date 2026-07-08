@@ -4,21 +4,21 @@
 import { basename } from 'node:path';
 import type { DeployResult } from '../types.js';
 import { ANSI, MAX_RETRIES } from './constants.js';
-import type { ProgressCallback } from './http-client.js';
 import type {
   PluginVersionInfo,
   PluginVersionsResponse,
   PluginVersionCheckResult,
   TriggerUpdateResult,
 } from './types.js';
+import type { WarInfo } from './war-info.js';
+import type { ProgressCallback } from '@zincapp/znvault-deploy-core';
 import {
   formatSize,
   formatDuration,
   formatDate,
   formatTime,
   progressBar,
-} from './formatters.js';
-import type { WarInfo } from './war-info.js';
+} from '@zincapp/znvault-deploy-core';
 
 /**
  * Pre-flight check result for a host
@@ -28,7 +28,13 @@ export interface PreflightResult {
   reachable: boolean;
   agentVersion?: string;
   pluginVersion?: string;
-  payaraRunning?: boolean;
+  /**
+   * Whether the payara plugin's `running` status was true. Named
+   * `pluginRunning` (not `payaraRunning`) to match the field populated by
+   * `@zincapp/znvault-deploy-core`'s target-agnostic `checkHostReachable`
+   * (Task 5 adoption) — same underlying value, generic field name.
+   */
+  pluginRunning?: boolean;
   error?: string;
 }
 
@@ -36,7 +42,7 @@ export interface PreflightResult {
 export type { PluginVersionInfo, PluginVersionsResponse, PluginVersionCheckResult, TriggerUpdateResult };
 
 // Re-export formatters for backwards compatibility
-export { formatSize, formatDuration, formatDate, progressBar } from './formatters.js';
+export { formatSize, formatDuration, formatDate, progressBar } from '@zincapp/znvault-deploy-core';
 
 // Re-export WAR info utilities for backwards compatibility
 export { getWarInfo } from './war-info.js';
@@ -152,14 +158,14 @@ export class ProgressReporter implements ProgressCallback {
 
     if (this.isPlain) {
       const info = result.reachable
-        ? `agent ${result.agentVersion || '?'}, plugin ${result.pluginVersion || '?'}, payara ${result.payaraRunning ? 'running' : 'stopped'}`
+        ? `agent ${result.agentVersion || '?'}, plugin ${result.pluginVersion || '?'}, payara ${result.pluginRunning ? 'running' : 'stopped'}`
         : result.error || 'unreachable';
       console.log(`  [${index + 1}/${total}] ${result.host}: ${result.reachable ? 'OK' : 'FAIL'} - ${info}`);
     } else {
       // Clear the "checking" line and show result
       process.stdout.write(`\r${ANSI.clearLine}`);
       if (result.reachable) {
-        const payaraStatus = result.payaraRunning
+        const payaraStatus = result.pluginRunning
           ? `${ANSI.green}running${ANSI.reset}`
           : `${ANSI.yellow}stopped${ANSI.reset}`;
         console.log(`  ${status} ${result.host} ${ANSI.dim}(agent ${result.agentVersion || '?'}, payara ${payaraStatus}${ANSI.dim})${ANSI.reset}`);

@@ -5,7 +5,7 @@ import {
   setEndpointOverride,
   clearEndpointOverride,
   clearAllEndpointOverrides,
-} from '../src/cli/http-client.js';
+} from '@zincapp/znvault-deploy-core';
 
 describe('endpoint overrides', () => {
   beforeEach(() => clearAllEndpointOverrides());

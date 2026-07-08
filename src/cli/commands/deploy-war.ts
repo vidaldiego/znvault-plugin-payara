@@ -7,11 +7,18 @@ import type { WarFileHashes } from '../../types.js';
 import { calculateWarHashes, calculateDiff } from '../../war-deployer.js';
 import { ProgressReporter } from '../progress.js';
 import { ANSI, parsePort } from '../constants.js';
-import { agentGet, buildPluginUrl, setEndpointOverride, clearEndpointOverride } from '../http-client.js';
 import type { CLIPluginContext } from '../types.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { deployToHost } from './deploy.js';
-import { openTunnel, isLoopbackHost, type Tunnel } from '../ssh-tunnel.js';
+import {
+  agentGet,
+  buildPluginUrl,
+  setEndpointOverride,
+  clearEndpointOverride,
+  openTunnel,
+  isLoopbackHost,
+  type Tunnel,
+} from '@zincapp/znvault-deploy-core';
 
 /**
  * Extract the bare host (no scheme, no port, no path) from a target that may be

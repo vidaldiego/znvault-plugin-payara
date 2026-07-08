@@ -5,7 +5,7 @@ import type { Command } from 'commander';
 import type { CLIPluginContext } from '../types.js';
 import { loadDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
-import { agentGet, agentPost, buildPluginUrl } from '../http-client.js';
+import { agentGet, agentPost, buildPluginUrl } from '@zincapp/znvault-deploy-core';
 import { getErrorMessage } from '../../utils/error.js';
 import { withErrorHandling } from './helpers.js';
 

@@ -7,10 +7,13 @@ import type { CLIPluginContext, DeployConfig, HealthCheckConfig, HAProxyConfig, 
 import { loadDeployConfigs, saveDeployConfigs } from '../config-store.js';
 import { ANSI, parsePort } from '../constants.js';
 import { getConfigOrExit, confirmPrompt, withErrorHandling } from './helpers.js';
-import { validateDeployConfig } from '../deploy-config-validate.js';
-import { loadConfigFromFile } from '../config-file.js';
-import { resolveClass, hasActiveServerMap } from '../deploy-class.js';
 import { parseDeploymentStrategy } from '../types.js';
+import {
+  validateDeployConfig,
+  loadConfigFromFile,
+  resolveClass,
+  hasActiveServerMap,
+} from '@zincapp/znvault-deploy-core';
 
 /**
  * Register deploy config commands

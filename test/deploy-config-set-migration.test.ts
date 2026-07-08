@@ -4,7 +4,7 @@
 // the pure validation logic in validateDeployConfig exhaustively here.
 
 import { describe, it, expect } from 'vitest';
-import { validateDeployConfig } from '../src/cli/deploy-config-validate.js';
+import { validateDeployConfig } from '@zincapp/znvault-deploy-core';
 import type { DeployConfig } from '../src/cli/types.js';
 
 // ── Flat config fixtures ──

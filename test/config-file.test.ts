@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { loadConfigFromFile } from '../src/cli/config-file.js';
+import { loadConfigFromFile } from '@zincapp/znvault-deploy-core';
 
 function tmpJson(obj: unknown): string {
   const dir = mkdtempSync(join(tmpdir(), 'cfgfile-'));

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isConfigFilePath } from '../src/cli/config-arg.js';
+import { isConfigFilePath } from '@zincapp/znvault-deploy-core';
 
 describe('isConfigFilePath (lexical, no filesystem probe)', () => {
   it('a bare name is NOT a file path', () => {

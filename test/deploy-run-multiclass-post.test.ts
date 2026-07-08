@@ -1,8 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const mcResult: any = { classes: [], abortedAt: undefined };
-vi.mock('../src/cli/multi-class-deploy.js', async () => {
-  const actual = await vi.importActual<typeof import('../src/cli/multi-class-deploy.js')>('../src/cli/multi-class-deploy.js');
+vi.mock('@zincapp/znvault-deploy-core', async () => {
+  const actual = await vi.importActual<typeof import('@zincapp/znvault-deploy-core')>('@zincapp/znvault-deploy-core');
   return { ...actual, executeMultiClassDeployment: vi.fn(async () => mcResult), printMultiClassSummary: vi.fn(), printMultiClassDryRun: vi.fn() };
 });
 vi.mock('@zincapp/znvault-migrate', async () => {

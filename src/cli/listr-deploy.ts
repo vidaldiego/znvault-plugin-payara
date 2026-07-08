@@ -4,15 +4,24 @@
 import { Listr, ListrTask, PRESET_TIMER } from 'listr2';
 import type { WarFileHashes } from '../types.js';
 import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult, HealthCheckConfig, HAProxyConfig, QuiesceConfig } from './types.js';
-import type { HostAnalysis } from './unified-progress.js';
 import { deployToHost } from './commands/deploy.js';
-import { performHealthCheck } from './host-checks.js';
 import { ProgressReporter } from './progress.js';
-import { formatSize, formatDuration, formatTime } from './formatters.js';
-import type { ConnectionInfo } from './http-client.js';
-import { getTLSIndicator } from './http-client.js';
-import { drainServer, readyServer } from './haproxy.js';
-import { quiesceScheduler, pollUntilDrained, resumeScheduler } from '../scheduler-quiesce.js';
+import type {
+  HostAnalysis,
+  ConnectionInfo,
+} from '@zincapp/znvault-deploy-core';
+import {
+  performHealthCheck,
+  formatSize,
+  formatDuration,
+  formatTime,
+  getTLSIndicator,
+  drainServer,
+  readyServer,
+  quiesceScheduler,
+  pollUntilDrained,
+  resumeScheduler,
+} from '@zincapp/znvault-deploy-core';
 
 /**
  * Context passed through Listr tasks

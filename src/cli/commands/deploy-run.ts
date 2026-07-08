@@ -8,9 +8,6 @@ import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { calculateWarHashes } from '../../war-deployer.js';
 import { loadDeployConfigs } from '../config-store.js';
-import { isConfigFilePath } from '../config-arg.js';
-import { loadConfigFromFile } from '../config-file.js';
-import { expandTilde } from '../deploy-config-paths.js';
 import {
   getWarInfo,
   ProgressReporter,
@@ -24,17 +21,7 @@ import {
   parseDeploymentStrategy,
   getStrategyDisplayName,
 } from '../types.js';
-import {
-  type MigrationSkipReason,
-  computeNoFailures,
-  computeFullCoverage,
-  isScopedDeploy,
-  resolvePostSkipReason,
-} from '../post-gate.js';
-import { resolveDeployPlan, type DeployPlan } from '../deploy-plan.js';
 import { getErrorMessage } from '../../utils/error.js';
-import { resolveStrategy } from '../strategy-executor.js';
-import { formatSize } from '../formatters.js';
 import { executeListrDeployment, printDeploymentSummary, partitionHostsByClass, type ListrDeployOptions } from '../listr-deploy.js';
 import {
   executePreflightChecks,
@@ -43,22 +30,37 @@ import {
   printPreflightSummary,
 } from '../listr-preflight.js';
 import {
+  isConfigFilePath,
+  loadConfigFromFile,
+  expandTilde,
+  type MigrationSkipReason,
+  computeNoFailures,
+  computeFullCoverage,
+  isScopedDeploy,
+  resolvePostSkipReason,
+  resolveDeployPlan,
+  type DeployPlan,
+  resolveStrategy,
+  formatSize,
   configureTLS,
   setEndpointOverride,
   clearEndpointOverride,
   clearAllEndpointOverrides,
-} from '../http-client.js';
-import { openTunnel, type Tunnel } from '../ssh-tunnel.js';
-import { getUnmappedHosts, testHAProxyConnectivity } from '../haproxy.js';
-import { resolveClass, partitionSelectedClasses } from '../deploy-class.js';
-import { validateDeployConfig } from '../deploy-config-validate.js';
-import { resolveConfigPaths } from '../deploy-config-paths.js';
-import {
+  openTunnel,
+  type Tunnel,
+  getUnmappedHosts,
+  testHAProxyConnectivity,
+  resolveClass,
+  partitionSelectedClasses,
+  validateDeployConfig,
+  resolveConfigPaths,
   executeMultiClassDeployment,
   printMultiClassDryRun,
   printMultiClassSummary,
   type RunClassResult,
-} from '../multi-class-deploy.js';
+  runMigrationPhase as coreRunMigrationPhase,
+  siblingIntegrityDirs as coreSiblingIntegrityDirs,
+} from '@zincapp/znvault-deploy-core';
 
 /** Default CA certificate path */
 const DEFAULT_CA_PATH = join(homedir(), '.znvault', 'ca', 'agent-tls-ca.pem');
@@ -183,8 +185,32 @@ export function validateClassHostOverride(
 }
 
 /**
+ * The OTHER migration phase's directory (post's dir for the pre phase, and vice
+ * versa), as a one-element array for `integrityDirs` — or `[]` when the other phase
+ * is unconfigured or shares this phase's directory. Both phases write to the same
+ * schema_migrations table, so the planner's integrity check must know about the
+ * sibling dir to avoid flagging its rows as orphaned. Pure (zero I/O).
+ *
+ * Re-exported (unchanged signature/behavior) from `@zincapp/znvault-deploy-core`,
+ * which lifted this verbatim out of payara — kept as a local export because
+ * `test/deploy-run-migration-phase.test.ts` imports it from this module.
+ */
+export const siblingIntegrityDirs = coreSiblingIntegrityDirs;
+
+/**
  * Run a schema-migration phase (pre-deploy or post-deploy) if a migration config
  * is provided. No-op when `migration` is undefined.
+ *
+ * Thin payara-specific wrapper over `@zincapp/znvault-deploy-core`'s
+ * target-agnostic `runMigrationPhase` gate: the gate's `runPhase` callback is
+ * bound here to payara's own `runMigrations` (mysql, via
+ * `@zincapp/znvault-migrate`) using the injected `deps`, and `dryRunRender`
+ * reproduces payara's exact original dry-run line. The gate's `labels`
+ * default text ("WAR" / "payara deploy run … --post-only") already matches
+ * payara's original wording, so no override is passed. Kept with payara's
+ * ORIGINAL signature (`deps` as an explicit param, not a closure the caller
+ * can't reach) because `test/deploy-run-migration-phase.test.ts` calls it
+ * with an injected `deps` object and inspects `deps.makeRunner` calls.
  *
  * @param migration  - The migration config for this phase (undefined = no-op).
  * @param phase      - Which phase this is, for log lines and skip-reason messages.
@@ -194,23 +220,6 @@ export function validateClassHostOverride(
  * @param opts       - `dryRun` prints the plan only; `run: false` skips with a
  *                     reason-tagged log line built from `skipReason`.
  */
-/**
- * The OTHER migration phase's directory (post's dir for the pre phase, and vice
- * versa), as a one-element array for `integrityDirs` — or `[]` when the other phase
- * is unconfigured or shares this phase's directory. Both phases write to the same
- * schema_migrations table, so the planner's integrity check must know about the
- * sibling dir to avoid flagging its rows as orphaned. Pure (zero I/O).
- */
-export function siblingIntegrityDirs(
-  config: DeployConfig,
-  phase: 'pre-deploy' | 'post-deploy',
-): string[] {
-  const own = phase === 'pre-deploy' ? config.migration?.migrationsDir : config.postMigration?.migrationsDir;
-  const other = phase === 'pre-deploy' ? config.postMigration?.migrationsDir : config.migration?.migrationsDir;
-  if (!other || other === own) return [];
-  return [other];
-}
-
 export async function runMigrationPhase(
   migration: MigrationConfig | undefined,
   phase: 'pre-deploy' | 'post-deploy',
@@ -219,49 +228,30 @@ export async function runMigrationPhase(
   deps = migrationDefaultDeps(ctx.client, mysqlAdapter),
   opts: { dryRun?: boolean; run?: boolean; skipReason?: MigrationSkipReason; integrityDirs?: string[] } = {},
 ): Promise<void> {
-  if (!migration) return;
-
-  // Skip (with a reason-tagged line so incident logs are accurate).
-  if (opts.run === false) {
-    const r = opts.skipReason;
-    let msg: string;
-    if (!r || r.kind === 'flag') {
-      const flag = r && r.kind === 'flag' ? r.flag : 'flag';
-      msg = `[deploy] Skipping ${phase} schema migrations (${flag}).`;
-    } else if (r.kind === 'scoped-subset') {
-      msg = `[deploy] Skipping ${phase} schema migrations: deploy scoped to a subset (other hosts still run the previous WAR). Run a full deploy or 'payara deploy run ${configName} --post-only' once all hosts are current.`;
-    } else if (r.kind === 'partial-coverage') {
-      msg = `[deploy] Skipping ${phase} schema migrations: ${r.dropped.length} configured host(s) were not deployed (${r.dropped.join(', ')}) — they still run the previous WAR.`;
-    } else {
-      msg = `[deploy] Skipping ${phase} schema migrations: rollout did not fully succeed.`;
-    }
-    ctx.output.info(msg);
-    return;
-  }
-
-  // --dry-run: print the plan only, no side effects.
-  if (opts.dryRun) {
-    ctx.output.info(
-      `[deploy] [dry-run] would run ${phase} schema migrations ` +
-        `(role '${migration.roleId}', dir '${migration.migrationsDir}')`,
-    );
-    return;
-  }
-
-  ctx.output.info(`[deploy] Running ${phase} schema migrations...`);
-  await runMigrations(ctx, {
-    env: configName,
-    engine: 'mysql',
-    roleId: migration.roleId,
-    migrationsDir: migration.migrationsDir,
-    database: migration.database,
-    // The sibling phase's dir shares the schema_migrations history table; pass it
-    // so the planner's integrity check treats sibling-applied rows as tracked, not
-    // as orphaned (renamed/deleted) files.
-    integrityDirs: opts.integrityDirs,
-    scaffoldingFile: migration.scaffoldingFile,
-  }, deps);
-  ctx.output.info(`[deploy] ${phase} migrations complete.`);
+  await coreRunMigrationPhase(
+    migration,
+    phase,
+    configName,
+    ctx,
+    async (m, p, c) => {
+      await runMigrations(c, {
+        env: configName,
+        engine: 'mysql',
+        roleId: m.roleId,
+        migrationsDir: m.migrationsDir,
+        database: m.database,
+        // The sibling phase's dir shares the schema_migrations history table; pass it
+        // so the planner's integrity check treats sibling-applied rows as tracked, not
+        // as orphaned (renamed/deleted) files.
+        integrityDirs: opts.integrityDirs,
+        scaffoldingFile: m.scaffoldingFile,
+      }, deps);
+    },
+    (m, p) =>
+      `[deploy] [dry-run] would run ${p} schema migrations ` +
+      `(role '${m.roleId}', dir '${m.migrationsDir}')`,
+    opts,
+  );
 }
 
 /**

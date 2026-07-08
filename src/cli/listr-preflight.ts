@@ -5,10 +5,14 @@ import { Listr, ListrTask, PRESET_TIMER } from 'listr2';
 import type { WarFileHashes } from '../types.js';
 import type { PluginVersionCheckResult } from './types.js';
 import type { PreflightResult } from './progress.js';
-import type { HostAnalysis } from './unified-progress.js';
-import { checkHostReachable, checkPluginVersions, triggerPluginUpdate } from './host-checks.js';
 import { analyzeHost } from './commands/deploy.js';
-import { formatSize } from './formatters.js';
+import type { HostAnalysis } from '@zincapp/znvault-deploy-core';
+import {
+  checkHostReachable,
+  checkPluginVersions,
+  triggerPluginUpdate,
+  formatSize,
+} from '@zincapp/znvault-deploy-core';
 
 /**
  * Result of pre-deployment check for a single host
@@ -80,7 +84,7 @@ function createHostPreflightTask(
 
       ctx.reachableHosts.push(host);
       const agentInfo = preflight.agentVersion ? `agent ${preflight.agentVersion}` : '';
-      const payaraInfo = preflight.payaraRunning ? 'payara running' : 'payara stopped';
+      const payaraInfo = preflight.pluginRunning ? 'payara running' : 'payara stopped';
 
       // Step 2: Check plugin versions (if not skipped)
       if (!options.skipVersionCheck) {
