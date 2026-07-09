@@ -64,7 +64,7 @@
     }
   },
   "dependencies": {
-    "@zincapp/znvault-deploy-core": "file:../znvault-deploy-core",
+    "@zincapp/znvault-deploy-core": "^0.1.0",
     "@zincapp/znvault-migrate": "^1.0.0",
     "adm-zip": "^0.5.16",
     "inquirer": "^13.2.1",
