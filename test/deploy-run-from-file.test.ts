@@ -10,7 +10,7 @@ vi.mock('../src/cli/config-store.js', () => ({
     configs: {
       // A saved config using a RELATIVE migrationsDir + rootDir (v2.5.0 style).
       staging: {
-        name: 'staging', hosts: ['10.0.0.1'], warPath: 'app.war', rootDir: '/saved/root',
+        name: 'staging', hosts: ['192.0.2.1'], warPath: 'app.war', rootDir: '/saved/root',
         migration: { roleId: 'r', migrationsDir: 'db/pre' },
         postMigration: { roleId: 'r', migrationsDir: 'db/post' },
       },
@@ -51,7 +51,7 @@ function tmpConfigFile(): string {
   const dir = mkdtempSync(join(tmpdir(), 'fromfile-'));
   const p = join(dir, 'tmpl.json');
   writeFileSync(p, JSON.stringify({
-    name: 'filecfg', hosts: ['10.0.0.1'], warPath: 'app.war',
+    name: 'filecfg', hosts: ['192.0.2.1'], warPath: 'app.war',
     migration: { roleId: 'r', migrationsDir: 'docs/migrations/pre' },
     postMigration: { roleId: 'r', migrationsDir: 'docs/migrations/post' },
   }));

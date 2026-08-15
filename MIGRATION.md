@@ -38,7 +38,7 @@ Create `/etc/zn-vault-agent/config.json`:
 
 ```json
 {
-  "vaultUrl": "https://vault.zincapp.dev",
+  "vaultUrl": "https://vault.example.com",
   "tenantId": "zincapp",
   "auth": {
     "apiKey": "znv_..."
@@ -79,7 +79,7 @@ Map your Python configuration to the new format:
 ```bash
 # Old zinc_updater client
 python3 deploy_client.py \
-  --server staging-1.zincapp.dev:9909 \
+  --server staging-1.example.com:9909 \
   --war ./target/ZincAPI.war
 ```
 
@@ -87,7 +87,7 @@ python3 deploy_client.py \
 ```bash
 # New znvault CLI
 znvault payara deploy war ./target/ZincAPI.war \
-  --target https://staging-1.zincapp.dev:9100
+  --target https://staging-1.example.com:9100
 ```
 
 ### Step 5: Parallel Operation (Recommended)
@@ -107,12 +107,12 @@ Test the new deployment:
 ```bash
 # Test with new CLI
 znvault payara deploy war ./target/ZincAPI.war \
-  --target https://staging-1.zincapp.dev:9100 \
+  --target https://staging-1.example.com:9100 \
   --dry-run
 
 # If looks good, deploy for real
 znvault payara deploy war ./target/ZincAPI.war \
-  --target https://staging-1.zincapp.dev:9100
+  --target https://staging-1.example.com:9100
 ```
 
 ### Step 6: Create Systemd Service
@@ -311,4 +311,4 @@ Ensure the agent has permission to:
 
 For issues or questions:
 - GitHub Issues: https://github.com/vidaldiego/znvault-plugin-payara/issues
-- Documentation: https://docs.zincapp.dev/vault/plugins/payara
+- Documentation: https://docs.example.com/vault/plugins/payara

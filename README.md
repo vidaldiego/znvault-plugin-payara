@@ -64,18 +64,24 @@ Add the plugin to your agent's `config.json`:
 
 ### Secrets Configuration
 
-Secrets are written to Payara's `setenv.conf` file, NOT passed via command line (security improvement in v1.7.0):
+Secrets are written to Payara's `setenv.conf` file, NOT passed via command line (security improvement in v1.7.0).
+
+> Throughout this README, host addresses are **RFC 5737 documentation ranges**
+> (`192.0.2.0/24` for application nodes, `198.51.100.0/24` for load balancers)
+> and vault alias paths are illustrative. Substitute your own — real addresses
+> and the real alias names live in your deploy config and your vault, never in
+> this repo.
 
 ```json
 {
   "secrets": {
     "ZINC_CONFIG_USE_VAULT": "literal:true",
-    "ZINC_CONFIG_APPLICATION_FILE": "literal:api/staging/config",
+    "ZINC_CONFIG_APPLICATION_FILE": "literal:app/staging/config",
     "ZINC_CONFIG_VAULT_API_KEY": "api-key:my-managed-key",
-    "AWS_ACCESS_KEY_ID": "alias:api/staging/s3.accessKeyId",
-    "AWS_SECRET_ACCESS_KEY": "alias:api/staging/s3.secretAccessKey"
+    "AWS_ACCESS_KEY_ID": "alias:app/staging/object-store.accessKeyId",
+    "AWS_SECRET_ACCESS_KEY": "alias:app/staging/object-store.secretAccessKey"
   },
-  "watchSecrets": ["api/staging/config", "api/staging/s3"]
+  "watchSecrets": ["app/staging/config", "app/staging/object-store"]
 }
 ```
 
@@ -195,9 +201,9 @@ Create and manage deployment configurations for multiple hosts:
 # Create a new deployment config
 znvault payara config create staging \
   --war /path/to/app.war \
-  --host 172.16.220.55 \
-  --host 172.16.220.56 \
-  --host 172.16.220.57 \
+  --host 192.0.2.55 \
+  --host 192.0.2.56 \
+  --host 192.0.2.57 \
   --parallel
 
 # Deploy to all hosts in config (diff transfer)
@@ -221,13 +227,13 @@ znvault payara deploy to staging --skip-migrations
 
 # Post-deploy migrations: run destructive schema changes AFTER a successful
 # rollout (see the "Migration phases" section below for the full rules).
-znvault payara config set-migration staging --phase post --role zincdb-rw --dir docs/migrations/post
+znvault payara config set-migration staging --phase post --role appdb-rw --dir docs/migrations/post
 znvault payara deploy to staging --skip-post
 
 # Manage configs
 znvault payara config list
 znvault payara config show staging
-znvault payara config add-host staging 172.16.220.58
+znvault payara config add-host staging 192.0.2.58
 znvault payara config set staging war /new/path.war
 znvault payara config delete staging
 ```
@@ -369,7 +375,7 @@ under a common `Migration:` header, with each phase nested beneath it:
 
 ```
   Migration:
-    Role:     zincdb-rw
+    Role:     appdb-rw
     Database: (from Vault dynamic-secrets connection)
     Pre-deploy:
       Dir:    docs/migrations/pre
@@ -377,9 +383,9 @@ under a common `Migration:` header, with each phase nested beneath it:
       Dir:    docs/migrations/post
 
   Execution plan (what 'payara deploy run staging' does, in order):
-    1. Run pre-deploy schema migrations (role zincdb-rw; aborts the deploy on failure)
+    1. Run pre-deploy schema migrations (role appdb-rw; aborts the deploy on failure)
     2. Roll out hosts (…)
-    3. Run post-deploy schema migrations (role zincdb-rw; only if the rollout succeeded)
+    3. Run post-deploy schema migrations (role appdb-rw; only if the rollout succeeded)
        ⚠ point of no return: post-deploy migrations may apply destructive changes;
          rollback to the previous application version may no longer be possible.
 ```
@@ -400,7 +406,7 @@ directory. Set it with `--scaffolding-file` on `config set-migration`:
 
 ```bash
 znvault payara config set-migration staging \
-  --phase pre --role zincdb-rw --dir docs/migrations/pre \
+  --phase pre --role appdb-rw --dir docs/migrations/pre \
   --scaffolding-file migration_utils.sql
 ```
 
@@ -414,11 +420,11 @@ bare filename resolves against two different directories:
 
 ```bash
 znvault payara config set-migration staging \
-  --phase pre --role zincdb-rw --dir docs/migrations/pre \
+  --phase pre --role appdb-rw --dir docs/migrations/pre \
   --scaffolding-file /path/to/docs/migrations/0000_migration-helpers.sql
 
 znvault payara config set-migration staging \
-  --phase post --role zincdb-rw --dir docs/migrations/post \
+  --phase post --role appdb-rw --dir docs/migrations/post \
   --scaffolding-file /path/to/docs/migrations/0000_migration-helpers.sql
 ```
 
@@ -485,7 +491,7 @@ transfer through the tunnel, and tears it down afterward.
 {
   "name": "staging",
   "war": "/path/to/app.war",
-  "hosts": ["172.16.220.55", "172.16.220.56", "172.16.220.57"],
+  "hosts": ["192.0.2.55", "192.0.2.56", "192.0.2.57"],
   "tunnel": true,
   "ssh": {
     "user": "sysadmin",            // optional; SSH user for the forward
@@ -520,16 +526,16 @@ Add a `quiesce` block to a deploy config and, optionally, per-host timeout overr
 {
   "name": "znapi-staging",
   "war": "/path/to/znapi.war",
-  "hosts": ["172.16.220.55", "172.16.220.56", "172.16.220.57"],
+  "hosts": ["192.0.2.55", "192.0.2.56", "192.0.2.57"],
   "tunnel": true,
   "ssh": { "user": "sysadmin" },
   "haproxy": {
-    "hosts": ["172.16.220.20"],
+    "hosts": ["198.51.100.20"],
     "backend": "znapi",
     "serverMap": {
-      "172.16.220.55": "znapi-01",
-      "172.16.220.56": "znapi-02"
-      // 172.16.220.57 is absent from serverMap → treated as a WORKER:
+      "192.0.2.55": "znapi-01",
+      "192.0.2.56": "znapi-02"
+      // 192.0.2.57 is absent from serverMap → treated as a WORKER:
       //   - deploys in the final, parallel, non-blocking batch (after .55/.56)
       //   - skips HAProxy drain
       //   - never the canary; its failure does not abort the serving roll
@@ -543,7 +549,7 @@ Add a `quiesce` block to a deploy config and, optionally, per-host timeout overr
     // The agent always sends X-Internal-Origin: deploy; this is not operator-configurable.
   },
   "hostConfigs": {
-    "172.16.220.57": {
+    "192.0.2.57": {
       "quiesceTimeoutMs": 60000  // per-host override of drainTimeoutMs
     }
   }
@@ -608,15 +614,15 @@ A config is either **flat** (top-level `hosts`, no `classes`) or **multi-class**
   "classes": [
     {
       "name": "api",
-      "hosts": ["172.16.220.55", "172.16.220.56", "172.16.220.57"],
+      "hosts": ["192.0.2.55", "192.0.2.56", "192.0.2.57"],
       "strategy": "1+R",
       "haproxy": {
-        "hosts": ["172.16.220.20", "172.16.220.21", "172.16.220.22"],
+        "hosts": ["198.51.100.20", "198.51.100.21", "198.51.100.22"],
         "backend": "packleader_api_backend",
         "serverMap": {
-          "172.16.220.55": "server1",
-          "172.16.220.56": "server2",
-          "172.16.220.57": "server3"
+          "192.0.2.55": "server1",
+          "192.0.2.56": "server2",
+          "192.0.2.57": "server3"
         },
         "socketPath": "/run/haproxy/admin.sock",
         "drainWaitSeconds": 10
@@ -626,7 +632,7 @@ A config is either **flat** (top-level `hosts`, no `classes`) or **multi-class**
     },
     {
       "name": "worker",
-      "hosts": ["172.16.220.58"],
+      "hosts": ["192.0.2.58"],
       "strategy": "parallel",
       "blocking": false,
       "quiesce": { "enabled": true, "pollMs": 2000, "drainTimeoutMs": 120000 }
@@ -688,7 +694,7 @@ znvault payara deploy run staging --class api --class worker
 znvault payara deploy run staging --class api --strategy 1+2
 
 # Scope to a specific host within one class
-znvault payara deploy run staging --class api --host 172.16.220.55
+znvault payara deploy run staging --class api --host 192.0.2.55
 
 # Dry run — print the ordered plan without deploying
 znvault payara deploy run staging --dry-run
@@ -699,8 +705,8 @@ znvault payara deploy run staging --class worker --dry-run
 
 ```
 Dry run — staging (2 classes, ordered):
- 1. api     [blocking]      1+R       drain     172.16.220.55, .56, .57
- 2. worker  [non-blocking]  parallel  no-drain  172.16.220.58
+ 1. api     [blocking]      1+R       drain     192.0.2.55, .56, .57
+ 2. worker  [non-blocking]  parallel  no-drain  192.0.2.58
 ```
 
 `--strategy` and `--host` are **per-class** on multi-class configs. Using them without `--class` (or with more than one `--class`) is an error.

@@ -4,7 +4,7 @@ vi.mock('../src/cli/config-store.js', () => ({
   loadDeployConfigs: vi.fn().mockResolvedValue({
     configs: {
       stg: {
-        name: 'stg', hosts: ['10.0.0.1'], warPath: '/nonexistent.war',
+        name: 'stg', hosts: ['192.0.2.1'], warPath: '/nonexistent.war',
         migration: { roleId: 'r', migrationsDir: 'db/pre' },
         postMigration: { roleId: 'r', migrationsDir: 'db/post' },
       },

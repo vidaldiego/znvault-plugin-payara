@@ -26,9 +26,9 @@ vi.mock('../src/cli/config-store.js', () => ({
     configs: {
       stg: {
         name: 'stg',
-        hosts: ['10.0.0.1'],
+        hosts: ['192.0.2.1'],
         warPath: '/nonexistent.war',
-        migration: { roleId: 'zincdb-rw', migrationsDir: 'docs/migrations' },
+        migration: { roleId: 'appdb-rw', migrationsDir: 'docs/migrations' },
       },
     },
   }),

@@ -72,10 +72,10 @@ import { parseDeploymentStrategy } from '../src/cli/types.js';
 // ---------------------------------------------------------------------------
 // Incident hosts (the actual config that caused the 2026-06-23 outage)
 // ---------------------------------------------------------------------------
-const WORKER = '172.16.220.58';      // NOT in serverMap → scheduler worker
-const SERVING_1 = '172.16.220.55';   // server1
-const SERVING_2 = '172.16.220.56';   // server2
-const SERVING_3 = '172.16.220.57';   // server3
+const WORKER = '192.0.2.58';      // NOT in serverMap → scheduler worker
+const SERVING_1 = '192.0.2.55';   // server1
+const SERVING_2 = '192.0.2.56';   // server2
+const SERVING_3 = '192.0.2.57';   // server3
 const PORT = 9100;
 
 const SERVER_MAP = {
@@ -135,7 +135,7 @@ function makeOptions(hosts: string[], overrides: Partial<ListrDeployOptions> = {
     force: false,
     analysisMap: makeAnalysisMap(hosts),
     haproxy: {
-      hosts: ['172.16.220.20'],
+      hosts: ['198.51.100.20'],
       backend: 'api_servers',
       serverMap: SERVER_MAP,
       drainWaitSeconds: 0,
@@ -149,11 +149,11 @@ beforeEach(() => {
 
   vi.mocked(haproxyMod.drainServer).mockResolvedValue({
     success: true,
-    results: [{ host: '172.16.220.20', success: true }],
+    results: [{ host: '198.51.100.20', success: true }],
   });
   vi.mocked(haproxyMod.readyServer).mockResolvedValue({
     success: true,
-    results: [{ host: '172.16.220.20', success: true }],
+    results: [{ host: '198.51.100.20', success: true }],
   });
   vi.mocked(deployMod.deployToHost).mockResolvedValue(makeSuccessResult());
   vi.mocked(schedulerMod.quiesceScheduler).mockResolvedValue({ available: true, inFlightUnits: 0 });
@@ -202,11 +202,11 @@ describe('0. partitionHostsByClass helper', () => {
 
   it('all-worker when serverMap is present but matches none of the hosts', () => {
     const { serving, workers } = partitionHostsByClass(
-      [WORKER, '172.16.220.59'],
+      [WORKER, '192.0.2.59'],
       { hosts: [], backend: 'b', serverMap: SERVER_MAP },
     );
     expect(serving).toEqual([]);
-    expect(workers).toEqual([WORKER, '172.16.220.59']);
+    expect(workers).toEqual([WORKER, '192.0.2.59']);
   });
 });
 
@@ -357,7 +357,7 @@ describe('3. No serverMap configured: one class, behavior unchanged', () => {
     const order = captureDeployOrder();
     const strategy = parseDeploymentStrategy('1+R');
     const options = makeOptions(HOSTS, {
-      haproxy: { hosts: ['172.16.220.20'], backend: 'api_servers', serverMap: {}, drainWaitSeconds: 0 },
+      haproxy: { hosts: ['198.51.100.20'], backend: 'api_servers', serverMap: {}, drainWaitSeconds: 0 },
     });
 
     await executeListrDeployment(strategy, HOSTS, options);
@@ -419,7 +419,7 @@ describe('5. Mixed serving + worker config emits a warning', () => {
 describe('8. Worker-only config: deploy workers, do not error', () => {
   // serverMap is configured (for a DIFFERENT fleet) but none of these hosts
   // are in it → all are workers, no serving node to protect.
-  const HOSTS = [WORKER, '172.16.220.59'];
+  const HOSTS = [WORKER, '192.0.2.59'];
 
   it('deploys all workers and never aborts', async () => {
     const order = captureDeployOrder();

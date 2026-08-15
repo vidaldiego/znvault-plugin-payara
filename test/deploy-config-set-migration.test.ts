@@ -43,7 +43,7 @@ describe('validateDeployConfig — migration config', () => {
   it('errors when migration.migrationsDir is empty (flat)', () => {
     const r = validateDeployConfig({
       ...flatBase,
-      migration: { roleId: 'zincdb-rw', migrationsDir: '' },
+      migration: { roleId: 'appdb-rw', migrationsDir: '' },
     });
     expect(r.errors.some(e => /migration.*missing migrationsDir|migrationsDir.*migration/i.test(e))).toBe(true);
   });
@@ -51,7 +51,7 @@ describe('validateDeployConfig — migration config', () => {
   it('errors when migration.migrationsDir is whitespace-only (flat)', () => {
     const r = validateDeployConfig({
       ...flatBase,
-      migration: { roleId: 'zincdb-rw', migrationsDir: '  ' },
+      migration: { roleId: 'appdb-rw', migrationsDir: '  ' },
     });
     expect(r.errors.some(e => /migration.*missing migrationsDir|migrationsDir.*migration/i.test(e))).toBe(true);
   });
@@ -67,20 +67,20 @@ describe('validateDeployConfig — migration config', () => {
   it('passes and emits an info line for a valid migration config (flat)', () => {
     const r = validateDeployConfig({
       ...flatBase,
-      migration: { roleId: 'zincdb-rw', migrationsDir: 'docs/migrations' },
+      migration: { roleId: 'appdb-rw', migrationsDir: 'docs/migrations' },
     });
     expect(r.errors).toEqual([]);
-    expect(r.info.some(i => /zincdb-rw/.test(i) && /docs\/migrations/.test(i))).toBe(true);
+    expect(r.info.some(i => /appdb-rw/.test(i) && /docs\/migrations/.test(i))).toBe(true);
     expect(r.info.some(i => /Vault dynamic-secrets/i.test(i))).toBe(true);
   });
 
   it('passes with optional database override in migration config (flat)', () => {
     const r = validateDeployConfig({
       ...flatBase,
-      migration: { roleId: 'zincdb-rw', migrationsDir: 'docs/migrations', database: 'zincdb' },
+      migration: { roleId: 'appdb-rw', migrationsDir: 'docs/migrations', database: 'appdb' },
     });
     expect(r.errors).toEqual([]);
-    expect(r.info.some(i => /zincdb-rw/.test(i))).toBe(true);
+    expect(r.info.some(i => /appdb-rw/.test(i))).toBe(true);
   });
 
   it('passes and emits an info line for a valid migration config (multi-class)', () => {
@@ -92,11 +92,11 @@ describe('validateDeployConfig — migration config', () => {
         { name: 'api', hosts: ['.55'], strategy: 'sequential' },
         { name: 'worker', hosts: ['.58'], strategy: 'parallel', blocking: false },
       ],
-      migration: { roleId: 'zincdb-rw', migrationsDir: 'docs/migrations' },
+      migration: { roleId: 'appdb-rw', migrationsDir: 'docs/migrations' },
     };
     const r = validateDeployConfig(multiClass);
     expect(r.errors).toEqual([]);
-    expect(r.info.some(i => /zincdb-rw/.test(i) && /docs\/migrations/.test(i))).toBe(true);
+    expect(r.info.some(i => /appdb-rw/.test(i) && /docs\/migrations/.test(i))).toBe(true);
   });
 
   it('errors on missing roleId in a multi-class config', () => {

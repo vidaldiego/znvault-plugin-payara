@@ -11,12 +11,12 @@ describe('endpoint overrides', () => {
   beforeEach(() => clearAllEndpointOverrides());
 
   it('uses the override host:port when one is registered', () => {
-    setEndpointOverride('172.16.220.55', '127.0.0.1', 54321);
-    expect(buildPluginUrl('172.16.220.55', 9100)).toBe('http://127.0.0.1:54321/plugins/payara');
+    setEndpointOverride('192.0.2.55', '127.0.0.1', 54321);
+    expect(buildPluginUrl('192.0.2.55', 9100)).toBe('http://127.0.0.1:54321/plugins/payara');
   });
 
   it('falls back to the real host:port when no override exists', () => {
-    expect(buildPluginUrl('172.16.220.56', 9100)).toBe('http://172.16.220.56:9100/plugins/payara');
+    expect(buildPluginUrl('192.0.2.56', 9100)).toBe('http://192.0.2.56:9100/plugins/payara');
   });
 
   it('clearEndpointOverride removes a single override', () => {

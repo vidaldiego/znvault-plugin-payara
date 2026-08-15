@@ -69,8 +69,8 @@ import { parseDeploymentStrategy } from '../src/cli/types.js';
 // Helpers
 // ---------------------------------------------------------------------------
 
-const HOST_API = '172.16.211.10';  // mapped in haproxy serverMap
-const HOST_WORKER = '172.16.211.15';  // NOT in serverMap
+const HOST_API = '192.0.2.10';  // mapped in haproxy serverMap
+const HOST_WORKER = '192.0.2.15';  // NOT in serverMap
 const PORT = 9100;
 
 /** Fake CLIPluginContext */
@@ -145,7 +145,7 @@ function makeOptions(host: string, overrides: Partial<ListrDeployOptions> = {}):
     force: false,
     analysisMap: new Map([[host, { success: true, filesChanged: 1, filesDeleted: 0, bytesToUpload: 1024, isFullUpload: false }]]),
     haproxy: {
-      hosts: ['172.16.220.20'],
+      hosts: ['198.51.100.20'],
       backend: 'api_servers',
       serverMap: { [HOST_API]: 'server1' },
       drainWaitSeconds: 0,  // no actual sleep in tests
@@ -181,11 +181,11 @@ beforeEach(() => {
   // Default drain/ready success
   vi.mocked(haproxyMod.drainServer).mockResolvedValue({
     success: true,
-    results: [{ host: '172.16.220.20', success: true }],
+    results: [{ host: '198.51.100.20', success: true }],
   });
   vi.mocked(haproxyMod.readyServer).mockResolvedValue({
     success: true,
-    results: [{ host: '172.16.220.20', success: true }],
+    results: [{ host: '198.51.100.20', success: true }],
   });
 
   // Default deploy success
@@ -207,7 +207,7 @@ describe('(a) serverMap host: drain before quiesce', () => {
     const callOrder: string[] = [];
     vi.mocked(haproxyMod.drainServer).mockImplementation(async () => {
       callOrder.push('drain');
-      return { success: true, results: [{ host: '172.16.220.20', success: true }] };
+      return { success: true, results: [{ host: '198.51.100.20', success: true }] };
     });
     vi.mocked(schedulerMod.quiesceScheduler).mockImplementation(async () => {
       callOrder.push('quiesce');

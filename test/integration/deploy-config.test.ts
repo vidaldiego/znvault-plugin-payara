@@ -125,7 +125,7 @@ describe('Deploy Config Integration Tests', () => {
         configs: {
           staging: {
             name: 'staging',
-            hosts: ['192.168.1.10', '192.168.1.11'],
+            hosts: ['192.0.2.10', '192.0.2.11'],
             warPath: TEST_WAR_PATH,
             port: 9100,
             parallel: true,
@@ -140,7 +140,7 @@ describe('Deploy Config Integration Tests', () => {
 
       const staging = (loaded.configs as Record<string, unknown>).staging as Record<string, unknown>;
       expect(staging.name).toBe('staging');
-      expect(staging.hosts).toEqual(['192.168.1.10', '192.168.1.11']);
+      expect(staging.hosts).toEqual(['192.0.2.10', '192.0.2.11']);
       expect(staging.warPath).toBe(TEST_WAR_PATH);
       expect(staging.parallel).toBe(true);
     });
@@ -348,7 +348,7 @@ describe('Deploy Config Integration Tests', () => {
         configs: {
           staging: {
             name: 'staging',
-            hosts: ['192.168.1.10', '192.168.1.11', '192.168.1.12'],
+            hosts: ['192.0.2.10', '192.0.2.11', '192.0.2.12'],
             warPath: '/opt/app/MyApp.war',
             port: 9100,
             parallel: true,

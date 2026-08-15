@@ -42,9 +42,9 @@ function makeMockDeps(overrides: {
     leaseId: 'L1',
     username: 'mig_user',
     password: 'mig_pass',
-    host: '172.16.220.40',
+    host: '192.0.2.40',
     port: 6446,
-    database: 'zincdb',
+    database: 'appdb',
   });
   const revoke = overrides.revoke ?? vi.fn().mockResolvedValue(undefined);
   const run = overrides.run ?? vi.fn().mockResolvedValue({
@@ -86,7 +86,7 @@ describe('runMigrationPhase', () => {
   it('is a no-op when config.migration is absent', async () => {
     const config: DeployConfig = {
       name: 'test-config',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
     } as unknown as DeployConfig;
 
     const ctx = makeMockCtx();
@@ -106,9 +106,9 @@ describe('runMigrationPhase', () => {
     // migration phase against the real DB even for a dry run.
     const config: DeployConfig = {
       name: 'staging',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -123,7 +123,7 @@ describe('runMigrationPhase', () => {
     // A dry-run plan line was printed (mentions the role/dir + that it's a dry run).
     const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
     expect(infoCalls.some((m) => /dry.?run/i.test(m))).toBe(true);
-    expect(infoCalls.some((m) => m.includes('zincdb-rw') && m.includes('docs/migrations'))).toBe(true);
+    expect(infoCalls.some((m) => m.includes('appdb-rw') && m.includes('docs/migrations'))).toBe(true);
     // The "Migrations complete" line (which only fires after a real run) must NOT appear.
     expect(ctx.output.info).not.toHaveBeenCalledWith('[deploy] pre-deploy migrations complete.');
   });
@@ -131,9 +131,9 @@ describe('runMigrationPhase', () => {
   it('calls runMigrations with the correct roleId and migrationsDir when config.migration is present', async () => {
     const config: DeployConfig = {
       name: 'production',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -144,7 +144,7 @@ describe('runMigrationPhase', () => {
     await runMigrationPhase(config.migration, 'pre-deploy', 'production', ctx, deps, { run: true });
 
     // The lease must have been minted — runMigrations ran
-    expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
+    expect(deps.client.issueCredential).toHaveBeenCalledWith('appdb-rw', { ttlSeconds: 14400 });
     expect(deps.client.issueCredential).toHaveBeenCalledTimes(1);
 
     // Verify via output messages — both info lines must have fired (before + after),
@@ -157,9 +157,9 @@ describe('runMigrationPhase', () => {
     const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 3, pendingRemaining: 0 });
     const config: DeployConfig = {
       name: 'staging',
-      hosts: ['10.0.0.2'],
+      hosts: ['192.0.2.2'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -184,9 +184,9 @@ describe('runMigrationPhase', () => {
 
     const config: DeployConfig = {
       name: 'production',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -220,9 +220,9 @@ describe('runMigrationPhase — --skip-migrations', () => {
     const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0 });
     const config: DeployConfig = {
       name: 'production',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -250,7 +250,7 @@ describe('runMigrationPhase — --skip-migrations', () => {
   it('is a silent no-op when run:false is set but config.migration is absent', async () => {
     const config: DeployConfig = {
       name: 'no-migration',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
     } as unknown as DeployConfig;
 
     const ctx = makeMockCtx();
@@ -269,9 +269,9 @@ describe('runMigrationPhase — --skip-migrations', () => {
     // If both are somehow set, skip wins — no plan is printed, nothing runs.
     const config: DeployConfig = {
       name: 'staging',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -305,8 +305,8 @@ describe('runMigrationPhase — multi-class config shape', () => {
     const config: DeployConfig = {
       name: 'staging',
       classes: [
-        { name: 'api', hosts: ['10.0.0.1'] },
-        { name: 'worker', hosts: ['10.0.0.2'] },
+        { name: 'api', hosts: ['192.0.2.1'] },
+        { name: 'worker', hosts: ['192.0.2.2'] },
       ],
     } as unknown as DeployConfig;
 
@@ -323,11 +323,11 @@ describe('runMigrationPhase — multi-class config shape', () => {
     const config: DeployConfig = {
       name: 'staging',
       classes: [
-        { name: 'api', hosts: ['10.0.0.1'] },
-        { name: 'worker', hosts: ['10.0.0.2'] },
+        { name: 'api', hosts: ['192.0.2.1'] },
+        { name: 'worker', hosts: ['192.0.2.2'] },
       ],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -338,7 +338,7 @@ describe('runMigrationPhase — multi-class config shape', () => {
     await runMigrationPhase(config.migration, 'pre-deploy', 'staging', ctx, deps, { run: true });
 
     // Credential must have been issued — runMigrations ran
-    expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
+    expect(deps.client.issueCredential).toHaveBeenCalledWith('appdb-rw', { ttlSeconds: 14400 });
     expect(deps.client.issueCredential).toHaveBeenCalledTimes(1);
 
     // Both info lines fire — full runMigrations lifecycle completed
@@ -354,11 +354,11 @@ describe('runMigrationPhase — multi-class config shape', () => {
     const config: DeployConfig = {
       name: 'production',
       classes: [
-        { name: 'api', hosts: ['10.0.0.1', '10.0.0.2'] },
-        { name: 'worker', hosts: ['10.0.0.3'] },
+        { name: 'api', hosts: ['192.0.2.1', '192.0.2.2'] },
+        { name: 'worker', hosts: ['192.0.2.3'] },
       ],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -392,9 +392,9 @@ describe('--migrations-only: runMigrationPhase contract', () => {
     const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 2, pendingRemaining: 0 });
     const config: DeployConfig = {
       name: 'production',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -415,7 +415,7 @@ describe('--migrations-only: runMigrationPhase contract', () => {
   it('is a no-op without migration config (action guard fires first; runMigrationPhase safe regardless)', async () => {
     const config: DeployConfig = {
       name: 'no-migration',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       // No migration block
     } as unknown as DeployConfig;
 
@@ -435,9 +435,9 @@ describe('--migrations-only: runMigrationPhase contract', () => {
 
     const config: DeployConfig = {
       name: 'production',
-      hosts: ['10.0.0.1'],
+      hosts: ['192.0.2.1'],
       migration: {
-        roleId: 'zincdb-rw',
+        roleId: 'appdb-rw',
         migrationsDir: 'docs/migrations',
       },
     } as unknown as DeployConfig;
@@ -465,11 +465,11 @@ describe('--migrations-only: runMigrationPhase contract', () => {
 describe('runMigrationPhase — generalized (post + reasons)', () => {
   it('runs the post-deploy phase against its own dir', async () => {
     const run = vi.fn().mockResolvedValue({ seeded: 0, reconciled: 0, applied: 1, pendingRemaining: 0 });
-    const post = { roleId: 'zincdb-rw', migrationsDir: 'db/post' } as any;
+    const post = { roleId: 'appdb-rw', migrationsDir: 'db/post' } as any;
     const ctx = makeMockCtx();
     const deps = makeMockDeps({ run });
     await runMigrationPhase(post, 'post-deploy', 'prod', ctx, deps, { run: true });
-    expect(deps.client.issueCredential).toHaveBeenCalledWith('zincdb-rw', { ttlSeconds: 14400 });
+    expect(deps.client.issueCredential).toHaveBeenCalledWith('appdb-rw', { ttlSeconds: 14400 });
     const infoCalls = ctx.output.info.mock.calls.map((c) => String(c[0]));
     expect(infoCalls.some((m) => /post-deploy/i.test(m) && /Running/i.test(m))).toBe(true);
   });
@@ -524,7 +524,7 @@ describe('siblingIntegrityDirs', () => {
 
 describe('runMigrationPhase forwards integrityDirs to runMigrations → makeRunner', () => {
   it('passes the sibling dir through to makeRunner (4th arg)', async () => {
-    const post = { roleId: 'zincdb-rw', migrationsDir: 'db/post' } as any;
+    const post = { roleId: 'appdb-rw', migrationsDir: 'db/post' } as any;
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
     await runMigrationPhase(post, 'post-deploy', 'prod', ctx, deps, {
@@ -538,7 +538,7 @@ describe('runMigrationPhase forwards integrityDirs to runMigrations → makeRunn
   });
 
   it('forwards undefined integrityDirs for a single-phase config (unchanged behavior)', async () => {
-    const pre = { roleId: 'zincdb-rw', migrationsDir: 'db/pre' } as any;
+    const pre = { roleId: 'appdb-rw', migrationsDir: 'db/pre' } as any;
     const ctx = makeMockCtx();
     const deps = makeMockDeps();
     await runMigrationPhase(pre, 'pre-deploy', 'prod', ctx, deps, { run: true });

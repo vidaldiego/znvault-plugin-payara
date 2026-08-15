@@ -46,7 +46,7 @@ export interface PayaraPluginConfig {
    * When any of these secrets change, Payara will be restarted.
    * Useful for application configuration secrets.
    *
-   * Example: ["api/staging/config"]
+   * Example: ["app/staging/config"]
    */
   watchSecrets?: string[];
 
@@ -150,7 +150,7 @@ export interface PayaraPluginConfig {
    * Example:
    * {
    *   "ZINC_CONFIG_VAULT_API_KEY": "api-key:zincapi-staging",
-   *   "AWS_ACCESS_KEY_ID": "alias:api/staging/s3.accessKeyId",
+   *   "AWS_ACCESS_KEY_ID": "alias:app/staging/object-store.accessKeyId",
    *   "DATABASE_PASSWORD": "alias:db/prod.password"
    * }
    */
