@@ -16,6 +16,8 @@ import {
   listWarFiles,
 } from '../helpers/war-utils.js';
 import pino from 'pino';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 describe('WarDeployer Integration', () => {
   let mockPayara: MockPayara;
@@ -212,11 +214,58 @@ describe('WarDeployer Integration', () => {
       expect(hashes).toHaveProperty('custom.txt');
     });
 
+    it('WD-11a: should return one coherent exact WAR identity and entry map', async () => {
+      const warPath = createTestWar({
+        path: `${tempDir}/identity.war`,
+        appName: 'TestApp',
+        files: [{ path: 'custom.txt', content: 'custom content' }],
+      });
+      const artifact = readFileSync(warPath);
+
+      const readback = await createDeployer(warPath).getCurrentArtifactReadback();
+
+      expect(readback).not.toBeNull();
+      expect(readback?.size).toBe(artifact.byteLength);
+      expect(readback?.sha256).toBe(
+        createHash('sha256').update(artifact).digest('hex')
+      );
+      expect(readback?.hashes).toHaveProperty('custom.txt');
+    });
+
+    it('WD-11b: should return a bounded whole-WAR identity without an entry map', async () => {
+      const warPath = createTestWar({
+        path: `${tempDir}/bounded-identity.war`,
+        appName: 'TestApp',
+        files: [{ path: 'custom.txt', content: 'custom content' }],
+      });
+      const artifact = readFileSync(warPath);
+
+      const identity = await createDeployer(warPath).getCurrentArtifactIdentity();
+
+      expect(identity).toEqual({
+        size: artifact.byteLength,
+        sha256: createHash('sha256').update(artifact).digest('hex'),
+      });
+      expect(identity).not.toHaveProperty('hashes');
+    });
+
     it('WD-12: should return empty hashes when WAR does not exist', async () => {
       const deployer = createDeployer(`${tempDir}/nonexistent.war`);
       const hashes = await deployer.getCurrentHashes();
 
       expect(hashes).toEqual({});
+    });
+
+    it('WD-12a: should return no artifact readback when WAR does not exist', async () => {
+      const deployer = createDeployer(`${tempDir}/nonexistent.war`);
+
+      expect(await deployer.getCurrentArtifactReadback()).toBeNull();
+    });
+
+    it('WD-12b: should return no bounded artifact identity when WAR does not exist', async () => {
+      const deployer = createDeployer(`${tempDir}/nonexistent.war`);
+
+      expect(await deployer.getCurrentArtifactIdentity()).toBeNull();
     });
 
     it('WD-13: should get specific file from WAR', async () => {

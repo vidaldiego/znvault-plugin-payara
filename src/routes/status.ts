@@ -6,11 +6,14 @@ import type { RouteContext } from './types.js';
 import { CONTENT_TYPES } from './types.js';
 import { getErrorMessage } from '../utils/error.js';
 
+const DEPLOYMENT_READBACK_SCHEMA = 'zincapp.payara.deployment-readback/v1';
+
 /**
  * Register status routes
  *
  * Routes:
  * - GET /status - Get current Payara status
+ * - GET /readback - Get bounded runtime plus exact whole-WAR identity
  * - GET /hashes - Get WAR file hashes for diff deployment
  * - GET /applications - List deployed applications
  * - GET /file/* - Get a specific file from the WAR
@@ -20,6 +23,43 @@ export async function registerStatusRoutes(
   ctx: RouteContext
 ): Promise<void> {
   const { payara, deployer, logger } = ctx;
+
+  /**
+   * GET /readback
+   * Returns a bounded runtime and whole-artifact observation without exposing
+   * the potentially large entry-hash map or performing any lifecycle action.
+   */
+  fastify.get('/readback', async (request, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    try {
+      const runtime = await payara.getStatus();
+      const appDeployed = await deployer.isAppDeployed();
+      const artifact = await deployer.getCurrentArtifactIdentity();
+
+      return {
+        appDeployed,
+        appName: deployer.getAppName(),
+        artifact,
+        dispatchAllowed: false,
+        domain: runtime.domain,
+        healthy: runtime.healthy,
+        observedAtUtc: new Date().toISOString(),
+        processCount: runtime.processCount,
+        running: runtime.running,
+        schema: DEPLOYMENT_READBACK_SCHEMA,
+        status: artifact ? 'ok' : 'no_war',
+        statusOnly: true,
+        warPath: deployer.getWarPath(),
+      };
+    } catch (err) {
+      logger.error({ err }, 'Failed to get bounded deployment readback');
+      return reply.code(500).send({
+        error: 'Failed to get deployment readback',
+        message: getErrorMessage(err),
+        status: 'error',
+      });
+    }
+  });
 
   /**
    * GET /hashes
@@ -33,21 +73,24 @@ export async function registerStatusRoutes(
    */
   fastify.get('/hashes', async (request, reply) => {
     try {
-      // Check if WAR exists first
-      if (!(await deployer.warExists())) {
+      const artifact = await deployer.getCurrentArtifactReadback();
+      if (!artifact) {
         return {
           hashes: {},
+          artifact: null,
           status: 'no_war',
           message: 'No WAR file deployed yet',
         };
       }
 
-      const hashes = await deployer.getCurrentHashes();
-
       return {
-        hashes,
+        hashes: artifact.hashes,
+        artifact: {
+          size: artifact.size,
+          sha256: artifact.sha256,
+        },
         status: 'ok',
-        fileCount: Object.keys(hashes).length,
+        fileCount: Object.keys(artifact.hashes).length,
       };
     } catch (err) {
       logger.error({ err }, 'Failed to get WAR hashes');

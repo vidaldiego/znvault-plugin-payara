@@ -95,9 +95,43 @@ Secret value prefixes:
 
 The plugin registers routes under `/plugins/payara/`:
 
+### GET /plugins/payara/readback
+
+Returns a bounded, status-only observation of the Payara runtime and the exact
+stored WAR identity. It never starts, stops, restarts, deploys or dispatches an
+application, and it omits the potentially large per-entry hash map.
+
+```json
+{
+  "schema": "zincapp.payara.deployment-readback/v1",
+  "status": "ok",
+  "statusOnly": true,
+  "dispatchAllowed": false,
+  "appName": "zincapi",
+  "warPath": "/var/lib/zn-vault-agent/payara/zincapi.war",
+  "artifact": {
+    "size": 297114914,
+    "sha256": "0123456789abcdef..."
+  },
+  "domain": "zincapi",
+  "running": true,
+  "healthy": true,
+  "observedAtUtc": "2026-08-16T17:55:00.000Z",
+  "processCount": 1,
+  "appDeployed": true
+}
+```
+
+When the stored WAR is absent, `status` is `no_war` and `artifact` is `null`.
+The response is marked `Cache-Control: no-store`; `observedAtUtc` makes stale
+readback fail closed. Runtime fields remain observations rather than an
+instruction to change state.
+
 ### GET /plugins/payara/hashes
 
-Returns SHA-256 hashes of all files in the current WAR.
+Returns one coherent readback of the stored WAR: its exact byte size/SHA-256
+and the SHA-256 of every contained file. Existing diff clients continue to use
+the `hashes` field; commissioning readers can pin the whole artifact.
 
 ```bash
 curl http://localhost:9100/plugins/payara/hashes
@@ -106,12 +140,21 @@ curl http://localhost:9100/plugins/payara/hashes
 Response:
 ```json
 {
+  "status": "ok",
+  "artifact": {
+    "size": 123456789,
+    "sha256": "0123456789abcdef..."
+  },
   "hashes": {
     "WEB-INF/web.xml": "abc123...",
     "index.html": "def456..."
-  }
+  },
+  "fileCount": 2
 }
 ```
+
+When no WAR exists, `status` is `no_war`, `artifact` is `null` and `hashes`
+is empty.
 
 ### POST /plugins/payara/deploy
 

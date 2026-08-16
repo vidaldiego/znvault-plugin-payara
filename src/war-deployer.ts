@@ -2,12 +2,20 @@
 // WAR file deployer with diff-based updates - uses asadmin deploy commands only
 
 import { createHash, randomBytes } from 'node:crypto';
-import { writeFile, mkdir, rm, stat } from 'node:fs/promises';
+import { writeFile, mkdir, rm, stat, readFile } from 'node:fs/promises';
 import { join, dirname, normalize, isAbsolute } from 'node:path';
 import AdmZip from 'adm-zip';
 import type { Logger } from 'pino';
 import type { PayaraManager } from './payara-manager.js';
-import type { WarDeployerOptions, WarFileHashes, FileChange, DeployResult, FullDeployResult } from './types.js';
+import type {
+  WarDeployerOptions,
+  WarFileHashes,
+  WarArtifactIdentity,
+  WarArtifactReadback,
+  FileChange,
+  DeployResult,
+  FullDeployResult,
+} from './types.js';
 import { DeploymentLock } from './deployment-lock.js';
 import { DeploymentJournal } from './deployment-journal.js';
 import { createTempDir, cleanupTempDir, withTempDir } from './utils/temp-dir.js';
@@ -151,18 +159,35 @@ export class WarDeployer {
     }
   }
 
-  /**
-   * Get SHA-256 hashes of all files in the WAR
-   */
-  async getCurrentHashes(): Promise<WarFileHashes> {
-    if (!(await this.warExists())) {
-      return {};
+  /** Read the exact stored WAR once and return only its bounded byte identity. */
+  async getCurrentArtifactIdentity(): Promise<WarArtifactIdentity | null> {
+    try {
+      const artifact = await readFile(this.warPath);
+      return {
+        size: artifact.byteLength,
+        sha256: createHash('sha256').update(artifact).digest('hex'),
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return null;
+      }
+      this.logger.error({ err, warPath: this.warPath }, 'Failed to read WAR identity');
+      throw err;
     }
+  }
 
+  /**
+   * Read the exact stored WAR once and return both its byte identity and entry hashes.
+   *
+   * A single read prevents a deployment racing the endpoint between a whole-artifact
+   * digest and the per-entry digest map. The result remains observation only.
+   */
+  async getCurrentArtifactReadback(): Promise<WarArtifactReadback | null> {
     const hashes: WarFileHashes = {};
 
     try {
-      const zip = new AdmZip(this.warPath);
+      const artifact = await readFile(this.warPath);
+      const zip = new AdmZip(artifact);
 
       for (const entry of zip.getEntries()) {
         if (!entry.isDirectory) {
@@ -171,12 +196,23 @@ export class WarDeployer {
           hashes[entry.entryName] = hash;
         }
       }
+      return {
+        size: artifact.byteLength,
+        sha256: createHash('sha256').update(artifact).digest('hex'),
+        hashes,
+      };
     } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+        return null;
+      }
       this.logger.error({ err, warPath: this.warPath }, 'Failed to read WAR file');
       throw err;
     }
+  }
 
-    return hashes;
+  /** Get SHA-256 hashes of all files in the WAR. */
+  async getCurrentHashes(): Promise<WarFileHashes> {
+    return (await this.getCurrentArtifactReadback())?.hashes ?? {};
   }
 
   /**

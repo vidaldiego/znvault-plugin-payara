@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-payara",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "Payara application server plugin for zn-vault-agent with WAR diff deployment",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "build:prod": "tsc --sourceMap false",
+    "build:prod": "npm run clean && tsc --sourceMap false",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",

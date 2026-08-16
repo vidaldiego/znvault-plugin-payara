@@ -215,6 +215,17 @@ export interface WarFileHashes {
   [relativePath: string]: string; // path -> SHA-256 hash
 }
 
+/** One coherent read of the exact stored WAR plus its entry hashes. */
+export interface WarArtifactIdentity {
+  size: number;
+  sha256: string;
+}
+
+/** One coherent read of the exact stored WAR plus its entry hashes. */
+export interface WarArtifactReadback extends WarArtifactIdentity {
+  hashes: WarFileHashes;
+}
+
 /**
  * File change for deployment
  */

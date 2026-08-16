@@ -13,6 +13,8 @@ import {
   cleanupTempDir,
 } from '../helpers/war-utils.js';
 import pino from 'pino';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 describe('HTTP Routes Integration', () => {
   let mockPayara: MockPayara;
@@ -83,10 +85,18 @@ describe('HTTP Routes Integration', () => {
 
       expect(response.statusCode).toBe(200);
 
-      const body = response.json<{ hashes: Record<string, string> }>();
+      const body = response.json<{
+        hashes: Record<string, string>;
+        artifact: { size: number; sha256: string };
+      }>();
       expect(body.hashes).toBeDefined();
       expect(body.hashes['WEB-INF/web.xml']).toBeDefined();
       expect(body.hashes['test.txt']).toBeDefined();
+      const artifact = readFileSync(warPath);
+      expect(body.artifact).toEqual({
+        size: artifact.byteLength,
+        sha256: createHash('sha256').update(artifact).digest('hex'),
+      });
 
       // Verify hash format
       for (const hash of Object.values(body.hashes)) {
@@ -112,8 +122,98 @@ describe('HTTP Routes Integration', () => {
       });
 
       expect(response.statusCode).toBe(200);
-      expect(response.json<{ hashes: Record<string, string> }>().hashes).toEqual({});
+      expect(
+        response.json<{ hashes: Record<string, string>; artifact: null }>(),
+      ).toMatchObject({ hashes: {}, artifact: null });
 
+      await emptyFastify.close();
+    });
+  });
+
+  describe('GET /readback', () => {
+    it('RT-02a: should return bounded runtime and exact whole-WAR identity', async () => {
+      const response = await fastify.inject({
+        method: 'GET',
+        url: '/readback',
+      });
+
+      expect(response.statusCode).toBe(200);
+      const artifact = readFileSync(warPath);
+      const body = response.json<{
+        appDeployed: boolean;
+        appName: string;
+        artifact: { size: number; sha256: string };
+        dispatchAllowed: boolean;
+        domain: string;
+        healthy: boolean;
+        observedAtUtc: string;
+        processCount: number;
+        running: boolean;
+        schema: string;
+        status: string;
+        statusOnly: boolean;
+        warPath: string;
+      }>();
+      expect(body).toEqual({
+        appDeployed: false,
+        appName: 'TestApp',
+        artifact: {
+          size: artifact.byteLength,
+          sha256: createHash('sha256').update(artifact).digest('hex'),
+        },
+        dispatchAllowed: false,
+        domain: mockPayara.domain,
+        healthy: true,
+        observedAtUtc: expect.stringMatching(
+          /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+        ),
+        processCount: 0,
+        running: true,
+        schema: 'zincapp.payara.deployment-readback/v1',
+        status: 'ok',
+        statusOnly: true,
+        warPath,
+      });
+      expect(body).not.toHaveProperty('hashes');
+      expect(response.headers['cache-control']).toBe('no-store');
+      expect(Number.isNaN(Date.parse(body.observedAtUtc))).toBe(false);
+    });
+
+    it('RT-02b: should report no_war without inventing an artifact', async () => {
+      const emptyDeployer = new WarDeployer({
+        warPath: `${tempDir}/nonexistent.war`,
+        appName: 'TestApp',
+        payara: payaraManager,
+        logger,
+      });
+      const emptyFastify = Fastify({ logger: false });
+      await registerRoutes(emptyFastify, payaraManager, emptyDeployer, logger);
+      await emptyFastify.ready();
+
+      const response = await emptyFastify.inject({
+        method: 'GET',
+        url: '/readback',
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(
+        response.json<{
+          artifact: null;
+          dispatchAllowed: boolean;
+          observedAtUtc: string;
+          schema: string;
+          status: string;
+          statusOnly: boolean;
+        }>(),
+      ).toMatchObject({
+        artifact: null,
+        dispatchAllowed: false,
+        observedAtUtc: expect.any(String),
+        schema: 'zincapp.payara.deployment-readback/v1',
+        status: 'no_war',
+        statusOnly: true,
+      });
+      expect(response.headers['cache-control']).toBe('no-store');
       await emptyFastify.close();
     });
   });
