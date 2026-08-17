@@ -285,7 +285,9 @@ export class PayaraManager {
   /**
    * Start Payara domain
    */
-  async start(): Promise<void> {
+  async start(options: { waitForApplicationHealth?: boolean } = {}): Promise<void> {
+    const waitForApplicationHealth = options.waitForApplicationHealth ?? true;
+
     if (await this.isRunning()) {
       this.logger.info({ domain: this.domain }, 'Domain already running');
       return;
@@ -298,8 +300,14 @@ export class PayaraManager {
 
     await this.asadminCommand(['start-domain', this.domain]);
 
-    // Wait for domain to be ready
-    await this.waitForHealthy(60000);
+    // A first deployment cannot satisfy an application-specific health check
+    // until after the WAR exists. Deployment callers wait only for the DAS;
+    // ordinary lifecycle callers retain the existing application-health gate.
+    if (waitForApplicationHealth) {
+      await this.waitForHealthy(60000);
+    } else {
+      await this.waitForRunning(60000);
+    }
 
     // Invalidate status cache after state change
     this.invalidateStatusCache();
@@ -529,6 +537,18 @@ export class PayaraManager {
     );
   }
 
+  /** Wait for the domain administration plane, without requiring an app. */
+  private async waitForRunning(timeoutMs: number): Promise<void> {
+    await waitFor(
+      () => this.isRunning(),
+      timeoutMs,
+      {
+        intervalMs: 1000,
+        timeoutMessage: `Payara domain did not become ready within ${timeoutMs}ms`,
+      }
+    );
+  }
+
   /**
    * Wait for Payara to stop.
    *
@@ -743,7 +763,9 @@ export class PayaraManager {
    *
    * This is the recommended way to start Payara in aggressive mode.
    */
-  async safeStart(): Promise<void> {
+  async safeStart(options: { waitForApplicationHealth?: boolean } = {}): Promise<void> {
+    const waitForApplicationHealth = options.waitForApplicationHealth ?? true;
+
     this.logger.info({ domain: this.domain }, 'Safe start: verifying clean state before starting');
 
     // Ensure no Java processes running
@@ -756,8 +778,11 @@ export class PayaraManager {
     this.logger.info({ domain: this.domain }, 'Starting Payara domain (aggressive mode)');
     await this.asadminCommand(['start-domain', this.domain]);
 
-    // Wait for domain to be ready
-    await this.waitForHealthy(60000);
+    if (waitForApplicationHealth) {
+      await this.waitForHealthy(60000);
+    } else {
+      await this.waitForRunning(60000);
+    }
 
     // Invalidate status cache after state change
     this.invalidateStatusCache();

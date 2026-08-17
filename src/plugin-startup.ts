@@ -84,7 +84,7 @@ export async function handleAggressiveModeStartup(ctx: StartupContext): Promise<
     await payara.ensureNoJavaRunning(true);
 
     // Start Payara fresh
-    await payara.safeStart();
+    await payara.safeStart({ waitForApplicationHealth: false });
 
     // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
     await applyPostStartDelay(ctx, 'after fresh start');
@@ -108,7 +108,7 @@ export async function handleNormalModeStartup(ctx: StartupContext): Promise<void
     logger.info('Payara already running and healthy');
   } else {
     logger.info('Starting Payara...');
-    await payara.start();
+    await payara.start({ waitForApplicationHealth: false });
 
     // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
     await applyPostStartDelay(ctx, 'after starting domain');

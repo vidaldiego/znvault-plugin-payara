@@ -388,7 +388,7 @@ export class WarDeployer {
 
     if (!isRunning) {
       this.logger.info('Starting Payara for deployment');
-      await this.payara.start();
+      await this.payara.start({ waitForApplicationHealth: false });
     }
 
     // Deploy WAR with --force flag (hot deployment/redeploy)
@@ -444,7 +444,7 @@ export class WarDeployer {
         await this.payara.aggressiveStop();
 
         this.setDeploymentStep('starting');
-        await this.payara.safeStart();
+        await this.payara.safeStart({ waitForApplicationHealth: false });
 
         // Wait for start-domain's boot auto-deploy (domain.xml <application-ref>) to
         // SETTLE before redeploying — otherwise undeploy/deploy --force races the boot
@@ -728,7 +728,7 @@ export class WarDeployer {
       await this.journal.updateStep('start');
 
       const startPayaraStart = Date.now();
-      await this.payara.safeStart();
+      await this.payara.safeStart({ waitForApplicationHealth: false });
       timings.start = Date.now() - startPayaraStart;
       this.logger.info({ duration: timings.start }, 'Payara started fresh');
 
