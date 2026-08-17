@@ -41,7 +41,7 @@ describe('createPayaraPlugin', () => {
     const plugin = createPayaraPlugin(validConfig);
 
     expect(plugin.name).toBe('payara');
-    expect(plugin.version).toMatch(/^\d+\.\d+\.\d+$/); // Valid semver
+    expect(plugin.version).toMatch(/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/); // Valid semver
     expect(plugin.description).toContain('Payara');
   });
 

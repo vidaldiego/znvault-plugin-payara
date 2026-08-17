@@ -304,9 +304,9 @@ export class PayaraManager {
     // until after the WAR exists. Deployment callers wait only for the DAS;
     // ordinary lifecycle callers retain the existing application-health gate.
     if (waitForApplicationHealth) {
-      await this.waitForHealthy(60000);
+      await this.waitForHealthy(this.operationTimeout);
     } else {
-      await this.waitForRunning(60000);
+      await this.waitForRunning(this.operationTimeout);
     }
 
     // Invalidate status cache after state change
@@ -779,9 +779,9 @@ export class PayaraManager {
     await this.asadminCommand(['start-domain', this.domain]);
 
     if (waitForApplicationHealth) {
-      await this.waitForHealthy(60000);
+      await this.waitForHealthy(this.operationTimeout);
     } else {
-      await this.waitForRunning(60000);
+      await this.waitForRunning(this.operationTimeout);
     }
 
     // Invalidate status cache after state change

@@ -19,6 +19,7 @@ describe('first-deployment readiness', () => {
       domain: 'zincapi',
       user: process.env.USER ?? 'test',
       healthEndpoint: 'http://127.0.0.1:1/service-status',
+      operationTimeout: 135000,
       logger,
     });
     const internals = manager as unknown as {
@@ -36,8 +37,33 @@ describe('first-deployment readiness', () => {
 
     await manager.start({ waitForApplicationHealth: false });
 
-    expect(running).toHaveBeenCalledWith(60000);
+    expect(running).toHaveBeenCalledWith(135000);
     expect(health).not.toHaveBeenCalled();
+  });
+
+  it('uses the configured lifecycle timeout while waiting for application health', async () => {
+    const manager = new PayaraManager({
+      payaraHome: '/tmp/payara',
+      domain: 'zincapi',
+      user: process.env.USER ?? 'test',
+      healthEndpoint: 'http://127.0.0.1:1/service-status',
+      operationTimeout: 145000,
+      logger,
+    });
+    const internals = manager as unknown as {
+      writeSetenvConfInternal: () => Promise<void>;
+      asadminCommand: (args: string[]) => Promise<string>;
+      waitForHealthy: (timeoutMs: number) => Promise<void>;
+    };
+
+    vi.spyOn(manager, 'isRunning').mockResolvedValue(false);
+    vi.spyOn(internals, 'writeSetenvConfInternal').mockResolvedValue();
+    vi.spyOn(internals, 'asadminCommand').mockResolvedValue('started');
+    const health = vi.spyOn(internals, 'waitForHealthy').mockResolvedValue();
+
+    await manager.start();
+
+    expect(health).toHaveBeenCalledWith(145000);
   });
 
   it('uses domain readiness when WarDeployer starts an empty domain', async () => {
