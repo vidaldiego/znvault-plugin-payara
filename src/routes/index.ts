@@ -10,6 +10,7 @@ import type { RouteContext } from './types.js';
 import { registerDeployRoutes } from './deploy.js';
 import { registerLifecycleRoutes } from './lifecycle.js';
 import { registerStatusRoutes } from './status.js';
+import { isMutationAuthorized } from '../mutation-auth.js';
 
 /**
  * Register all Payara plugin HTTP routes
@@ -23,8 +24,33 @@ export async function registerRoutes(
   fastify: FastifyInstance,
   payara: PayaraManager,
   deployer: WarDeployer,
-  logger: Logger
+  logger: Logger,
+  mutationAuthToken: string,
+  onAuthorizedRequest?: () => void,
+  pluginVersion = '0.0.0'
 ): Promise<void> {
+  if (!mutationAuthToken) {
+    throw new Error(
+      'PAYARA_MUTATION_AUTH_INVALID: mutation credential was not initialized'
+    );
+  }
+
+  // onRequest runs before body parsing. Protect the complete Payara namespace:
+  // even nominal readbacks can expose WAR content or advance runtime/lock
+  // observations. OPTIONS is the sole non-resource exception.
+  fastify.addHook('onRequest', async (request, reply) => {
+    if (request.method === 'OPTIONS') {
+      return;
+    }
+    if (!isMutationAuthorized(request.headers.authorization, mutationAuthToken)) {
+      return reply
+        .header('WWW-Authenticate', 'Bearer realm="payara-mutations"')
+        .code(401)
+        .send({ error: 'Unauthorized' });
+    }
+    onAuthorizedRequest?.();
+  });
+
   // Create session store for chunked deployments
   const sessionStore = new SessionStore(logger, {
     maxSessions: 10,
@@ -46,6 +72,7 @@ export async function registerRoutes(
     deployer,
     sessionStore,
     logger,
+    pluginVersion,
   };
 
   // Register route modules

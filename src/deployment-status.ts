@@ -18,6 +18,8 @@ export interface DeploymentStatus {
   currentStep?: string;
   /** Last completed deployment result */
   lastResult?: DeployResult;
+  /** Opaque deployment ID associated with lastResult */
+  lastDeploymentId?: string;
   /** Last deployment completion time */
   lastCompletedAt?: number;
 }
@@ -33,6 +35,7 @@ export class DeploymentStatusTracker {
   private deploymentStartedAt?: number;
   private currentStep?: string;
   private lastDeploymentResult?: DeployResult;
+  private lastDeploymentId?: string;
   private lastDeploymentCompletedAt?: number;
   private readonly logger: Logger;
 
@@ -53,6 +56,7 @@ export class DeploymentStatusTracker {
       startedAt: this.deploymentStartedAt,
       currentStep: this.currentStep,
       lastResult: this.lastDeploymentResult,
+      lastDeploymentId: this.lastDeploymentId,
       lastCompletedAt: this.lastDeploymentCompletedAt,
     };
   }
@@ -81,10 +85,19 @@ export class DeploymentStatusTracker {
   /**
    * Mark deployment as completed
    *
+   * @param deploymentId - Exact operation identity being completed
    * @param result - Deployment result
    */
-  markCompleted(result: DeployResult): void {
+  markCompleted(deploymentId: string, result: DeployResult): void {
+    if (this.currentDeploymentId !== deploymentId) {
+      throw new Error(
+        `Deployment status identity mismatch: expected ${this.currentDeploymentId ?? 'none'}`
+      );
+    }
+    this.lastDeploymentId = deploymentId;
     this.lastDeploymentResult = result;
+    // Timestamp remains observational telemetry. Pollers correlate exclusively
+    // with lastDeploymentId, so cross-host clock skew cannot affect receipts.
     this.lastDeploymentCompletedAt = Date.now();
     this.currentDeploymentId = undefined;
     this.deploymentStartedAt = undefined;

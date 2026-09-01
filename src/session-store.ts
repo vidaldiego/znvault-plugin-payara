@@ -2,8 +2,14 @@
 // Session store for chunked deployments with LRU eviction
 
 import type { Logger } from 'pino';
-import type { ChunkedDeploySession } from './types.js';
+import type {
+  ChunkedDeploySession,
+  DeploymentArtifactExpectation,
+} from './types.js';
 import { randomUUID } from 'node:crypto';
+
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 /**
  * Configuration for SessionStore
@@ -26,7 +32,12 @@ export interface SessionStoreConfig {
  * @example
  * ```typescript
  * const store = new SessionStore(logger, { maxSessions: 10, timeoutMs: 30 * 60 * 1000 });
- * const session = store.create(['file1.txt'], []);
+ * const session = store.create(
+ *   ['file1.txt'],
+ *   undefined,
+ *   crypto.randomUUID(),
+ *   { expectedBaseSha256: null, targetContentSha256: '…' }
+ * );
  * store.addFiles(session.id, [{ path: 'file2.txt', content: '...' }]);
  * const committed = store.get(session.id);
  * store.delete(session.id);
@@ -54,12 +65,24 @@ export class SessionStore {
   /**
    * Create a new chunked deployment session
    */
-  create(deletions: string[] = [], expectedFiles?: number): ChunkedDeploySession {
+  create(
+    deletions: string[],
+    expectedFiles: number | undefined,
+    deploymentId: string,
+    artifact: DeploymentArtifactExpectation
+  ): ChunkedDeploySession {
+    if (!UUID_V4_PATTERN.test(deploymentId)) {
+      throw new Error(
+        'Chunk session requires an explicit caller-generated lowercase UUIDv4'
+      );
+    }
     // Clean up before creating new session
     this.cleanup();
 
     const session: ChunkedDeploySession = {
       id: randomUUID(),
+      deploymentId,
+      artifact,
       createdAt: Date.now(),
       files: [],
       deletions,

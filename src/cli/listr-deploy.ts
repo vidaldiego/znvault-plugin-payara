@@ -2,7 +2,7 @@
 // Listr2-based deployment executor for clean concurrent progress display
 
 import { Listr, ListrTask, PRESET_TIMER } from 'listr2';
-import type { WarFileHashes } from '../types.js';
+import type { LocalWarArtifactSnapshot, WarFileHashes } from '../types.js';
 import type { CLIPluginContext, DeploymentStrategy, DeployToHostResult, HealthCheckConfig, HAProxyConfig, QuiesceConfig } from './types.js';
 import { deployToHost } from './commands/deploy.js';
 import { ProgressReporter } from './progress.js';
@@ -21,7 +21,9 @@ import {
   quiesceScheduler,
   pollUntilDrained,
   resumeScheduler,
+  type AgentRequestAuth,
 } from '@zincapp/znvault-deploy-core';
+import { getErrorMessage } from '../utils/error.js';
 
 /**
  * Context passed through Listr tasks
@@ -37,14 +39,15 @@ export interface DeployContext {
   skipped: number;
   /** Successful count */
   successful: number;
-  /** Failed count (serving nodes only — drives process exit code) */
+  /** Failed count for serving nodes. */
   failed: number;
   /** Health check failures */
   healthCheckFailed: number;
   /**
    * Worker-node deploy failures (hosts NOT in haproxy.serverMap).
-   * Tracked separately from `failed` because a worker failure is non-blocking:
-   * it is logged + warned but must NOT fail or abort the serving roll.
+   * Tracked separately from `failed` because a worker failure does not abort the
+   * serving roll. It still blocks post-deploy migration and the final command
+   * exits non-zero until every selected worker has a verified receipt.
    */
   workerFailed: number;
 }
@@ -56,6 +59,8 @@ export interface ListrDeployOptions {
   ctx: CLIPluginContext;
   warPath: string;
   localHashes: WarFileHashes;
+  /** Immutable local bytes captured before preflight/migrations. */
+  artifactSnapshot?: LocalWarArtifactSnapshot;
   port: number;
   force: boolean;
   analysisMap: Map<string, HostAnalysis>;
@@ -63,6 +68,8 @@ export interface ListrDeployOptions {
   healthCheck?: HealthCheckConfig;
   /** Whether to use HTTPS for agent connections */
   useTLS?: boolean;
+  /** Dedicated per-host credentials for the protected Payara namespace. */
+  mutationAuthTokens: ReadonlyMap<string, string>;
   /** Connection info per host (for TLS auto-detection) */
   connectionMap?: Map<string, ConnectionInfo>;
   /** HAProxy drain/ready configuration */
@@ -84,6 +91,27 @@ export interface ListrDeployOptions {
    * the in-class partition is expected to be homogeneous and the warning is noise.
    */
   suppressMixedClassWarning?: boolean;
+}
+
+/**
+ * A host contributes to rollout coverage only after the CLI has received the
+ * server's terminal, inventory-verified deployment receipt. The outer success
+ * bit alone is not sufficient: it can only describe the transport helper.
+ */
+export function hasVerifiedDeploymentReceipt(
+  result: DeployToHostResult | undefined
+): boolean {
+  return result?.success === true
+    && result.result?.success === true
+    && result.result.deployed === true;
+}
+
+/** Return the exact expected hosts that do not have a verified receipt. */
+export function missingVerifiedDeploymentReceipts(
+  ctx: Pick<DeployContext, 'results'>,
+  expectedHosts: readonly string[]
+): string[] {
+  return expectedHosts.filter(host => !hasVerifiedDeploymentReceipt(ctx.results.get(host)));
 }
 
 /**
@@ -121,9 +149,9 @@ export function partitionHostsByClass(
  *
  * @param isWorker When true, the host is a worker node (not in
  *   haproxy.serverMap). Its deploy is NON-BLOCKING: a failure is recorded in
- *   `ctx.workerFailed` (not `ctx.failed`) and is NOT rethrown, so it can never
- *   abort or fail the serving roll. Worker nodes are unrouted, so a failure
- *   there is non-urgent.
+ *   `ctx.workerFailed` (not `ctx.failed`) and is NOT rethrown, so it does not
+ *   abort the serving roll. The command-level gate still blocks post-deploy
+ *   migration and exits non-zero for this incomplete selected rollout.
  */
 export function createHostTask(
   host: string,
@@ -145,26 +173,9 @@ export function createHostTask(
     title: `${host}${tlsIndicator} ${filesInfo}`,
     task: async (ctx, task) => {
       const startTime = Date.now();
-
-      // Skip hosts with no changes
-      if (analysis && analysis.filesChanged === 0 && analysis.filesDeleted === 0) {
-        task.title = `${host}${tlsIndicator} - no changes`;
-        ctx.results.set(host, {
-          success: true,
-          result: {
-            success: true,
-            filesChanged: 0,
-            filesDeleted: 0,
-            message: 'No changes',
-            deploymentTime: 0,
-            appName: '',
-          },
-        });
-        ctx.successful++;
-        return;
-        // NOTE: The early-return above exits BEFORE the try block, so quiesce
-        // is never invoked for no-change hosts — correct by design.
-      }
+      const useTLS = connInfo?.tls ?? options.useTLS ?? false;
+      const port = connInfo?.port ?? options.port;
+      const forceRecovery = analysis?.isFullUpload === true;
 
       // HAProxy drain/ready wrapping
       const shouldDrain = options.haproxy && options.haproxy.serverMap[host];
@@ -174,19 +185,28 @@ export function createHostTask(
       // Tunnel-resolved connection params declared before the try so both the
       // quiesce step and the finally (resume) share the ONE authoritative source.
       // (const inside a try block is not visible in its finally block.)
-      const useTLS = connInfo?.tls ?? options.useTLS ?? false;
-      const port = connInfo?.port ?? options.port;
-
+      let requestAuth: AgentRequestAuth | undefined;
+      let failureRecorded = false;
+      let successRecorded = false;
       try {
+        const mutationAuthToken = options.mutationAuthTokens.get(host);
+        if (!mutationAuthToken) {
+          throw new Error(`Payara credential was not loaded for host '${host}'`);
+        }
+        requestAuth = { bearerToken: mutationAuthToken };
+
         // --- Drain from HAProxy ---
         if (shouldDrain) {
           task.output = 'Draining from HAProxy...';
           const drainResult = await drainServer(options.haproxy!, host);
+          // drainServer fans out to every configured HAProxy. A mixed result
+          // means this server is already drained on at least one load balancer,
+          // so the failure path must compensate with readyServer in finally.
+          drained = drainResult.success || drainResult.results.some(result => result.success);
           if (!drainResult.success) {
             const failedHosts = drainResult.results.filter(r => !r.success).map(r => `${r.host}: ${r.error}`);
             throw new Error(`HAProxy drain failed: ${failedHosts.join('; ')}`);
           }
-          drained = true;
           const waitSec = options.haproxy!.drainWaitSeconds ?? 5;
           task.output = `Drain wait (${waitSec}s)...`;
           await new Promise(resolve => setTimeout(resolve, waitSec * 1000));
@@ -196,14 +216,20 @@ export function createHostTask(
         if (options.quiesce?.enabled) {
           try {
             task.output = 'Quiescing scheduler...';
-            const q = await quiesceScheduler(host, port, useTLS);
+            const q = await quiesceScheduler(host, port, useTLS, requestAuth);
             if (q.available) {
               quiesced = true;
               const timeoutMs = options.hostConfigs?.[host]?.quiesceTimeoutMs ?? options.quiesce.drainTimeoutMs;
               const pollMs = options.quiesce.pollMs;
               if (q.inFlightUnits > 0) {
                 task.output = `Draining ${q.inFlightUnits} in-flight unit(s)...`;
-                const poll = await pollUntilDrained(host, port, { pollMs, timeoutMs }, useTLS);
+                const poll = await pollUntilDrained(
+                  host,
+                  port,
+                  { pollMs, timeoutMs },
+                  useTLS,
+                  requestAuth
+                );
                 if (poll.timedOut) {
                   task.output = `Scheduler drain timed out — proceeding`;
                 }
@@ -241,30 +267,48 @@ export function createHostTask(
 
         task.output = 'Starting deployment...';
 
-        const result = await deployToHost(
-          options.ctx,
-          host,
-          port,
-          options.warPath,
-          options.localHashes,
-          options.force,
-          progress,
-          useTLS
-        );
+        const result = options.artifactSnapshot
+          ? await deployToHost(
+              options.ctx,
+              host,
+              port,
+              options.warPath,
+              options.localHashes,
+              options.force || forceRecovery,
+              progress,
+              mutationAuthToken,
+              useTLS,
+              options.artifactSnapshot
+            )
+          : await deployToHost(
+              options.ctx,
+              host,
+              port,
+              options.warPath,
+              options.localHashes,
+              options.force || forceRecovery,
+              progress,
+              mutationAuthToken,
+              useTLS
+            );
 
         ctx.results.set(host, result);
 
-        if (!result.success) {
-          const errorMsg = result.error?.substring(0, 50) ?? 'Unknown error';
+        if (!hasVerifiedDeploymentReceipt(result)) {
+          const errorMsg = (
+            result.error ?? 'Deployment completion was not verified'
+          ).substring(0, 50);
           if (isWorker) {
             // Worker failure is non-blocking: record + surface, never abort.
             ctx.workerFailed++;
+            failureRecorded = true;
             task.title = `${host}${tlsIndicator} - worker FAILED (non-blocking): ${errorMsg}`;
             return;
           }
           ctx.failed++;
+          failureRecorded = true;
           task.title = `${host}${tlsIndicator} - FAILED: ${errorMsg}`;
-          throw new Error(result.error ?? 'Deployment failed');
+          throw new Error(result.error ?? 'Deployment completion was not verified');
         }
 
         // --- Health check ---
@@ -291,16 +335,19 @@ export function createHostTask(
 
           if (healthResult.success) {
             ctx.successful++;
+            successRecorded = true;
             task.title = `${host}${tlsIndicator} - deployed + healthy (${elapsed})${timeStr}`;
           } else {
             const errorMsg = healthResult.error ?? `HTTP ${healthResult.status}`;
             if (isWorker) {
               // Worker health failure is non-blocking: record + surface, never abort.
               ctx.workerFailed++;
+              failureRecorded = true;
               task.title = `${host}${tlsIndicator} - worker UNHEALTHY (non-blocking): ${errorMsg}`;
               return;
             }
             ctx.healthCheckFailed++;
+            failureRecorded = true;
             task.title = `${host}${tlsIndicator} - deployed but UNHEALTHY: ${errorMsg}`;
             // In canary mode, health check failure should stop deployment
             throw new Error(`Health check failed: ${errorMsg}`);
@@ -311,15 +358,41 @@ export function createHostTask(
           const completedAt = result.result?.completedAt;
           const timeStr = completedAt ? ` @ ${formatTime(completedAt)}` : '';
           ctx.successful++;
+          successRecorded = true;
           task.title = `${host}${tlsIndicator} - deployed (${elapsed})${timeStr}`;
         }
 
         // --- Set ready in HAProxy after successful deploy + health check ---
         if (drained) {
           task.output = 'Setting ready in HAProxy...';
-          await readyServer(options.haproxy!, host);
+          const readyResult = await readyServer(options.haproxy!, host);
+          if (!readyResult.success) {
+            const failures = readyResult.results
+              .filter(result => !result.success)
+              .map(result => `${result.host}: ${result.error ?? 'ready command failed'}`);
+            throw new Error(`HAProxy ready failed: ${failures.join('; ')}`);
+          }
           drained = false; // Prevent finally from double-restoring
         }
+      } catch (err) {
+        if (!failureRecorded) {
+          const errorMessage = getErrorMessage(err);
+          if (!ctx.results.has(host)) {
+            ctx.results.set(host, { success: false, error: errorMessage });
+          }
+          if (successRecorded) {
+            ctx.successful = Math.max(0, ctx.successful - 1);
+            successRecorded = false;
+          }
+          if (isWorker) {
+            ctx.workerFailed++;
+            task.title = `${host}${tlsIndicator} - worker FAILED (non-blocking): ${errorMessage.substring(0, 50)}`;
+            return;
+          }
+          ctx.failed++;
+          task.title = `${host}${tlsIndicator} - FAILED: ${errorMessage.substring(0, 50)}`;
+        }
+        throw err;
       } finally {
         // ALWAYS restore server to ready if we drained it, even on failure
         if (drained && options.haproxy) {
@@ -328,8 +401,10 @@ export function createHostTask(
         // ALWAYS resume the scheduler if we quiesced it, even on deploy failure.
         // resumeScheduler is best-effort (swallows internally); the quiesceTtl
         // auto-resume is the backstop if this call fails.
-        if (quiesced) {
-          try { await resumeScheduler(host, port, useTLS); } catch { /* best-effort; auto-resume backstop */ }
+        if (quiesced && requestAuth) {
+          try {
+            await resumeScheduler(host, port, useTLS, requestAuth);
+          } catch { /* best-effort; auto-resume backstop */ }
         }
       }
     },
@@ -366,6 +441,22 @@ export async function executeListrDeployment(
   // separate, final, non-blocking batch. See partitionHostsByClass for the rule.
   const { serving, workers } = partitionHostsByClass(hosts, options.haproxy);
 
+  // A finite canary plan without a final R/rest batch must name enough capacity
+  // for every serving host. Refuse it before the first drain/deploy rather than
+  // silently treating the unmentioned tail as a successful rollout.
+  if (strategy.isCanary && !strategy.batches.some(batch => batch.count === 'rest')) {
+    const finiteCapacity = strategy.batches.reduce(
+      (total, batch) => total + (typeof batch.count === 'number' ? batch.count : 0),
+      0
+    );
+    if (finiteCapacity < serving.length) {
+      throw new Error(
+        `Deployment strategy '${strategy.name}' covers ${finiteCapacity} of ` +
+        `${serving.length} serving hosts; append +R to cover the remainder`
+      );
+    }
+  }
+
   // Warn on a mixed config: the strategy governs serving nodes only; workers
   // deploy last (parallel, non-blocking).
   if (serving.length > 0 && workers.length > 0 && !options.suppressMixedClassWarning) {
@@ -381,8 +472,16 @@ export async function executeListrDeployment(
   const tasks: ListrTask<DeployContext>[] = [];
   let hostIndex = 0;
 
-  for (let batchIndex = 0; batchIndex < strategy.batches.length && hostIndex < serving.length; batchIndex++) {
-    const batch = strategy.batches[batchIndex]!;
+  let batchIndex = 0;
+  while (hostIndex < serving.length) {
+    // Non-canary strategies are reusable patterns. In particular, sequential
+    // is represented as one {count: 1} batch and must repeat until every host
+    // has a task. Canary batches are consumed exactly once.
+    const strategyBatchIndex = strategy.isCanary
+      ? batchIndex
+      : batchIndex % strategy.batches.length;
+    const batch = strategy.batches[strategyBatchIndex];
+    if (!batch) break;
     const batchSize = batch.count === 'rest'
       ? serving.length - hostIndex
       : Math.min(batch.count, serving.length - hostIndex);
@@ -426,6 +525,7 @@ export async function executeListrDeployment(
         }),
       });
     }
+    batchIndex++;
   }
 
   // Determine concurrency based on strategy
@@ -497,13 +597,14 @@ export async function executeListrDeployment(
 
   // --- Worker batch (final, parallel, no drain, NON-BLOCKING) ---
   // Workers deploy LAST, only if the serving roll did not abort. A worker
-  // failure is recorded in ctx.workerFailed (not ctx.failed) and never aborts.
+  // failure is recorded in ctx.workerFailed (not ctx.failed) and never aborts
+  // serving deployment. The command-level receipt gate still exits non-zero.
   // Don't touch workers if serving is broken (servingAborted short-circuits).
   if (workers.length > 0 && !servingAborted) {
     const workerTasks = workers.map(host => createHostTask(host, options, /* isWorker */ true));
     const workerListrOptions = {
       concurrent: workers.length > 1,
-      // Non-blocking: never throw out of the worker batch. createHostTask also
+      // Non-blocking for serving rollout: never throw out of the worker batch. createHostTask also
       // swallows worker failures (records to workerFailed + returns), so this is
       // belt-and-suspenders.
       exitOnError: false,
@@ -521,8 +622,9 @@ export async function executeListrDeployment(
     try {
       await workerListr.run();
     } catch {
-      // Defensive: worker batch is best-effort. A worker failure must never
-      // fail or abort the (already-successful) serving deploy.
+      // Defensive: finish observing the worker batch. A worker failure must not
+      // abort the already-successful serving deploy; the final command gate
+      // still reports the incomplete rollout as non-zero.
     }
   }
 

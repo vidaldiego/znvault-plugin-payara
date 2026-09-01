@@ -2,15 +2,22 @@
 // Plugin startup mode handlers
 
 import type { Logger } from 'pino';
+import { performance } from 'node:perf_hooks';
 import type { PayaraManager } from './payara-manager.js';
 import type { WarDeployer } from './war-deployer.js';
-import { waitForWithResult } from './utils/polling.js';
 
 /**
  * Default delay after starting Payara before deploying (milliseconds)
  * This allows Payara's env var substitution to fully initialize
  */
 export const DEFAULT_POST_START_DELAY_MS = 5000;
+/**
+ * Shared command + runtime-probe budget inside the agent 2.x 120s onStart
+ * limit. onStart never deploys an application, so this is the only potentially
+ * long mutation it may dispatch.
+ */
+export const STARTUP_LIFECYCLE_BUDGET_MS = 35000;
+export const STARTUP_OBSERVATION_BUDGET_MS = 25000;
 
 /**
  * Context for startup operations
@@ -21,6 +28,8 @@ export interface StartupContext {
   logger: Logger;
   /** Delay after domain start before deploying (ms) */
   postStartDelay?: number;
+  /** Absolute monotonic deadline inherited from the agent onStart hook. */
+  deadlineMs?: number;
 }
 
 /**
@@ -29,35 +38,12 @@ export interface StartupContext {
  * In this mode, we don't start Payara ourselves - we wait for it
  * to be started by an external process (e.g., systemd exec command)
  */
-export async function handleExecModeStartup(ctx: StartupContext): Promise<void> {
-  const { payara, deployer, logger } = ctx;
-
-  logger.info('Lifecycle managed externally (exec mode), waiting for Payara to be ready...');
-
-  // Wait for Payara to become healthy (started by exec command)
-  const maxWait = 120000; // 2 minutes
-  const payaraReady = await waitForWithResult(
-    () => payara.isRunning(),
-    maxWait,
-    { intervalMs: 2000 }
+export async function handleExecModeStartup(_ctx: StartupContext): Promise<void> {
+  const error = new Error(
+    'EXEC_LIFECYCLE_UNSUPPORTED: agent exec events cannot safely identify the detached Payara DAS'
   );
-
-  if (payaraReady) {
-    logger.info('Payara is running');
-  } else {
-    logger.warn(
-      `Timeout waiting for Payara to start (${maxWait / 1000}s). ` +
-      'Plugin will continue but Payara may not be available. ' +
-      'Check exec command configuration.'
-    );
-  }
-
-  // Deploy WAR if it exists and Payara is running
-  if (payaraReady && await deployer.warExists()) {
-    // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
-    await applyPostStartDelay(ctx, 'after Payara became ready');
-    await deployer.deploy();
-  }
+  error.name = 'EXEC_LIFECYCLE_UNSUPPORTED';
+  throw error;
 }
 
 /**
@@ -69,30 +55,35 @@ export async function handleExecModeStartup(ctx: StartupContext): Promise<void> 
 export async function handleAggressiveModeStartup(ctx: StartupContext): Promise<void> {
   const { payara, deployer, logger } = ctx;
 
-  if (await payara.isHealthy()) {
-    logger.info('Aggressive mode: Payara already running and healthy, skipping restart');
+  // Lifecycle routing is correctness-bearing. An UNKNOWN list-domains result
+  // must abort rather than collapse to "stopped" and select a start/kill path.
+  const alreadyRunning = await payara.isRunningStrict(
+    remainingStartupBudget(ctx, 'aggressive running-state probe', 10000)
+  );
+  if (alreadyRunning) {
+    logger.info('Aggressive mode: Payara already running, skipping restart');
 
-    // Just ensure app is deployed
-    if (await deployer.warExists() && !(await deployer.isAppDeployed())) {
-      logger.info('WAR exists but app not deployed, deploying...');
-      await deployer.deploy();
-    }
+    // Startup is observation-only for the application. The agent loader's
+    // onStart timeout is not cancellable, so a WAR deploy must never continue
+    // after the host has marked this plugin failed.
+    logger.info('Observing startup deployment ownership for the existing domain');
+    await deployer.observeStartupOwnership(ctx.deadlineMs);
   } else {
-    logger.info('Aggressive mode: Payara not healthy, ensuring clean state');
+    logger.info('Aggressive mode: Payara is strictly stopped');
+    // Startup never performs orphan cleanup. A residual or ambiguous DAS is an
+    // operator condition; destructive aggressive recovery is available only
+    // after the plugin is running and outside the host onStart timeout.
+    await payara.start({
+      waitForApplicationHealth: false,
+      timeoutMs: reserveTerminalStartupBudget(
+        ctx,
+        'aggressive start-domain',
+        STARTUP_LIFECYCLE_BUDGET_MS
+      ),
+      ...(ctx.deadlineMs === undefined ? {} : { deadlineMs: ctx.deadlineMs }),
+    });
 
-    // Kill any existing Java processes (clean slate)
-    await payara.ensureNoJavaRunning(true);
-
-    // Start Payara fresh
-    await payara.safeStart({ waitForApplicationHealth: false });
-
-    // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
-    await applyPostStartDelay(ctx, 'after fresh start');
-
-    // Deploy WAR if it exists
-    if (await deployer.warExists()) {
-      await deployer.deploy();
-    }
+    await deployer.observeStartupOwnership(ctx.deadlineMs);
   }
 }
 
@@ -104,19 +95,25 @@ export async function handleAggressiveModeStartup(ctx: StartupContext): Promise<
 export async function handleNormalModeStartup(ctx: StartupContext): Promise<void> {
   const { payara, deployer, logger } = ctx;
 
-  if (await payara.isHealthy()) {
-    logger.info('Payara already running and healthy');
+  const alreadyRunning = await payara.isRunningStrict(
+    remainingStartupBudget(ctx, 'normal running-state probe', 10000)
+  );
+  if (alreadyRunning) {
+    logger.info('Payara already running');
+    await deployer.observeStartupOwnership(ctx.deadlineMs);
   } else {
     logger.info('Starting Payara...');
-    await payara.start({ waitForApplicationHealth: false });
+    await payara.start({
+      waitForApplicationHealth: false,
+      timeoutMs: reserveTerminalStartupBudget(
+        ctx,
+        'normal start-domain',
+        STARTUP_LIFECYCLE_BUDGET_MS
+      ),
+      ...(ctx.deadlineMs === undefined ? {} : { deadlineMs: ctx.deadlineMs }),
+    });
 
-    // Wait for env var substitution to initialize (prevents @DataSourceDefinition failures)
-    await applyPostStartDelay(ctx, 'after starting domain');
-
-    // Deploy WAR if it exists
-    if (await deployer.warExists()) {
-      await deployer.deploy();
-    }
+    await deployer.observeStartupOwnership(ctx.deadlineMs);
   }
 }
 
@@ -126,9 +123,10 @@ export async function handleNormalModeStartup(ctx: StartupContext): Promise<void
  */
 export async function ensureSinglePayaraProcess(
   payara: PayaraManager,
-  logger: Logger
+  logger: Logger,
+  deadlineMs?: number
 ): Promise<boolean> {
-  const singleProcessCheck = await payara.ensureSingleProcess();
+  const singleProcessCheck = await payara.ensureSingleProcess(deadlineMs);
 
   if (singleProcessCheck.fixed) {
     logger.warn({
@@ -139,24 +137,42 @@ export async function ensureSinglePayaraProcess(
     logger.error({
       previousCount: singleProcessCheck.previousCount,
     }, 'CRITICAL: Could not fix duplicate Payara processes - manual intervention required');
+    const error = new Error(
+      `BOOT_MULTIPLE_DAS_PROCESSES: observed ${singleProcessCheck.previousCount} Payara JVMs`
+    );
+    error.name = 'BOOT_MULTIPLE_DAS_PROCESSES';
+    throw error;
   }
 
   return false;
 }
 
-/**
- * Wait for a specified delay, used to allow Payara to initialize env var substitution
- */
-async function applyPostStartDelay(
+function remainingStartupBudget(
   ctx: StartupContext,
-  reason: string
-): Promise<void> {
-  const delay = ctx.postStartDelay ?? DEFAULT_POST_START_DELAY_MS;
-  if (delay > 0) {
-    ctx.logger.info(
-      { delayMs: delay },
-      `Waiting ${delay}ms ${reason} before deploying (postStartDelay)`
-    );
-    await new Promise(resolve => setTimeout(resolve, delay));
+  stage: string,
+  capMs: number
+): number {
+  if (ctx.deadlineMs === undefined) return capMs;
+  const remainingMs = Math.floor(ctx.deadlineMs - performance.now());
+  if (remainingMs <= 0) {
+    throw new Error(`PLUGIN_STARTUP_DEADLINE_EXCEEDED: before ${stage}`);
   }
+  return Math.min(capMs, remainingMs);
+}
+
+function reserveTerminalStartupBudget(
+  ctx: StartupContext,
+  stage: string,
+  lifecycleMs: number
+): number {
+  if (ctx.deadlineMs === undefined) return lifecycleMs;
+  const requiredMs = lifecycleMs + STARTUP_OBSERVATION_BUDGET_MS;
+  const remainingMs = Math.floor(ctx.deadlineMs - performance.now());
+  if (remainingMs < requiredMs) {
+    throw new Error(
+      `PLUGIN_STARTUP_DEADLINE_EXCEEDED: ${remainingMs}ms remain before ${stage}; ` +
+      `${requiredMs}ms required`
+    );
+  }
+  return lifecycleMs;
 }

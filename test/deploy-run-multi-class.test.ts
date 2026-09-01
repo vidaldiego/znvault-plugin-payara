@@ -20,6 +20,9 @@ describe('validateClassFlags', () => {
   it('rejects an unknown --class name', () => {
     expect(validateClassFlags(multi, { classNames: ['bogus'] }).error).toMatch(/bogus/);
   });
+  it('rejects a duplicated --class name', () => {
+    expect(validateClassFlags(multi, { classNames: ['api', 'api'] }).error).toMatch(/duplicate --class.*api/i);
+  });
   it('rejects bare --strategy on a multi-class config', () => {
     expect(validateClassFlags(multi, { strategy: '1+2' }).error).toMatch(/per-class|specify --class/i);
   });

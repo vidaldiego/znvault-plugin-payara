@@ -2,8 +2,127 @@
 // WAR file utility functions - hash calculation and diff operations
 
 import { createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import AdmZip from 'adm-zip';
-import type { WarFileHashes } from './types.js';
+import type {
+  LocalWarArtifactSnapshot,
+  WarFileHashes,
+} from './types.js';
+
+/**
+ * Produce a deterministic identity for a WAR's logical entry contents.
+ * Length-prefixed fields avoid concatenation ambiguity, and sorting makes the
+ * digest independent of ZIP entry order/compression metadata.
+ */
+export function calculateWarContentSha256(hashes: WarFileHashes): string {
+  const digest = createHash('sha256');
+  for (const path of Object.keys(hashes).sort()) {
+    const entryHash = hashes[path]!;
+    digest.update(`${Buffer.byteLength(path, 'utf8')}:`, 'utf8');
+    digest.update(path, 'utf8');
+    digest.update(`:${entryHash.length}:`, 'utf8');
+    digest.update(entryHash, 'utf8');
+  }
+  return digest.digest('hex');
+}
+
+function assertUnambiguousWarEntryName(entryName: string): void {
+  const logicalName = entryName.endsWith('/')
+    ? entryName.slice(0, -1)
+    : entryName;
+  const parts = logicalName.split('/');
+  const hasAsciiControl = Array.from(entryName).some(character => {
+    const codePoint = character.codePointAt(0)!;
+    return codePoint <= 0x1f || codePoint === 0x7f;
+  });
+  if (
+    logicalName.length === 0
+    || hasAsciiControl
+    || entryName.includes('\\')
+    || entryName.startsWith('/')
+    || /^[A-Za-z]:\//u.test(entryName)
+    || parts.some(part => part.length === 0 || part === '.' || part === '..')
+  ) {
+    throw new Error(
+      `WAR_ENTRY_PATH_INVALID: ambiguous or unsafe ZIP entry name: ${JSON.stringify(entryName)}`
+    );
+  }
+}
+
+/**
+ * Parse one WAR into an unambiguous logical entry map.
+ *
+ * ZIP permits duplicate names, while extractors/classloaders need not agree on
+ * which duplicate wins. Such an archive cannot have one trustworthy logical
+ * identity and is rejected instead of silently collapsing entries in an object.
+ */
+export function calculateWarEntryHashes(artifact: Buffer): WarFileHashes {
+  const hashes: WarFileHashes = {};
+  const zip = new AdmZip(artifact);
+  const seenLogicalEntries = new Set<string>();
+  const fileEntries = new Set<string>();
+  const logicalParents = new Set<string>();
+
+  for (const entry of zip.getEntries()) {
+    assertUnambiguousWarEntryName(entry.entryName);
+    const logicalName = entry.entryName.endsWith('/')
+      ? entry.entryName.slice(0, -1)
+      : entry.entryName;
+    if (seenLogicalEntries.has(logicalName)) {
+      throw new Error(
+        `WAR_ENTRY_DUPLICATE: duplicate or file/directory-colliding ZIP entry: ` +
+        JSON.stringify(entry.entryName)
+      );
+    }
+    const parentParts = logicalName.split('/');
+    parentParts.pop();
+    let parent = '';
+    for (const part of parentParts) {
+      parent = parent.length === 0 ? part : `${parent}/${part}`;
+      if (fileEntries.has(parent)) {
+        throw new Error(
+          `WAR_ENTRY_PATH_INVALID: file entry ${JSON.stringify(parent)} ` +
+          `cannot also be a parent of ${JSON.stringify(entry.entryName)}`
+        );
+      }
+    }
+    if (!entry.isDirectory && logicalParents.has(logicalName)) {
+      throw new Error(
+        `WAR_ENTRY_PATH_INVALID: file entry ${JSON.stringify(entry.entryName)} ` +
+        'collides with an existing descendant entry'
+      );
+    }
+    seenLogicalEntries.add(logicalName);
+    parent = '';
+    for (const part of parentParts) {
+      parent = parent.length === 0 ? part : `${parent}/${part}`;
+      logicalParents.add(parent);
+    }
+    if (!entry.isDirectory) {
+      const content = entry.getData();
+      hashes[entry.entryName] = createHash('sha256').update(content).digest('hex');
+      fileEntries.add(logicalName);
+    }
+  }
+
+  return hashes;
+}
+
+/** Read a local WAR exactly once and retain an immutable in-memory snapshot. */
+export async function readLocalWarArtifactSnapshot(
+  warPath: string
+): Promise<LocalWarArtifactSnapshot> {
+  const artifact = Buffer.from(await readFile(warPath));
+  const hashes = Object.freeze(calculateWarEntryHashes(artifact));
+  const snapshot: LocalWarArtifactSnapshot = {
+    size: artifact.byteLength,
+    sha256: createHash('sha256').update(artifact).digest('hex'),
+    contentSha256: calculateWarContentSha256(hashes),
+    hashes,
+    getBytes: () => Buffer.from(artifact),
+  };
+  return Object.freeze(snapshot);
+}
 
 /**
  * Calculate diff between local and remote hashes
@@ -43,18 +162,7 @@ export function calculateDiff(
  * @returns Object mapping file paths to their SHA-256 hashes
  */
 export async function calculateWarHashes(warPath: string): Promise<WarFileHashes> {
-  const hashes: WarFileHashes = {};
-  const zip = new AdmZip(warPath);
-
-  for (const entry of zip.getEntries()) {
-    if (!entry.isDirectory) {
-      const content = entry.getData();
-      const hash = createHash('sha256').update(content).digest('hex');
-      hashes[entry.entryName] = hash;
-    }
-  }
-
-  return hashes;
+  return (await readLocalWarArtifactSnapshot(warPath)).hashes;
 }
 
 /**

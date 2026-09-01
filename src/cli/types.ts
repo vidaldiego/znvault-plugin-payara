@@ -283,6 +283,14 @@ export type DeployClass = SharedDeployDefaults & {
 export interface DeployConfig {
   name: string;
   /**
+   * Local path to the private token file whose contents match the protected
+   * Payara plugin namespace on every target. Store only the path, never the
+   * credential itself.
+   */
+  mutationAuthTokenFile?: string;
+  /** Per-host local token paths; preferred because setup generates unique tokens. */
+  mutationAuthTokenFiles?: Record<string, string>;
+  /**
    * Optional root directory for RELATIVE local filesystem paths. When set,
    * a relative warPath / migrationsDir / scaffoldingFile is resolved against
    * this root; an absolute one is used as-is. A leading `~/` in rootDir (or in
@@ -314,7 +322,8 @@ export interface DeployConfig {
   /**
    * When true, reach each host's agent through an SSH-CA-authenticated local
    * port-forward (via `znvault ssh forward`) instead of connecting to :9100
-   * directly. Lets the agent bind loopback-only. Default: false.
+   * directly. Lets the agent bind loopback-only. Default: true in plugin 3;
+   * explicit false requires loopback or verified HTTPS.
    */
   tunnel?: boolean;
   /** SSH tunnel settings (only used when tunnel is true). */
@@ -427,6 +436,7 @@ export interface DeploymentStatusResponse {
   startedAt?: number;
   currentStep?: string;
   elapsedMs?: number;
+  lastDeploymentId?: string;
   lastResult?: DeployResult;
   lastCompletedAt?: number;
   appDeployed: boolean;
@@ -458,6 +468,12 @@ export interface PluginVersionInfo {
   current: string;
   latest: string;
   updateAvailable: boolean;
+  /** Signed release rail selected by Agent 2's updater. */
+  channel?: string;
+  /** Exact artifact version the updater is prepared to install. */
+  targetVersion?: string;
+  /** True only after Agent has validated the selected updater artifact. */
+  updaterReady?: boolean;
 }
 
 /**
@@ -480,15 +496,27 @@ export interface PluginUpdateResult {
   error?: string;
 }
 
+/** Exact, compare-and-swap plugin transition requested from Agent 2. */
+export interface PluginUpdateRequest {
+  requestId: string;
+  package: string;
+  expectedCurrentVersion: string;
+  expectedVersion: string;
+}
+
 /**
  * Plugin update response from agent /plugins/update endpoint
  */
 export interface PluginUpdateResponse {
+  requestId: string;
   updated: number;
   results: PluginUpdateResult[];
   willRestart: boolean;
   message: string;
   timestamp: string;
+  requestedAt: string;
+  startedAt: string;
+  finishedAt: string;
 }
 
 /**

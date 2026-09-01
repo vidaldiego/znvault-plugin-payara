@@ -46,14 +46,20 @@ export {
   getStrategyDisplayName,
 } from './types.js';
 
-// HTTP client
+// HTTP client. Payara namespace requests require the dedicated credential;
+// only URL construction remains delegated to deploy-core.
 export {
-  agentGet,
-  agentPost,
-  agentPostWithStatus,
-  pollDeploymentStatus,
   buildPluginUrl,
+  agentGet as payaraGet,
+  agentPost as payaraPost,
+  agentPostWithStatus as payaraPostWithStatus,
+  pollDeploymentStatus as pollPayaraDeploymentStatus,
 } from '@zincapp/znvault-deploy-core';
+export {
+  loadCliMutationAuthToken,
+  loadHostMutationAuthTokens,
+  resolveMutationAuthTokenFile,
+} from './auth-token.js';
 export type { ProgressCallback } from '@zincapp/znvault-deploy-core';
 
 // Formatters

@@ -19,7 +19,12 @@ export interface ProcessKillOptions {
  * Command executor interface matching PayaraManager.execCommand
  */
 export interface CommandExecutor {
-  (command: string, timeoutMs?: number): Promise<{ stdout: string; stderr: string }>;
+  (
+    command: string,
+    args: readonly string[],
+    timeoutMs?: number,
+    acceptedExitCodes?: readonly number[]
+  ): Promise<{ stdout: string; stderr: string }>;
 }
 
 /**
@@ -62,7 +67,7 @@ export async function killProcessesByPid(
   logger.info({ pids }, `Found ${processName} processes to kill`);
 
   // First try graceful SIGTERM
-  await exec(`kill -TERM ${pids.join(' ')} || true`, commandTimeoutMs);
+  await exec('/bin/kill', ['-TERM', ...pids.map(String)], commandTimeoutMs);
   await sleep(termDelayMs);
 
   // Check if any processes remain
@@ -70,7 +75,7 @@ export async function killProcessesByPid(
   if (remaining.length > 0) {
     // Force kill with SIGKILL
     logger.warn({ pids: remaining }, `${processName} processes still running, using SIGKILL`);
-    await exec(`kill -9 ${remaining.join(' ')} || true`, commandTimeoutMs);
+    await exec('/bin/kill', ['-KILL', ...remaining.map(String)], commandTimeoutMs);
     await sleep(killDelayMs);
   }
 
@@ -97,7 +102,7 @@ export async function killProcessesByPid(
  * @throws Error if processes cannot be killed
  */
 export async function killProcessesByPkill(
-  pkillArgs: string,
+  pkillArgs: readonly string[],
   processName: string,
   exec: CommandExecutor,
   logger: Logger,
@@ -114,8 +119,8 @@ export async function killProcessesByPkill(
   logger.warn(`Killing ALL ${processName} processes`);
 
   // First try graceful SIGTERM
-  // Note: `|| true` ensures command succeeds even if no processes found
-  await exec(`pkill ${pkillArgs} || true`, commandTimeoutMs);
+  // pkill exit 1 means no process matched, which is an ordinary cleanup no-op.
+  await exec('/usr/bin/pkill', pkillArgs, commandTimeoutMs, [0, 1]);
   await sleep(termDelayMs);
 
   // Check if any processes remain
@@ -124,7 +129,7 @@ export async function killProcessesByPkill(
   if (stillRunning) {
     // Force kill with SIGKILL
     logger.warn(`${processName} processes still running, using SIGKILL`);
-    await exec(`pkill -9 ${pkillArgs} || true`, commandTimeoutMs);
+    await exec('/usr/bin/pkill', ['-KILL', ...pkillArgs], commandTimeoutMs, [0, 1]);
     await sleep(killDelayMs);
   }
 

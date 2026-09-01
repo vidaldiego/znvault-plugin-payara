@@ -3,7 +3,11 @@
 
 import type { Logger } from 'pino';
 import type { PluginHealthStatus } from '@zincapp/zn-vault-agent/plugins';
-import type { PayaraStatus, PayaraPluginConfig } from './types.js';
+import type {
+  BootDeploymentStatus,
+  PayaraStatus,
+  PayaraPluginConfig,
+} from './types.js';
 import { verifyApiKeyFile } from './secrets-handler.js';
 
 /**
@@ -74,7 +78,11 @@ export async function evaluateHealth(ctx: HealthContext): Promise<HealthEvaluati
   } else if (hasDuplicateProcesses) {
     healthStatus = 'unhealthy';
     criticalError = `Multiple Payara processes detected (${processCount} PIDs: ${status.processPids?.join(', ')})`;
-  } else if (status.running && appDeployed && status.healthy) {
+  } else if (
+    status.running
+    && appDeployed
+    && status.healthy
+  ) {
     healthStatus = 'healthy';
   } else if (status.running) {
     healthStatus = 'degraded';
@@ -97,12 +105,26 @@ export function buildHealthStatus(
   config: PayaraPluginConfig,
   status: PayaraStatus,
   appDeployed: boolean,
+  bootDeployment: BootDeploymentStatus,
   evaluation: HealthEvaluation
 ): PluginHealthStatus {
+  let healthStatus = evaluation.status;
+  let criticalError = evaluation.criticalError;
+  if (bootDeployment.mutationOutcomeUnknown) {
+    healthStatus = 'unhealthy';
+    criticalError =
+      `Deployment outcome is unknown for boot epoch ${bootDeployment.bootEpoch}`;
+  } else if (bootDeployment.phase === 'blocked') {
+    healthStatus = 'unhealthy';
+    criticalError = `Deployment fence is blocked in boot epoch ${bootDeployment.bootEpoch}`;
+  } else if (bootDeployment.phase !== 'ready' && healthStatus === 'healthy') {
+    healthStatus = 'degraded';
+  }
+
   return {
     name: 'payara',
-    status: evaluation.status,
-    message: evaluation.criticalError ? `CRITICAL: ${evaluation.criticalError}` : undefined,
+    status: healthStatus,
+    message: criticalError ? `CRITICAL: ${criticalError}` : undefined,
     details: {
       domain: config.domain,
       running: status.running,
@@ -113,6 +135,7 @@ export function buildHealthStatus(
       processPids: status.processPids,
       warPath: config.warPath,
       appName: config.appName,
+      bootDeployment,
     },
   };
 }

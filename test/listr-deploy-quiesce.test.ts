@@ -11,7 +11,7 @@
 // (d) timeout → deploy STILL called (proceed + warn)
 // (e) quiesce available:false (old znapi/error) → deploy still called, no resume
 // (f) deploy throws → finally STILL calls resumeScheduler (quiesced before try)
-// (g) no-change early-return host → NEVER quiesces (no agent calls)
+// (g) no-change host → still deploys because hashes do not prove runtime dispatch
 // (h) quiesce.enabled false/absent → NO quiesce/agent calls (byte-identical)
 // (i) concurrent strategy + quiesce.enabled → warns once, proceeds
 
@@ -72,6 +72,8 @@ import { parseDeploymentStrategy } from '../src/cli/types.js';
 const HOST_API = '192.0.2.10';  // mapped in haproxy serverMap
 const HOST_WORKER = '192.0.2.15';  // NOT in serverMap
 const PORT = 9100;
+const MUTATION_AUTH_TOKEN = 'test-payara-control-token-0123456789';
+const REQUEST_AUTH = { bearerToken: MUTATION_AUTH_TOKEN };
 
 /** Fake CLIPluginContext */
 function makeCtx(): ListrDeployOptions['ctx'] {
@@ -130,6 +132,7 @@ function makeSuccessResult() {
       message: 'ok',
       deploymentTime: 100,
       appName: 'TestApp',
+      deployed: true,
       completedAt: Date.now(),
     },
   };
@@ -144,6 +147,7 @@ function makeOptions(host: string, overrides: Partial<ListrDeployOptions> = {}):
     port: PORT,
     force: false,
     analysisMap: new Map([[host, { success: true, filesChanged: 1, filesDeleted: 0, bytesToUpload: 1024, isFullUpload: false }]]),
+    mutationAuthTokens: new Map([[host, MUTATION_AUTH_TOKEN]]),
     haproxy: {
       hosts: ['198.51.100.20'],
       backend: 'api_servers',
@@ -165,6 +169,7 @@ async function runTask(host: string, options: ListrDeployOptions) {
     successful: 0,
     failed: 0,
     healthCheckFailed: 0,
+    workerFailed: 0,
   };
   const fakeTask = makeTaskProxy();
   await (listTask.task as (ctx: DeployContext, task: unknown) => Promise<void>)(ctx, fakeTask);
@@ -230,7 +235,117 @@ describe('(a) serverMap host: drain before quiesce', () => {
   it('calls resumeScheduler after deploy', async () => {
     await runTask(HOST_API, makeOptions(HOST_API));
     expect(schedulerMod.resumeScheduler).toHaveBeenCalledOnce();
-    expect(schedulerMod.resumeScheduler).toHaveBeenCalledWith(HOST_API, PORT, false);
+    expect(schedulerMod.resumeScheduler).toHaveBeenCalledWith(
+      HOST_API,
+      PORT,
+      false,
+      REQUEST_AUTH
+    );
+  });
+
+  it('restores ready after a partial two-HAProxy drain and never deploys', async () => {
+    const haproxy = {
+      hosts: ['198.51.100.20', '198.51.100.21'],
+      backend: 'api_servers',
+      serverMap: { [HOST_API]: 'server1' },
+      drainWaitSeconds: 0,
+    };
+    vi.mocked(haproxyMod.drainServer).mockResolvedValue({
+      success: false,
+      results: [
+        { host: '198.51.100.20', success: true },
+        { host: '198.51.100.21', success: false, error: 'drain rejected' },
+      ],
+    });
+    const listTask = createHostTask(HOST_API, makeOptions(HOST_API, { haproxy }));
+    const ctx: DeployContext = {
+      results: new Map(), aborted: false, skipped: 0, successful: 0,
+      failed: 0, healthCheckFailed: 0, workerFailed: 0,
+    };
+
+    await expect(
+      (listTask.task as (ctx: DeployContext, task: unknown) => Promise<void>)(
+        ctx,
+        makeTaskProxy()
+      )
+    ).rejects.toThrow(/HAProxy drain failed/);
+
+    expect(deployMod.deployToHost).not.toHaveBeenCalled();
+    expect(haproxyMod.readyServer).toHaveBeenCalledOnce();
+    expect(haproxyMod.readyServer).toHaveBeenCalledWith(haproxy, HOST_API);
+    expect(ctx.failed).toBe(1);
+    expect(ctx.successful).toBe(0);
+    expect(ctx.results.get(HOST_API)).toMatchObject({
+      success: false,
+      error: expect.stringContaining('drain'),
+    });
+  });
+
+  it('does not require ready compensation when every HAProxy drain failed', async () => {
+    vi.mocked(haproxyMod.drainServer).mockResolvedValue({
+      success: false,
+      results: [
+        { host: '198.51.100.20', success: false, error: 'drain rejected' },
+        { host: '198.51.100.21', success: false, error: 'drain rejected' },
+      ],
+    });
+    const listTask = createHostTask(HOST_API, makeOptions(HOST_API));
+    const ctx: DeployContext = {
+      results: new Map(), aborted: false, skipped: 0, successful: 0,
+      failed: 0, healthCheckFailed: 0, workerFailed: 0,
+    };
+
+    await expect(
+      (listTask.task as (ctx: DeployContext, task: unknown) => Promise<void>)(
+        ctx,
+        makeTaskProxy()
+      )
+    ).rejects.toThrow(/HAProxy drain failed/);
+
+    expect(deployMod.deployToHost).not.toHaveBeenCalled();
+    expect(haproxyMod.readyServer).not.toHaveBeenCalled();
+    expect(ctx.failed).toBe(1);
+    expect(ctx.results.get(HOST_API)).toMatchObject({ success: false });
+  });
+
+  it.each([
+    [
+      'partial',
+      [
+        { host: '198.51.100.20', success: true },
+        { host: '198.51.100.21', success: false, error: 'ready rejected' },
+      ],
+    ],
+    [
+      'complete',
+      [
+        { host: '198.51.100.20', success: false, error: 'ready rejected' },
+        { host: '198.51.100.21', success: false, error: 'ready rejected' },
+      ],
+    ],
+  ])('treats a %s HAProxy ready failure as a rollout failure', async (_label, results) => {
+    vi.mocked(haproxyMod.readyServer).mockResolvedValue({ success: false, results });
+    const listTask = createHostTask(HOST_API, makeOptions(HOST_API));
+    const ctx: DeployContext = {
+      results: new Map(),
+      aborted: false,
+      skipped: 0,
+      successful: 0,
+      failed: 0,
+      healthCheckFailed: 0,
+      workerFailed: 0,
+    };
+
+    await expect(
+      (listTask.task as (ctx: DeployContext, task: unknown) => Promise<void>)(
+        ctx,
+        makeTaskProxy()
+      )
+    ).rejects.toThrow(/HAProxy ready failed/);
+
+    expect(ctx.failed).toBe(1);
+    expect(ctx.successful).toBe(0);
+    expect(haproxyMod.readyServer).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -248,7 +363,12 @@ describe('(b) Unmapped worker host: quiesce without drain', () => {
 
     expect(haproxyMod.drainServer).not.toHaveBeenCalled();
     expect(schedulerMod.quiesceScheduler).toHaveBeenCalledOnce();
-    expect(schedulerMod.quiesceScheduler).toHaveBeenCalledWith(HOST_WORKER, PORT, false);
+    expect(schedulerMod.quiesceScheduler).toHaveBeenCalledWith(
+      HOST_WORKER,
+      PORT,
+      false,
+      REQUEST_AUTH
+    );
   });
 
   it('does NOT call readyServer for unmapped host', async () => {
@@ -276,7 +396,8 @@ describe('(c) Poll until drained', () => {
       HOST_API,
       PORT,
       { pollMs: 1, timeoutMs: 5000 },
-      false
+      false,
+      REQUEST_AUTH
     );
   });
 
@@ -306,7 +427,8 @@ describe('(c) Poll until drained', () => {
       HOST_API,
       PORT,
       { pollMs: 500, timeoutMs: 30000 },  // per-host override wins
-      false
+      false,
+      REQUEST_AUTH
     );
   });
 });
@@ -339,6 +461,7 @@ describe('(d) Drain timeout: proceed + warn, deploy still runs', () => {
       successful: 0,
       failed: 0,
       healthCheckFailed: 0,
+      workerFailed: 0,
     };
     const fakeTask = makeTaskProxy();
     await (listTask.task as (ctx: DeployContext, task: unknown) => Promise<void>)(ctx, fakeTask);
@@ -399,6 +522,7 @@ describe('(f) Deploy failure: finally always calls resumeScheduler', () => {
       successful: 0,
       failed: 0,
       healthCheckFailed: 0,
+      workerFailed: 0,
     };
     const fakeTask = makeTaskProxy();
 
@@ -407,7 +531,12 @@ describe('(f) Deploy failure: finally always calls resumeScheduler', () => {
 
     // But resume must still have been called
     expect(schedulerMod.resumeScheduler).toHaveBeenCalledOnce();
-    expect(schedulerMod.resumeScheduler).toHaveBeenCalledWith(HOST_API, PORT, false);
+    expect(schedulerMod.resumeScheduler).toHaveBeenCalledWith(
+      HOST_API,
+      PORT,
+      false,
+      REQUEST_AUTH
+    );
   });
 
   it('restores HAProxy ready even when deploy throws AND quiesce was done', async () => {
@@ -415,7 +544,7 @@ describe('(f) Deploy failure: finally always calls resumeScheduler', () => {
     vi.mocked(deployMod.deployToHost).mockRejectedValue(new Error('oops'));
 
     const listTask = createHostTask(HOST_API, makeOptions(HOST_API));
-    const ctx: DeployContext = { results: new Map(), aborted: false, skipped: 0, successful: 0, failed: 0, healthCheckFailed: 0 };
+    const ctx: DeployContext = { results: new Map(), aborted: false, skipped: 0, successful: 0, failed: 0, healthCheckFailed: 0, workerFailed: 0 };
     const fakeTask = makeTaskProxy();
 
     await expect((listTask.task as (ctx: DeployContext, task: unknown) => Promise<void>)(ctx, fakeTask)).rejects.toThrow();
@@ -427,30 +556,32 @@ describe('(f) Deploy failure: finally always calls resumeScheduler', () => {
 });
 
 // ---------------------------------------------------------------------------
-// (g) No-change early-return host → NEVER quiesces
+// (g) No-change host → verified deployment is still required
 // ---------------------------------------------------------------------------
-describe('(g) No-change host: skipped before quiesce', () => {
-  it('does not call quiesceScheduler when host has no changes', async () => {
+describe('(g) No-change host: no unverified success fast path', () => {
+  it('still quiesces and deploys when hashes have no changes', async () => {
     const options = makeOptions(HOST_API, {
       analysisMap: new Map([[HOST_API, { success: true, filesChanged: 0, filesDeleted: 0, bytesToUpload: 0, isFullUpload: false }]]),
     });
 
     await runTask(HOST_API, options);
 
-    expect(schedulerMod.quiesceScheduler).not.toHaveBeenCalled();
+    expect(schedulerMod.quiesceScheduler).toHaveBeenCalledOnce();
     expect(schedulerMod.pollUntilDrained).not.toHaveBeenCalled();
-    expect(schedulerMod.resumeScheduler).not.toHaveBeenCalled();
+    expect(deployMod.deployToHost).toHaveBeenCalledOnce();
+    expect(schedulerMod.resumeScheduler).toHaveBeenCalledOnce();
   });
 
-  it('does not drain HAProxy for no-change hosts', async () => {
+  it('drains and requires a verified deploy for no-change serving hosts', async () => {
     const options = makeOptions(HOST_API, {
       analysisMap: new Map([[HOST_API, { success: true, filesChanged: 0, filesDeleted: 0, bytesToUpload: 0, isFullUpload: false }]]),
     });
 
     await runTask(HOST_API, options);
 
-    expect(haproxyMod.drainServer).not.toHaveBeenCalled();
-    expect(deployMod.deployToHost).not.toHaveBeenCalled();
+    expect(haproxyMod.drainServer).toHaveBeenCalledOnce();
+    expect(deployMod.deployToHost).toHaveBeenCalledOnce();
+    expect(haproxyMod.readyServer).toHaveBeenCalledOnce();
   });
 });
 
@@ -507,6 +638,7 @@ describe('(i) Concurrent (parallel) strategy + quiesce: warns once', () => {
       port: PORT,
       force: false,
       analysisMap,
+      mutationAuthTokens: new Map([[HOST_API, MUTATION_AUTH_TOKEN]]),
       quiesce: { enabled: true, pollMs: 1, drainTimeoutMs: 5000 },
     });
 
@@ -530,6 +662,7 @@ describe('(i) Concurrent (parallel) strategy + quiesce: warns once', () => {
       port: PORT,
       force: false,
       analysisMap,
+      mutationAuthTokens: new Map([[HOST_API, MUTATION_AUTH_TOKEN]]),
       quiesce: { enabled: true, pollMs: 1, drainTimeoutMs: 5000 },
     });
 
@@ -550,6 +683,7 @@ describe('(i) Concurrent (parallel) strategy + quiesce: warns once', () => {
       port: PORT,
       force: false,
       analysisMap,
+      mutationAuthTokens: new Map([[HOST_API, MUTATION_AUTH_TOKEN]]),
       quiesce: { enabled: false },
     });
 
@@ -570,7 +704,12 @@ describe('Tunnel port/useTLS resolution', () => {
     await runTask(HOST_API, options);
 
     // quiesce must use the tunnel port, not options.port
-    expect(schedulerMod.quiesceScheduler).toHaveBeenCalledWith(HOST_API, 55000, false);
+    expect(schedulerMod.quiesceScheduler).toHaveBeenCalledWith(
+      HOST_API,
+      55000,
+      false,
+      REQUEST_AUTH
+    );
     // deploy also uses the same port
     expect(deployMod.deployToHost).toHaveBeenCalledWith(
       expect.anything(),
@@ -580,6 +719,7 @@ describe('Tunnel port/useTLS resolution', () => {
       expect.any(Object),
       expect.any(Boolean),
       expect.anything(),
+      MUTATION_AUTH_TOKEN,
       false
     );
   });
@@ -592,6 +732,11 @@ describe('Tunnel port/useTLS resolution', () => {
 
     await runTask(HOST_API, options);
 
-    expect(schedulerMod.resumeScheduler).toHaveBeenCalledWith(HOST_API, 55000, true);
+    expect(schedulerMod.resumeScheduler).toHaveBeenCalledWith(
+      HOST_API,
+      55000,
+      true,
+      REQUEST_AUTH
+    );
   });
 });

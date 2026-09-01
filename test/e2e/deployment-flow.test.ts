@@ -1,7 +1,7 @@
 // Path: test/e2e/deployment-flow.test.ts
 // End-to-end deployment flow tests (WAR diff logic)
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import Fastify, { FastifyInstance } from 'fastify';
 import createPayaraPlugin from '../../src/index.js';
 import { PayaraManager } from '../../src/payara-manager.js';
@@ -20,6 +20,9 @@ import {
 } from '../helpers/war-utils.js';
 import pino from 'pino';
 import AdmZip from 'adm-zip';
+import { chmodSync, writeFileSync } from 'node:fs';
+
+const MUTATION_AUTH_TOKEN = 'test-payara-mutation-token-0123456789abcdef';
 
 describe('E2E: WAR Diff Deployment Flow', () => {
   let mockPayara: MockPayara;
@@ -41,7 +44,9 @@ describe('E2E: WAR Diff Deployment Flow', () => {
 
     // Setup mock Payara
     mockPayara = await createMockPayara({ baseDir: `${tempDir}/payara` });
-    mockPayara.simulateStart();
+    // These cases exercise WAR-only edits. Keep the runtime strictly stopped
+    // so the artifact fence does not inherit an implicit running-DAS grant.
+    mockPayara.simulateStop();
     await mockPayara.startHealthServer();
 
     // Create initial WAR on "server"
@@ -54,17 +59,33 @@ describe('E2E: WAR Diff Deployment Flow', () => {
       user: process.env.USER || 'test',
       healthEndpoint: mockPayara.healthEndpoint,
       logger,
+      runtimeIdentityProvider: async () => undefined,
+      mutationQuarantinePath: `${tempDir}/mutation-quarantine/state.json`,
     });
+    vi.spyOn(
+      payaraManager as unknown as { getPayaraProcessPidsStrict: () => Promise<number[]> },
+      'getPayaraProcessPidsStrict'
+    ).mockResolvedValue([]);
 
     warDeployer = new WarDeployer({
       warPath: serverWarPath,
       appName: 'TestApp',
       payara: payaraManager,
       logger,
+      deploymentLockPath: `${tempDir}/deploy.lock`,
     });
 
     fastify = Fastify({ logger: false });
-    await registerRoutes(fastify, payaraManager, warDeployer, logger);
+    fastify.addHook('onRequest', async request => {
+      request.headers.authorization = `Bearer ${MUTATION_AUTH_TOKEN}`;
+    });
+    await registerRoutes(
+      fastify,
+      payaraManager,
+      warDeployer,
+      logger,
+      MUTATION_AUTH_TOKEN
+    );
     await fastify.ready();
   });
 
@@ -320,8 +341,10 @@ describe('E2E: WAR Diff Deployment Flow', () => {
 describe('E2E: Plugin Factory', () => {
   let mockPayara: MockPayara;
   let tempDir: string;
+  let mutationAuthTokenFile: string;
   let logger: pino.Logger;
   let mockContext: any;
+  const originalControlTokenFile = process.env.ZNVAULT_CONTROL_TOKEN_FILE;
 
   beforeAll(async () => {
     logger = pino({ level: 'silent' });
@@ -329,6 +352,10 @@ describe('E2E: Plugin Factory', () => {
 
   beforeEach(async () => {
     tempDir = createTempDir('e2e-plugin');
+    mutationAuthTokenFile = `${tempDir}/payara-mutation-token`;
+    writeFileSync(mutationAuthTokenFile, MUTATION_AUTH_TOKEN, { mode: 0o600 });
+    chmodSync(mutationAuthTokenFile, 0o600);
+    process.env.ZNVAULT_CONTROL_TOKEN_FILE = mutationAuthTokenFile;
     mockPayara = await createMockPayara({ baseDir: `${tempDir}/payara` });
     mockContext = {
       logger: logger.child({ plugin: 'test' }),
@@ -343,6 +370,11 @@ describe('E2E: Plugin Factory', () => {
   });
 
   afterEach(async () => {
+    if (originalControlTokenFile === undefined) {
+      delete process.env.ZNVAULT_CONTROL_TOKEN_FILE;
+    } else {
+      process.env.ZNVAULT_CONTROL_TOKEN_FILE = originalControlTokenFile;
+    }
     await mockPayara.cleanup();
     cleanupTempDir(tempDir);
   });
@@ -356,6 +388,7 @@ describe('E2E: Plugin Factory', () => {
       user: 'test',
       warPath,
       appName: 'TestApp',
+      mutationAuthTokenFile,
     });
 
     expect(plugin.name).toBe('payara');
@@ -374,6 +407,7 @@ describe('E2E: Plugin Factory', () => {
       user: 'test',
       warPath,
       appName: 'TestApp',
+      mutationAuthTokenFile,
     });
 
     await expect(plugin.onInit?.(mockContext as any)).resolves.not.toThrow();
@@ -392,6 +426,7 @@ describe('E2E: Plugin Factory', () => {
       warPath,
       appName: 'TestApp',
       healthEndpoint: `http://localhost:${healthPort}/health`,
+      mutationAuthTokenFile,
     });
 
     await plugin.onInit?.(mockContext as any);
@@ -406,7 +441,7 @@ describe('E2E: Plugin Factory', () => {
     expect(health?.details?.domain).toBe(mockPayara.domain);
   });
 
-  it('E2E-17: should register routes on Fastify', async () => {
+  it('E2E-17: should fence registered routes until plugin startup completes', async () => {
     const warPath = createTestWar({ path: `${tempDir}/app.war`, appName: 'Test' });
 
     const plugin = createPayaraPlugin({
@@ -415,6 +450,7 @@ describe('E2E: Plugin Factory', () => {
       user: 'test',
       warPath,
       appName: 'TestApp',
+      mutationAuthTokenFile,
     });
 
     await plugin.onInit?.(mockContext as any);
@@ -426,9 +462,14 @@ describe('E2E: Plugin Factory', () => {
     const response = await fastify.inject({
       method: 'GET',
       url: '/hashes',
+      headers: { authorization: `Bearer ${MUTATION_AUTH_TOKEN}` },
     });
 
-    expect(response.statusCode).toBe(200);
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: 'STARTUP_RECONCILIATION_NOT_COMPLETE',
+      startupReconciliation: 'not_started',
+    });
 
     await fastify.close();
   });

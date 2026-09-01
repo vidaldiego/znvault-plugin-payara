@@ -88,6 +88,7 @@ export async function registerStatusRoutes(
         artifact: {
           size: artifact.size,
           sha256: artifact.sha256,
+          contentSha256: artifact.contentSha256,
         },
         status: 'ok',
         fileCount: Object.keys(artifact.hashes).length,
@@ -108,20 +109,42 @@ export async function registerStatusRoutes(
    */
   fastify.get('/status', async (request, reply) => {
     try {
-      const status = await payara.getStatus();
-
-      // Also check if app is deployed
-      const appDeployed = await deployer.isAppDeployed();
+      const appName = deployer.getAppName();
+      const readback = await deployer.withDeploymentFileLock(
+        `status-readback:${appName}`,
+        'verify',
+        async () => {
+          const status = await payara.getStatus(true);
+          const appDeployed = await deployer.isAppDeployed();
+          // This final awaited runtime-bound read detects an unannounced DAS
+          // replacement during application inventory.
+          await payara.readBootDeploymentStatus(appName);
+          // No await after this synchronous reread: an in-process child event
+          // cannot leave the response carrying an old ready epoch.
+          const bootDeployment = payara.getBootDeploymentStatus(appName);
+          const fenceHealthy =
+            bootDeployment.phase === 'ready'
+            && !bootDeployment.mutationOutcomeUnknown;
+          return {
+            status,
+            appDeployed,
+            bootDeployment,
+            healthy: status.healthy && status.running && appDeployed && fenceHealthy,
+          };
+        }
+      );
 
       // Explicitly list all properties to avoid spread issues
       return {
-        healthy: status.healthy,
-        running: status.running,
-        domain: status.domain,
-        processCount: status.processCount,
-        processPids: status.processPids,
-        appDeployed,
-        appName: deployer.getAppName(),
+        pluginVersion: ctx.pluginVersion,
+        healthy: readback.healthy,
+        running: readback.status.running,
+        domain: readback.status.domain,
+        processCount: readback.status.processCount,
+        processPids: readback.status.processPids,
+        appDeployed: readback.appDeployed,
+        appName,
+        bootDeployment: readback.bootDeployment,
         warPath: deployer.getWarPath(),
       };
     } catch (err) {

@@ -22,13 +22,21 @@ export interface PayaraPluginConfig {
   /** Application name in Payara */
   appName: string;
 
+  /**
+   * Absolute path to the dedicated Bearer credential for every Payara HTTP
+   * mutation. The token is read from this private file during plugin init; it
+   * must never be placed directly in config, environment variables, or argv.
+   * Default: /etc/zn-vault-agent/payara-mutation-token
+   */
+  mutationAuthTokenFile?: string;
+
   /** Health check endpoint URL (e.g., http://localhost:8080/health) */
   healthEndpoint?: string;
 
-  /** Restart Payara when certificates change */
+  /** Legacy option. true is rejected; certificate events never restart Payara. */
   restartOnCertChange?: boolean;
 
-  /** Restart Payara when managed API key is rotated (default: true) */
+  /** Legacy option. true is rejected; use apiKeyFilePath for live rotation. */
   restartOnKeyRotation?: boolean;
 
   /**
@@ -42,11 +50,8 @@ export interface PayaraPluginConfig {
   apiKeyFilePath?: string;
 
   /**
-   * Secret aliases to watch for changes.
-   * When any of these secrets change, Payara will be restarted.
-   * Useful for application configuration secrets.
-   *
-   * Example: ["app/staging/config"]
+   * Legacy option. Any non-empty value is rejected because secret-change
+   * events cannot safely mutate a running Payara environment.
    */
   watchSecrets?: string[];
 
@@ -88,7 +93,7 @@ export interface PayaraPluginConfig {
    * Enable aggressive mode for stable deployments.
    *
    * When true, the plugin will:
-   * 1. Kill ALL Java processes before starting Payara (ensures clean slate)
+   * 1. Kill only exact DAS processes for this canonical domain before start
    * 2. Use full restart sequence for deployments: undeploy → stop → kill → start → deploy
    * 3. Verify no Java processes running before each start
    *
@@ -105,14 +110,8 @@ export interface PayaraPluginConfig {
   /**
    * Whether the plugin should manage Payara lifecycle (start/stop/restart).
    *
-   * When true (default): Plugin handles starting/stopping Payara
-   * When false: Plugin only handles WAR deployment, health checks, and secrets
-   *
-   * Set to false when using agent exec mode to start Payara, e.g.:
-   *   zn-vault-agent start --exec "asadmin start-domain domain1"
-   *
-   * In this case, the agent's exec mode manages Payara lifecycle,
-   * and the plugin should not interfere.
+   * Only true/default is supported. false is rejected because agent exec child
+   * events do not identify the detached DAS and cannot enforce one writer.
    */
   manageLifecycle?: boolean;
 
@@ -186,6 +185,21 @@ export interface PayaraManagerOptions {
   passwordFile?: string;
   /** TTL for status cache in milliseconds (default: 5000) */
   statusCacheTtlMs?: number;
+  /**
+   * Override the exact DAS runtime identity probe. Equal values must identify
+   * the same JVM process; any different value is treated as a new boot epoch.
+   * Primarily intended for deterministic tests.
+   */
+  runtimeIdentityProvider?: () => Promise<string | number | undefined>;
+  /**
+   * Synchronous final identity CAS used immediately before a destructive
+   * recovery command. Production defaults to a system-wide /proc scan. Tests
+   * that override runtimeIdentityProvider must supply the matching sync seam
+   * when exercising recovery.
+   */
+  runtimeIdentitySyncProvider?: () => string | number | undefined;
+  /** Override durable mutation quarantine storage; false is for isolated tests only. */
+  mutationQuarantinePath?: string | false;
 }
 
 /**
@@ -197,16 +211,129 @@ export interface WarDeployerOptions {
   contextRoot?: string;
   payara: PayaraManager;
   logger: Logger;
+  /** Override the cross-process lock path (primarily for isolated tests). */
+  deploymentLockPath?: string;
   /**
    * Enable aggressive mode for deployments.
    * When true, deployments will use the full restart sequence:
-   * undeploy → stop → kill all Java → start → deploy
+   * undeploy when running → stop → kill exact domain DAS → start → deploy
    *
    * This ensures only ONE Java process runs at a time.
    * Recommended for production stability.
    */
   aggressiveMode?: boolean;
 }
+
+/** Positive evidence, if any, that a Payara-owned boot deployment may be mutated. */
+export type BootDeploymentReadiness =
+  | 'unverified'
+  | 'health-verified'
+  | 'externally-attested'
+  | 'not_applicable';
+
+/** Current single-writer state for one application in one domain boot epoch. */
+export type BootDeploymentPhase =
+  | 'unfenced'
+  | 'startup'
+  | 'payara-booting'
+  | 'agent-reserved'
+  | 'ready'
+  | 'blocked';
+
+/** Read-only status exposed to operators so readiness attestations are epoch-bound. */
+export interface BootDeploymentStatus {
+  appName: string;
+  bootEpoch: string;
+  /** SHA-256 token for the exact DAS boot_id/PID/startticks identity. */
+  runtimeFingerprint?: string;
+  phase: BootDeploymentPhase;
+  readiness: BootDeploymentReadiness;
+  owner?: 'payara' | 'agent';
+  runtimeListed?: boolean;
+  /** A deploy/undeploy command may have completed despite an ambiguous result. */
+  mutationOutcomeUnknown: boolean;
+  startupActive: boolean;
+  startedAt: string;
+  readyAt?: string;
+  evidenceSource?: string;
+}
+
+/** Audited external evidence used when no application health endpoint is configured. */
+export interface BootReadinessAttestation {
+  bootEpoch: string;
+  reason: string;
+  source: string;
+}
+
+/**
+ * Explicit authority for one immediate recovery of a Payara-owned boot whose
+ * persistent reference exists but whose runtime application is absent or is
+ * explicitly declared unhealthy by the operator.
+ *
+ * This is deliberately distinct from readiness attestation: submitting it
+ * performs the bounded recovery while the same file lock and mutation lease
+ * are held. It never grants reusable mutation authority.
+ */
+export interface BootRecoveryAuthorization {
+  bootEpoch: string;
+  runtimeFingerprint: string;
+  /** SHA-256 of the exact staged WAR the operator authorizes for recovery. */
+  expectedArtifactSha256: string;
+  authorizationId: string;
+  /** Exact inventory state the operator observed and is authorizing to replace. */
+  expectedRuntimeListed: boolean;
+  reason: string;
+  source: string;
+}
+
+export interface BootRecoveryResult {
+  applications: string[];
+  bootDeployment: BootDeploymentStatus;
+}
+
+/** Which controller owns application deployment immediately after start-domain. */
+export type BootDeploymentOwnership =
+  | {
+      owner: 'payara';
+      bootEpoch: string;
+      runtimeListed: boolean;
+      readiness: Exclude<BootDeploymentReadiness, 'not_applicable'>;
+    }
+  | {
+      owner: 'agent';
+      bootEpoch: string;
+      runtimeListed: boolean;
+      readiness: 'not_applicable';
+    };
+
+/** How a post-start caller handles an application restored by Payara itself. */
+export type PostStartDeploymentPolicy =
+  | 'skip-if-boot-owned'
+  | 'require-agent-owned';
+
+/** Result of reconciling deployment ownership after start-domain. */
+export type PostStartDeploymentResult =
+  | {
+      outcome: 'boot-owned-skip';
+      bootEpoch: string;
+      deploymentAttempted: false;
+      deployedObserved: boolean;
+      readiness: Exclude<BootDeploymentReadiness, 'not_applicable'>;
+    }
+  | {
+      outcome: 'agent-deployed';
+      bootEpoch: string;
+      deploymentAttempted: true;
+      deployed: boolean;
+      applications: string[];
+    }
+  | {
+      outcome: 'already-reconciled-skip';
+      bootEpoch: string;
+      deploymentAttempted: false;
+      deployedObserved: true;
+      owner: 'agent';
+    };
 
 /**
  * File hash map for WAR diff deployment
@@ -218,12 +345,34 @@ export interface WarFileHashes {
 /** One coherent read of the exact stored WAR plus its entry hashes. */
 export interface WarArtifactIdentity {
   size: number;
+  /** SHA-256 of the exact persisted WAR bytes. Used as the base CAS token. */
   sha256: string;
+  /**
+   * Deterministic SHA-256 of the sorted entry-path/entry-hash manifest.
+   * Diff deployment can reproduce this identity even when ZIP metadata differs.
+   */
+  contentSha256: string;
 }
 
 /** One coherent read of the exact stored WAR plus its entry hashes. */
 export interface WarArtifactReadback extends WarArtifactIdentity {
   hashes: WarFileHashes;
+}
+
+/**
+ * One immutable local read used by preflight and every host deployment.
+ * `getBytes()` returns a defensive copy so callers cannot mutate the snapshot.
+ */
+export interface LocalWarArtifactSnapshot extends WarArtifactReadback {
+  getBytes(): Buffer;
+}
+
+/** Artifact identities that bind a deployment request to one observed base. */
+export interface DeploymentArtifactExpectation {
+  /** Exact whole-WAR SHA observed from /hashes, or null when no WAR existed. */
+  expectedBaseSha256: string | null;
+  /** Canonical entry-content SHA of the local target snapshot. */
+  targetContentSha256: string;
 }
 
 /**
@@ -238,6 +387,10 @@ export interface FileChange {
  * Deploy request body
  */
 export interface DeployRequest {
+  /** Caller-generated lowercase UUIDv4 for this exact deployment operation. */
+  deploymentId: string;
+  /** Exact artifact identity fence for this deployment. */
+  artifact: DeploymentArtifactExpectation;
   files: Array<{ path: string; content: string }>; // base64 content
   deletions: string[];
 }
@@ -274,6 +427,10 @@ export interface DeployResult {
   applications?: string[];
   /** Unix timestamp when deployment completed */
   completedAt?: number;
+  /** Exact persisted artifact proven after deployment. */
+  artifact?: WarArtifactIdentity;
+  /** Canonical target identity supplied by the caller and verified on readback. */
+  targetContentSha256?: string;
 }
 
 /**
@@ -303,6 +460,10 @@ export interface FullDeployResult extends DeployResult {
 export interface ChunkedDeploySession {
   /** Session ID */
   id: string;
+  /** One identity shared by every chunk and the final commit. */
+  deploymentId: string;
+  /** Artifact fence fixed by the first chunk for the lifetime of the session. */
+  artifact: DeploymentArtifactExpectation;
   /** Timestamp when session was created */
   createdAt: number;
   /** Files accumulated so far */
@@ -317,6 +478,13 @@ export interface ChunkedDeploySession {
  * Chunked deploy request - upload a batch of files
  */
 export interface ChunkedDeployRequest {
+  /** Caller-generated lowercase UUIDv4 repeated exactly on every chunk. */
+  deploymentId: string;
+  /**
+   * Artifact fence. Required on the first chunk and, when repeated, must match
+   * the session exactly.
+   */
+  artifact?: DeploymentArtifactExpectation;
   /** Session ID (optional for first chunk - server generates one) */
   sessionId?: string;
   /** Files in this chunk */
@@ -333,6 +501,8 @@ export interface ChunkedDeployRequest {
  * Chunked deploy response
  */
 export interface ChunkedDeployResponse {
+  /** Exact deployment identity bound to this session/result. */
+  deploymentId: string;
   /** Session ID for subsequent chunks */
   sessionId: string;
   /** Files received so far */

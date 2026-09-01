@@ -1,20 +1,47 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const mocks = vi.hoisted(() => ({
+  runMigrations: vi.fn(),
+  assertHostControlPlaneCompatible: vi.fn(),
+}));
+
 vi.mock('../src/cli/config-store.js', () => ({
   loadDeployConfigs: vi.fn().mockResolvedValue({
     configs: {
       stg: {
-        name: 'stg', hosts: ['192.0.2.1'], warPath: '/nonexistent.war',
+        name: 'stg', hosts: ['127.0.0.1'], warPath: '/nonexistent.war',
+        tunnel: false,
         migration: { roleId: 'r', migrationsDir: 'db/pre' },
         postMigration: { roleId: 'r', migrationsDir: 'db/post' },
       },
     },
   }),
 }));
-// Stub the migration engine so --post-only/--pre-only don't hit a DB.
+// Stub the compatibility rail and migration engine so --post-only/--pre-only
+// prove their ordering without contacting an Agent or database.
 vi.mock('@zincapp/znvault-migrate', async () => {
   const actual = await vi.importActual<typeof import('@zincapp/znvault-migrate')>('@zincapp/znvault-migrate');
-  return { ...actual, runMigrations: vi.fn().mockResolvedValue(undefined) };
+  return { ...actual, runMigrations: mocks.runMigrations };
+});
+vi.mock('../src/cli/auth-token.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/cli/auth-token.js')>(
+    '../src/cli/auth-token.js'
+  );
+  return {
+    ...actual,
+    loadHostMutationAuthTokens: vi.fn((_config, hosts: string[]) =>
+      new Map(hosts.map(host => [host, 'test-control-token-0123456789abcdef']))
+    ),
+  };
+});
+vi.mock('../src/cli/listr-preflight.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/cli/listr-preflight.js')>(
+    '../src/cli/listr-preflight.js'
+  );
+  return {
+    ...actual,
+    assertHostControlPlaneCompatible: mocks.assertHostControlPlaneCompatible,
+  };
 });
 
 import { Command } from 'commander';
@@ -52,7 +79,14 @@ async function parseExit(program: Command, argv: string[]): Promise<number | nul
 
 describe('deploy run — six flags (CLI)', () => {
   let real: typeof process.exit;
-  beforeEach(() => { real = process.exit; });
+  beforeEach(() => {
+    real = process.exit;
+    vi.clearAllMocks();
+    mocks.runMigrations.mockResolvedValue(undefined);
+    mocks.assertHostControlPlaneCompatible.mockResolvedValue({
+      host: '127.0.0.1', reachable: true, agentVersion: '2.0.0',
+    });
+  });
   afterEach(() => { process.exit = real; });
 
   it('registers all six flags on `deploy run`', () => {
@@ -70,12 +104,33 @@ describe('deploy run — six flags (CLI)', () => {
     expect(errors.some((m) => /mutually exclusive/i.test(m))).toBe(true);
   });
 
-  it('--post-only runs post inline and does NOT require a WAR/preflight', async () => {
+  it('--post-only gates compatibility before DB mutation without requiring a WAR', async () => {
     const { ctx, infos } = makeCtx();
     // No exit expected on the happy path — the action returns after post.
     await build(ctx).parseAsync(['node', 'znvault', 'payara', 'deploy', 'run', 'stg', '--post-only']);
+    expect(mocks.assertHostControlPlaneCompatible).toHaveBeenCalledOnce();
+    expect(
+      mocks.assertHostControlPlaneCompatible.mock.invocationCallOrder[0]
+    ).toBeLessThan(mocks.runMigrations.mock.invocationCallOrder[0]!);
     expect(infos.some((m) => /post-deploy/i.test(m) && /Running/i.test(m))).toBe(true);
     // Pre must NOT have run.
     expect(infos.some((m) => /pre-deploy/i.test(m) && /Running/i.test(m))).toBe(false);
+  });
+
+  it('--post-only performs no DB mutation when compatibility fails', async () => {
+    mocks.assertHostControlPlaneCompatible.mockRejectedValueOnce(
+      new Error('CONTROL_PLANE_VERSION_INCOMPATIBLE: Agent 1')
+    );
+    const { ctx, errors } = makeCtx();
+
+    const code = await parseExit(build(ctx), [
+      'payara', 'deploy', 'run', 'stg', '--post-only',
+    ]);
+
+    expect(code).toBe(1);
+    expect(mocks.runMigrations).not.toHaveBeenCalled();
+    expect(errors.some(message =>
+      message.includes('CONTROL_PLANE_VERSION_INCOMPATIBLE')
+    )).toBe(true);
   });
 });

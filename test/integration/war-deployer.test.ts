@@ -1,7 +1,7 @@
 // Path: test/integration/war-deployer.test.ts
 // WarDeployer integration tests with real WAR file operations
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { WarDeployer, calculateDiff, calculateWarHashes } from '../../src/war-deployer.js';
 import { PayaraManager } from '../../src/payara-manager.js';
 import { createMockPayara, MockPayara } from '../helpers/mock-payara.js';
@@ -17,7 +17,7 @@ import {
 } from '../helpers/war-utils.js';
 import pino from 'pino';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { chmodSync, readFileSync, statSync } from 'node:fs';
 
 describe('WarDeployer Integration', () => {
   let mockPayara: MockPayara;
@@ -41,18 +41,27 @@ describe('WarDeployer Integration', () => {
 
   // Helper to create deployer without lifecycle methods
   function createDeployer(warPath: string) {
+    // WAR-only edits are exercised against a strictly stopped mock runtime.
+    mockPayara.simulateStop();
     const payaraManager = new PayaraManager({
       payaraHome: mockPayara.payaraHome,
       domain: mockPayara.domain,
       user: process.env.USER || 'test',
       logger,
+      runtimeIdentityProvider: async () => undefined,
+      mutationQuarantinePath: `${tempDir}/mutation-quarantine/state.json`,
     });
+    vi.spyOn(
+      payaraManager as unknown as { getPayaraProcessPidsStrict: () => Promise<number[]> },
+      'getPayaraProcessPidsStrict'
+    ).mockResolvedValue([]);
 
     return new WarDeployer({
       warPath,
       appName: 'TestApp',
       payara: payaraManager,
       logger,
+      deploymentLockPath: `${tempDir}/deploy.lock`,
     });
   }
 
@@ -245,6 +254,7 @@ describe('WarDeployer Integration', () => {
       expect(identity).toEqual({
         size: artifact.byteLength,
         sha256: createHash('sha256').update(artifact).digest('hex'),
+        contentSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
       });
       expect(identity).not.toHaveProperty('hashes');
     });
@@ -295,6 +305,43 @@ describe('WarDeployer Integration', () => {
   });
 
   describe('Apply Changes (WAR modification only)', () => {
+    it('WD-14a: should preserve mode and ownership when atomically replacing a WAR', async () => {
+      const warPath = createTestWar({
+        path: `${tempDir}/app.war`,
+        appName: 'TestApp',
+      });
+      chmodSync(warPath, 0o640);
+      const before = statSync(warPath);
+
+      await createDeployer(warPath).applyChangesWithoutDeploy(
+        [{ path: 'metadata.txt', content: Buffer.from('preserved') }],
+        []
+      );
+
+      const after = statSync(warPath);
+      expect(after.mode & 0o7777).toBe(before.mode & 0o7777);
+      expect(after.uid).toBe(before.uid);
+      expect(after.gid).toBe(before.gid);
+    });
+
+    it('WD-14b: should make a first WAR readable without relying on a shared group', async () => {
+      const warPath = `${tempDir}/first/app.war`;
+      const previousUmask = process.umask(0o077);
+      try {
+        await createDeployer(warPath).applyChangesWithoutDeploy(
+          [{ path: 'first.txt', content: Buffer.from('created') }],
+          []
+        );
+      } finally {
+        process.umask(previousUmask);
+      }
+
+      const created = statSync(warPath);
+      expect(created.mode & 0o7777).toBe(0o644);
+      expect(created.mode & 0o004).toBe(0o004);
+      expect(readFileSync(warPath).length).toBeGreaterThan(0);
+    });
+
     it('WD-15: should apply file additions to WAR', async () => {
       const warPath = createTestWar({
         path: `${tempDir}/app.war`,
@@ -413,6 +460,43 @@ describe('WarDeployer Integration', () => {
 
       const retrieved = getWarFile(warPath, 'binary.bin');
       expect(retrieved).toEqual(binaryContent);
+    });
+
+    it('WD-20a: epoch rotation before atomic rename leaves the prior WAR intact', async () => {
+      const warPath = createTestWar({
+        path: `${tempDir}/epoch-race.war`,
+        appName: 'TestApp',
+        files: [{ path: 'version.txt', content: 'before' }],
+      });
+      const deployer = createDeployer(warPath);
+      const commitFence = vi.spyOn(
+        PayaraManager.prototype,
+        'assertArtifactMutationEpochCurrent'
+      ).mockRejectedValueOnce(new Error('BOOT_EPOCH_CHANGED: test rotation'));
+
+      try {
+        await expect(deployer.applyChangesWithoutDeploy(
+          [{ path: 'version.txt', content: Buffer.from('after') }],
+          []
+        )).rejects.toThrow('BOOT_EPOCH_CHANGED');
+        expect(getWarFile(warPath, 'version.txt')?.toString()).toBe('before');
+      } finally {
+        commitFence.mockRestore();
+      }
+    });
+
+    it('WD-20b: a rejected deletion aborts without rewriting the WAR', async () => {
+      const warPath = createTestWar({
+        path: `${tempDir}/delete-failure.war`,
+        appName: 'TestApp',
+        files: [{ path: 'keep.txt', content: 'before' }],
+      });
+      const deployer = createDeployer(warPath);
+
+      await expect(
+        deployer.applyChangesWithoutDeploy([], ['../outside.war-entry'])
+      ).rejects.toThrow();
+      expect(getWarFile(warPath, 'keep.txt')?.toString()).toBe('before');
     });
   });
 

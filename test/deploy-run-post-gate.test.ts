@@ -1,5 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+const CONFIGURED_HOSTS = ['h1', 'h2', 'h3'];
+const verifiedReceipt = () => ({
+  success: true,
+  result: {
+    success: true,
+    filesChanged: 0,
+    filesDeleted: 0,
+    message: 'verified',
+    deploymentTime: 1,
+    appName: 'ZincAPI',
+    deployed: true,
+  },
+});
 const deployResult = { successful: 0, failed: 0, aborted: false, healthCheckFailed: 0, workerFailed: 0, skipped: 0, results: new Map() };
 vi.mock('../src/cli/listr-deploy.js', async () => {
   const actual = await vi.importActual<typeof import('../src/cli/listr-deploy.js')>('../src/cli/listr-deploy.js');
@@ -32,12 +45,24 @@ vi.mock('../src/cli/listr-preflight.js', async () => {
 vi.mock('../src/cli/config-store.js', () => ({
   loadDeployConfigs: vi.fn().mockResolvedValue({
     configs: { stg: {
-      name: 'stg', hosts: ['h1', 'h2'], warPath: '/x.war',
+      name: 'stg', hosts: ['h1', 'h2', 'h3'], warPath: '/x.war',
+      tunnel: false, tls: { useVaultCA: false },
       migration: { roleId: 'r', migrationsDir: 'db/pre' },
       postMigration: { roleId: 'r', migrationsDir: 'db/post' },
     } },
   }),
 }));
+vi.mock('../src/cli/auth-token.js', async () => {
+  const actual = await vi.importActual<typeof import('../src/cli/auth-token.js')>(
+    '../src/cli/auth-token.js'
+  );
+  return {
+    ...actual,
+    loadHostMutationAuthTokens: vi.fn((_config, hosts: string[]) =>
+      new Map(hosts.map(host => [host, `test-control-token-${host}-0123456789`]))
+    ),
+  };
+});
 
 // getWarInfo + calculateWarHashes read a real file — stub them.
 vi.mock('../src/cli/progress.js', async () => {
@@ -51,7 +76,17 @@ vi.mock('../src/cli/progress.js', async () => {
 });
 vi.mock('../src/war-deployer.js', async () => {
   const actual = await vi.importActual<typeof import('../src/war-deployer.js')>('../src/war-deployer.js');
-  return { ...actual, calculateWarHashes: vi.fn(async () => ({})) };
+  return {
+    ...actual,
+    calculateWarHashes: vi.fn(async () => ({})),
+    readLocalWarArtifactSnapshot: vi.fn(async () => ({
+      size: 1,
+      sha256: 'a'.repeat(64),
+      contentSha256: 'b'.repeat(64),
+      hashes: {},
+      getBytes: () => Buffer.from('snapshot'),
+    })),
+  };
 });
 
 import { Command } from 'commander';
@@ -71,23 +106,34 @@ async function runDeploy(ctx: CLIPluginContext, argv: string[]) {
   const program = new Command(); program.exitOverride();
   registerDeployRunCommand(program.command('payara').command('deploy'), ctx);
   const real = process.exit;
+  const exitCodes: number[] = [];
   // @ts-expect-error stub
-  process.exit = () => { throw new Error('__exit__'); };
+  process.exit = (code?: number) => { exitCodes.push(code ?? 0); throw new Error('__exit__'); };
   try { await program.parseAsync(['node', 'znvault', ...argv]); }
   catch (e) { if ((e as Error).message !== '__exit__') throw e; }
   finally { process.exit = real; }
+  return exitCodes;
 }
 
 describe('flat post-deploy gate', () => {
   beforeEach(() => {
-    Object.assign(deployResult, { failed: 0, aborted: false, healthCheckFailed: 0, workerFailed: 0 });
+    Object.assign(deployResult, {
+      successful: CONFIGURED_HOSTS.length,
+      failed: 0,
+      aborted: false,
+      healthCheckFailed: 0,
+      workerFailed: 0,
+      skipped: 0,
+      results: new Map(CONFIGURED_HOSTS.map(host => [host, verifiedReceipt()])),
+    });
     reachableOverride = undefined;
   });
 
   it('post runs after a full clean rollout', async () => {
     const { ctx, infos } = makeCtx();
-    await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
+    const exitCodes = await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(true);
+    expect(exitCodes).toEqual([]);
   });
 
   it('worker failure → post skipped (rollout-failed)', async () => {
@@ -97,21 +143,38 @@ describe('flat post-deploy gate', () => {
     expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /did not fully succeed/i.test(m))).toBe(true);
   });
 
+  it('missing exact receipt blocks post and exits non-zero', async () => {
+    deployResult.results.delete('h3');
+    deployResult.successful = 2;
+    const { ctx, infos } = makeCtx();
+
+    const exitCodes = await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
+
+    expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /h3/.test(m))).toBe(true);
+    expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(false);
+    expect(exitCodes).toContain(1);
+  });
+
   it('--host subset → post skipped (scoped-subset)', async () => {
     const { ctx, infos } = makeCtx();
     await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--host', 'h1', '--yes', '--skip-drain']);
     expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /scoped to a subset/i.test(m))).toBe(true);
   });
 
-  it('dropped/unreachable host → post skipped (partial-coverage)', async () => {
-    // Config has 2 hosts (h1, h2), but only h1 comes back reachable/analyzed
+  it('unverified host aborts before migration/deployment instead of partial coverage', async () => {
+    // Config has 3 hosts, but only h1 comes back reachable/analyzed
     // from preflight — simulating a host that was dropped/unreachable
     // pre-rollout. No --host flag is passed, so flatIsScoped is false: this
-    // must be caught by the coverage check, not the scope check.
+    // must be caught by the fleet-wide preflight completeness gate, not the
+    // scope check or the later post-deploy coverage gate.
     reachableOverride = ['h1'];
     const { ctx, infos } = makeCtx();
     await runDeploy(ctx, ['payara', 'deploy', 'run', 'stg', '--yes', '--skip-drain']);
-    expect(infos.some((m) => /Skipping post-deploy/i.test(m) && /not deployed/i.test(m) && /h2/.test(m))).toBe(true);
+    expect(infos.some((m) =>
+      /CONTROL_PLANE_PREFLIGHT_INCOMPLETE/i.test(m)
+      && /unverified: h2, h3/i.test(m)
+      && /analysis failed: h2, h3/i.test(m)
+    )).toBe(true);
     expect(infos.some((m) => /Running post-deploy/i.test(m))).toBe(false);
   });
 });

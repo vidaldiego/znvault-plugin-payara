@@ -14,6 +14,8 @@ export interface RouteContext {
   deployer: WarDeployer;
   sessionStore: SessionStore;
   logger: Logger;
+  /** Running plugin package version for the authenticated CLI compatibility gate. */
+  pluginVersion: string;
 }
 
 /**

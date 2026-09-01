@@ -90,7 +90,17 @@ FAIL_STOP=$(get_state_value "failStop")
 FAIL_DEPLOY=$(get_state_value "failDeploy")
 FAIL_UNDEPLOY=$(get_state_value "failUndeploy")
 
-case "$1" in
+COMMAND=""
+for arg in "$@"; do
+  case "$arg" in
+    start-domain|stop-domain|restart-domain|deploy|undeploy|list-applications|list-application-refs|list-domains|uptime)
+      COMMAND="$arg"
+      break
+      ;;
+  esac
+done
+
+case "$COMMAND" in
   start-domain)
     if [ "$FAIL_START" = "true" ]; then
       echo "Command start-domain failed." >&2
@@ -144,6 +154,11 @@ case "$1" in
     exit 0
     ;;
 
+  list-application-refs)
+    echo "Command list-application-refs executed successfully."
+    exit 0
+    ;;
+
   list-domains)
     if [ "$RUNNING" = "true" ]; then
       echo "${this.options.domain} running"
@@ -153,8 +168,18 @@ case "$1" in
     exit 0
     ;;
 
+  uptime)
+    if [ "$RUNNING" = "true" ]; then
+      echo "Uptime: 0 days, 0 hours, 0 minutes, 1 seconds, Total milliseconds: 1000"
+      echo "Command uptime executed successfully."
+      exit 0
+    fi
+    echo "Command uptime failed." >&2
+    exit 1
+    ;;
+
   *)
-    echo "Unknown command: $1" >&2
+    echo "Unknown command: $COMMAND" >&2
     exit 1
     ;;
 esac

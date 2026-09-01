@@ -6,67 +6,196 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tagged commit belongs to main
+        shell: bash
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
+            echo "Tagged commit is not contained in origin/main"
+            exit 1
+          fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22'
+          node-version: '22.13.0'
           cache: 'npm'
+
+      - name: Verify version matches tag
+        shell: bash
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          LOCK_VERSION=$(node -p "require('./package-lock.json').version")
+          LOCK_ROOT_VERSION=$(node -p "require('./package-lock.json').packages[''].version")
+          EXPECTED_VERSIONS="$TAG_VERSION|$TAG_VERSION|$TAG_VERSION"
+          ACTUAL_VERSIONS="$PKG_VERSION|$LOCK_VERSION|$LOCK_ROOT_VERSION"
+          if [[ "$ACTUAL_VERSIONS" != "$EXPECTED_VERSIONS" ]]; then
+            echo "Release version mismatch: tag=$TAG_VERSION package=$PKG_VERSION lock=$LOCK_VERSION lock-root=$LOCK_ROOT_VERSION"
+            exit 1
+          fi
 
       - name: Install dependencies
         run: npm ci
 
+      - name: Run linter
+        run: npm run lint -- --quiet
+
+      - name: Type check
+        run: npm run typecheck
+
       - name: Run tests
         run: npm test
 
-      - name: Build
-        run: npm run build
+      - name: Production build
+        run: npm run build:prod
+
+      - name: Audit runtime dependencies
+        run: npm audit --omit=dev --audit-level=high
 
   publish:
     needs: test
     runs-on: ubuntu-latest
     environment: npm-publish
+    outputs:
+      prerelease: ${{ steps.release_metadata.outputs.prerelease }}
+      make_latest: ${{ steps.release_metadata.outputs.make_latest }}
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        # Deliberately omit registry-url: setup-node would write a classic
+        # _authToken stub and bypass npm Trusted Publishing via GitHub OIDC.
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '24'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '22.13.0'
           cache: 'npm'
 
-      - name: Upgrade npm to latest (OIDC requires 11.5.1+)
-        run: npm install -g npm@latest
+      - name: Install OIDC-capable npm
+        run: npm install -g npm@11.17.0
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Install dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
 
       - name: Build
-        run: npm run build
+        run: npm run build:prod
+
+      - name: Verify version matches tag
+        shell: bash
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          LOCK_VERSION=$(node -p "require('./package-lock.json').version")
+          LOCK_ROOT_VERSION=$(node -p "require('./package-lock.json').packages[''].version")
+          EXPECTED_VERSIONS="$TAG_VERSION|$TAG_VERSION|$TAG_VERSION"
+          ACTUAL_VERSIONS="$PKG_VERSION|$LOCK_VERSION|$LOCK_ROOT_VERSION"
+          if [[ "$ACTUAL_VERSIONS" != "$EXPECTED_VERSIONS" ]]; then
+            echo "Release version mismatch: tag=$TAG_VERSION package=$PKG_VERSION lock=$LOCK_VERSION lock-root=$LOCK_ROOT_VERSION"
+            exit 1
+          fi
+
+      - name: Select release metadata
+        id: release_metadata
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          DIST_TAG=latest
+          IS_PRERELEASE=false
+          MAKE_LATEST=true
+          BASE_VERSION=${VERSION%%+*}
+          if [[ "$BASE_VERSION" == *-* ]]; then
+            PRERELEASE=${BASE_VERSION#*-}
+            CHANNEL=${PRERELEASE%%.*}
+            case "$CHANNEL" in
+              beta) DIST_TAG=beta ;;
+              alpha|rc|next) DIST_TAG=next ;;
+              *)
+                echo "Unsupported prerelease channel '$CHANNEL' in $VERSION"
+                exit 1
+                ;;
+            esac
+            IS_PRERELEASE=true
+            MAKE_LATEST=false
+          elif [[ "${BASE_VERSION%%.*}" == "3" ]]; then
+            # Agent 2 / plugin 3 is a coordinated host migration. Keep stable
+            # v3 artifacts off every conventional updater channel until the
+            # separate fleet gate explicitly promotes the exact pair.
+            DIST_TAG=dr-m4
+            MAKE_LATEST=false
+          fi
+          {
+            echo "dist_tag=$DIST_TAG"
+            echo "prerelease=$IS_PRERELEASE"
+            echo "make_latest=$MAKE_LATEST"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Pack the immutable release artifact
+        id: release_artifact
+        shell: bash
+        run: |
+          ARTIFACT_DIR="$RUNNER_TEMP/znvault-plugin-payara-release"
+          PACK_RESULT="$RUNNER_TEMP/znvault-plugin-payara-pack.json"
+          mkdir -p "$ARTIFACT_DIR"
+          npm pack --json --pack-destination "$ARTIFACT_DIR" > "$PACK_RESULT"
+          PACK_FILENAME=$(node -e '
+            const fs = require("node:fs");
+            const result = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+            if (!Array.isArray(result) || result.length !== 1 || typeof result[0]?.filename !== "string") {
+              throw new Error("npm pack did not produce exactly one artifact");
+            }
+            process.stdout.write(result[0].filename);
+          ' "$PACK_RESULT")
+          ARTIFACT_PATH="$ARTIFACT_DIR/$PACK_FILENAME"
+          if [[ ! -f "$ARTIFACT_PATH" || -L "$ARTIFACT_PATH" ]]; then
+            echo "Packed artifact is not one regular non-symlink file: $ARTIFACT_PATH"
+            exit 1
+          fi
+          {
+            echo "path=$ARTIFACT_PATH"
+            echo "sha256=$(sha256sum "$ARTIFACT_PATH" | cut -d ' ' -f 1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify exact release artifact
+        env:
+          ARTIFACT_PATH: ${{ steps.release_artifact.outputs.path }}
+          TAG_VERSION: ${{ github.ref_name }}
+        run: node scripts/verify-release-tarball.mjs "$ARTIFACT_PATH" "${TAG_VERSION#v}"
 
       - name: Publish to npm with provenance
-        run: npm publish --provenance --access public
+        env:
+          ARTIFACT_PATH: ${{ steps.release_artifact.outputs.path }}
+          ARTIFACT_SHA256: ${{ steps.release_artifact.outputs.sha256 }}
+          DIST_TAG: ${{ steps.release_metadata.outputs.dist_tag }}
+        shell: bash
+        run: |
+          printf '%s  %s\n' "$ARTIFACT_SHA256" "$ARTIFACT_PATH" | sha256sum --check --strict
+          npm publish "$ARTIFACT_PATH" --ignore-scripts --provenance --access public --tag "$DIST_TAG"
 
   github-release:
     needs: publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           generate_release_notes: true
           draft: false
+          prerelease: ${{ needs.publish.outputs.prerelease }}
+          make_latest: ${{ needs.publish.outputs.make_latest }}

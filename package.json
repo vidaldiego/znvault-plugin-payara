@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-payara",
-  "version": "2.7.2-lab.2",
+  "version": "3.0.0",
   "description": "Payara application server plugin for zn-vault-agent with WAR diff deployment",
   "type": "module",
   "main": "dist/index.js",
@@ -20,7 +20,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "build:prod": "npm run clean && tsc --sourceMap false",
+    "build:prod": "npm run clean && tsc --sourceMap false --declarationMap false",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
     "test": "vitest run",
@@ -52,8 +52,8 @@
     "url": "git+https://github.com/vidaldiego/znvault-plugin-payara.git"
   },
   "peerDependencies": {
-    "@zincapp/zn-vault-agent": ">=1.20.14",
-    "@zincapp/znvault-cli": ">=2.11.0"
+    "@zincapp/zn-vault-agent": ">=2.0.0 <3",
+    "@zincapp/znvault-cli": ">=4.5.0"
   },
   "peerDependenciesMeta": {
     "@zincapp/zn-vault-agent": {
@@ -64,9 +64,9 @@
     }
   },
   "dependencies": {
-    "@zincapp/znvault-deploy-core": "^0.1.0",
+    "@zincapp/znvault-deploy-core": "^0.2.4",
     "@zincapp/znvault-migrate": "^1.0.0",
-    "adm-zip": "^0.5.16",
+    "adm-zip": "^0.6.0",
     "inquirer": "^13.2.1",
     "listr2": "^10.0.0",
     "mysql2": "^3.16.1",
@@ -79,7 +79,7 @@
     "@typescript-eslint/eslint-plugin": "^8.53.1",
     "@typescript-eslint/parser": "^8.53.1",
     "@vitest/coverage-v8": "^4.0.17",
-    "@zincapp/zn-vault-agent": "^1.17.3",
+    "@zincapp/zn-vault-agent": "^2.0.0",
     "commander": "^14.0.2",
     "eslint": "^9.39.2",
     "fastify": "^5.7.1",
@@ -87,7 +87,7 @@
     "vitest": "^4.0.17"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22.13.0"
   },
   "publishConfig": {
     "access": "public"

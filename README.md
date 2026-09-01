@@ -6,15 +6,19 @@ Payara application server management plugin for ZnVault Agent and CLI. Enables i
 
 - **WAR Diff Deployment**: Only transfer changed files, not entire WAR
 - **Payara Lifecycle Management**: Start, stop, restart Payara domains
-- **Certificate Integration**: Auto-restart on certificate deployment
+- **Certificate Event Safety**: Observe certificate events without restarting Payara
 - **Health Monitoring**: Plugin health status in agent health endpoint
 - **CLI Commands**: Deploy WAR files from development machine
 
 ## Installation
 
 ```bash
-npm install @zincapp/znvault-plugin-payara
+npm install @zincapp/znvault-plugin-payara@3.0.0
 ```
+
+Plugin 3 requires Agent 2 and is initially fenced under the isolated `dr-m4`
+release channel. Stage the exact compatible pair without restarting between
+package installs; publishing or installing it is not production commissioning.
 
 ## Agent Configuration
 
@@ -34,8 +38,9 @@ Add the plugin to your agent's `config.json`:
         "user": "payara",
         "warPath": "/opt/app/MyApp.war",
         "appName": "MyApp",
-        "healthEndpoint": "http://localhost:8080/health",
-        "restartOnCertChange": true
+        "healthEndpoint": "http://127.0.0.1:8080/public/health/ready",
+        "apiKeyFilePath": "/var/lib/zn-vault-agent/zincapi-api-key",
+        "mutationAuthTokenFile": "/etc/zn-vault-agent/payara-mutation-token"
       }
     }
   ]
@@ -52,15 +57,114 @@ Add the plugin to your agent's `config.json`:
 | `warPath` | string | Yes | Path to the WAR file |
 | `appName` | string | Yes | Application name in Payara |
 | `contextRoot` | string | No | Context root for deployment (default: `/${appName}`) |
-| `healthEndpoint` | string | No | HTTP endpoint to check application health |
-| `restartOnCertChange` | boolean | No | Restart Payara when certificates are deployed |
-| `restartOnKeyRotation` | boolean | No | Restart Payara when API key is rotated (default: false) |
-| `aggressiveMode` | boolean | No | Full restart cycle on deploy (undeploy→stop→kill→start→deploy) |
+| `healthEndpoint` | string | No* | Application readiness endpoint. Production commissioning requires a loopback 2xx endpoint; ZincAPI uses `http://127.0.0.1:8080/public/health/ready`. |
+| `restartOnCertChange` | boolean | No | Legacy only. `true` is rejected; certificate events cannot restart Payara. |
+| `restartOnKeyRotation` | boolean | No | Legacy only. `true` is rejected; use `apiKeyFilePath`. |
+| `aggressiveMode` | boolean | No | Full restart cycle on deploy. Cleanup targets only the exact canonical-domain DAS processes. |
+| `manageLifecycle` | boolean | No | Must be `true`/omitted. `false` is rejected because agent exec events do not identify the detached DAS safely. |
 | `apiKeyFilePath` | string | No | Path to write API key file (enables zero-downtime key rotation) |
+| `mutationAuthTokenFile` | string | No | **Node-local server path**, not a controller path or token value. Defaults to `/etc/zn-vault-agent/payara-mutation-token` and must equal the Agent's effective `ZNVAULT_CONTROL_TOKEN_FILE` path. The file must be regular, single-link, and have no group/other permissions. |
 | `secrets` | object | No | Environment variables to write to `setenv.conf` |
 | `fileSourceRoot` | string | No | Allowlist root for `file:` secret sources (default `/etc/zn-agent/node/`). A `file:` path is resolved under this root; outside-root paths are rejected and the env var omitted. |
-| `watchSecrets` | string[] | No | Secret aliases to watch for changes |
+| `watchSecrets` | string[] | No | Legacy only. Any non-empty value is rejected. |
 | `rootDir` | string | No | Absolute path (or `~/`-prefixed) base for RELATIVE local paths (`warPath`, `migrationsDir`, `scaffoldingFile`). Leading `~/` expands to home; absolute values used as-is. Does NOT affect `healthCheck.path` or `haproxy.socketPath` (remote/URL paths). (v2.5.0) |
+
+### Startup deployment ownership
+
+Payara may restore an application from its persistent server reference after
+`start-domain` has already returned. The plugin therefore gives each exact DAS
+epoch one deployment writer:
+
+- A persistent `list-application-refs server` entry makes Payara the boot owner.
+  Startup records `owner=payara` and never performs the incident-causing
+  `undeploy → deploy` sequence during restoration. `list-applications` visibility
+  alone is not readiness.
+- Startup never performs a first deployment. A later explicit first-deploy
+  request can become agent-owned only after both strict inventories remain empty
+  for a continuous 20-second monotonic window. A read error resets the window;
+  classification, final absence CAS, WAL arm, and deployment share one fence.
+- A missing local WAR never authorizes a restart or mutation. If the DAS is
+  already running, even with application health at 503, aggressive startup only
+  observes refs/runtime and leaves Payara untouched. A restored persistent ref
+  can still become health-verified without a local artifact.
+- The runtime identity is Linux `boot_id + exact DAS PID + /proc startticks`,
+  anchored to the canonical `-Dcom.sun.aas.instanceRoot=<domainRoot>` argv.
+  Every correctness-bearing commit rechecks the epoch. TERM/KILL also compares
+  startticks immediately before dispatch; the remaining kernel-scale gap would
+  require `pidfd`, which this release does not use.
+- Startup reconciliation is fully awaited by `onStart` and has a 105-second
+  monotonic budget inside the agent's 120-second hook budget. Every subprocess,
+  HTTP probe, poll interval, and shutdown check is capped to the remaining time.
+  Health and all routes remain 503 unless reconciliation completes.
+- `manageLifecycle=false` is rejected. Agent 2.x child events describe its
+  supervised launcher, not the detached Payara DAS, and therefore cannot safely
+  serve as lifecycle authority. Every non-empty Agent `exec.command` is rejected,
+  including commands for unrelated children. Agent `globalReloadCmd`,
+  `targets[].reloadCmd`, and `secretTargets[].reloadCmd` are also rejected because
+  reload hooks execute outside the shared Payara lock.
+
+While a Payara-owned boot is unverified, deploy, undeploy, stop, restart, WAR
+replacement, and process cleanup fail closed. A configured application
+`healthEndpoint` returning 2xx releases ordinary boot readiness automatically.
+Without that endpoint, read `bootDeployment.bootEpoch` from
+`GET /plugins/payara/status`, verify the application externally, then submit a
+reasoned attestation for that exact epoch through the agent's loopback endpoint:
+
+  ```http
+  POST /plugins/payara/boot-deployment/attest-ready
+  Authorization: Bearer <loaded by the client from its private token file>
+  Content-Type: application/json
+
+  {
+    "bootEpoch": "current-epoch-from-status",
+    "source": "rollout-preflight",
+    "reason": "service-status and readiness returned HTTP 200"
+  }
+  ```
+
+An attestation from another epoch, an active startup, or inconsistent inventory
+is rejected. Crucially, attestation can only release ordinary readiness: it can
+never clear a deploy/undeploy `*-outcome-unknown` in the same DAS. It requires
+the same file-backed control-plane Bearer as every other Payara route and also
+retains its direct-loopback/no-forwarding-header check. The Bearer is machine
+authorization; it does not replace the named human GO.
+
+### Ambiguous outcome quarantine and recovery
+
+Before the first remote application mutation, the plugin fsyncs a WAL record at
+`/var/lib/zn-vault-agent/payara-mutation-quarantine/state.json`. Its namespace is
+the canonical physical domain root, not the configured username spelling. The
+supported plugin factory always uses this fixed local-POSIX path; per-process
+overrides are not part of the public configuration.
+
+- The parent `/var/lib/zn-vault-agent` must be trusted and not group/world
+  writable. The store creates its private directory as `0700` and file as `0600`.
+  All plugin processes for the host must see the same local filesystem. NFS and
+  container-private copies are unsupported.
+- Command rejection, timeout, process death, or lost response leaves
+  `mutationOutcomeUnknown=true`. A replacement DAS does **not** resolve this:
+  the replacement may have received the command through the same admin port.
+  Only reconciliation after a strictly confirmed stopped domain with zero
+  matching JVMs may clear the durable WAL. Never attest, retry, or roll back
+  over this state.
+- An ambiguous lifecycle command retains
+  `/var/lib/zn-vault-agent/znvault-deploy.lock` with `quarantined`, `errorName`,
+  `reason`, step, PID, and ownership token. It is never age-reaped.
+- Finite manual recovery requires stopping/quiescing the agent and every deploy
+  entry point, proving no late `asadmin` remains, reconciling the exact DAS/PIDs
+  and WAL, then removing only the inspected lock pathname. If the recorded PID
+  is still the running agent, stop it first. Do not downgrade or roll back the
+  plugin while either durable quarantine exists.
+
+Every WAR or lifecycle route uses the same create-exclusive lock. Certificate
+and secret sync in the agent host must acquire that exact pathname too; an agent
+build without the shared mutation lock is not commissionable. Authenticated
+status routes take that lock for coherent snapshots. Public Agent `/health` and
+`/ready` consume the plugin's bounded cached snapshot and never acquire the
+deployment lock, synchronize the boot epoch, or promote readiness. WAR and
+`setenv.conf` replacements preserve metadata, fsync content and parent directory,
+and atomically rename. Strict inventory/undeploy errors propagate instead of
+becoming fabricated empty/success states.
 
 ### Secrets Configuration
 
@@ -80,8 +184,7 @@ Secrets are written to Payara's `setenv.conf` file, NOT passed via command line 
     "ZINC_CONFIG_VAULT_API_KEY": "api-key:my-managed-key",
     "AWS_ACCESS_KEY_ID": "alias:app/staging/object-store.accessKeyId",
     "AWS_SECRET_ACCESS_KEY": "alias:app/staging/object-store.secretAccessKey"
-  },
-  "watchSecrets": ["app/staging/config", "app/staging/object-store"]
+  }
 }
 ```
 
@@ -91,9 +194,45 @@ Secret value prefixes:
 - `api-key:` - Managed API key value
 - `file:<path>` - Read a local file on the node and inject its trimmed contents. Path must be under `fileSourceRoot` (default `/etc/zn-agent/node/`). A missing, unreadable, empty, or outside-root file **omits** the env var so the application can fall back to its own default. Use this for per-node markers (scheduler role, zone) under a shared host-template.
 
+These mappings are resolved during the bounded startup transaction. Runtime
+secret events never rewrite `setenv.conf` or restart Payara. Managed API-key
+rotation is the sole live update: it atomically replaces `apiKeyFilePath`; both
+standalone `managedKey` mode and `api-key:` mappings validate the rotated key
+name and serialize generations so the last event wins.
+
+`apiKeyFilePath` is a two-identity filesystem contract, not merely a pathname.
+`zn-vault-agent setup` makes `/var/lib/zn-vault-agent` Agent-owned, assigns
+Payara's primary group, sets mode `2750`, and gives the Agent service that group
+as supplementary. Each replacement requires an Agent-owned setgid `2750`
+directory and an Agent-owned `0640` file in Payara's primary group; every parent
+must be traversable by Payara. The plugin aborts with
+`PAYARA_API_KEY_PERMISSION_CONTRACT` on drift. Never work around this with
+world-readable keys or a group-writable directory.
+
+After installing/upgrading the pair, rerun setup and restart the Agent before
+commissioning so systemd applies the group:
+
+```bash
+sudo zn-vault-agent setup --yes
+sudo systemctl restart zn-vault-agent
+payara_group="$(id -gn payara)"
+stat -c '%U:%G %a %n' /var/lib/zn-vault-agent
+id -Gn zn-vault-agent
+# Expect zn-vault-agent:"$payara_group" 2750 and "$payara_group" in the id output.
+```
+
 ## HTTP API
 
 The plugin registers routes under `/plugins/payara/`:
+
+Every non-`OPTIONS` route in this namespace requires the Agent control-plane
+Bearer, including status, hashes, readback, applications, and file reads. The
+Agent's root `/health`, `/ready`, `/live`, and `/metrics` probes are outside this
+namespace. Use the plugin CLI or an audited client that reads the credential
+from a private file internally. Never put the token value in a command line,
+environment variable, deploy config, ticket, log, or shell expansion such as
+`Authorization: Bearer $(cat ...)`. The executable `curl` examples that used to
+appear here were removed deliberately.
 
 ### GET /plugins/payara/readback
 
@@ -111,7 +250,8 @@ application, and it omits the potentially large per-entry hash map.
   "warPath": "/var/lib/zn-vault-agent/payara/zincapi.war",
   "artifact": {
     "size": 297114914,
-    "sha256": "0123456789abcdef..."
+    "sha256": "0123456789abcdef...",
+    "contentSha256": "fedcba9876543210..."
   },
   "domain": "zincapi",
   "running": true,
@@ -129,13 +269,10 @@ instruction to change state.
 
 ### GET /plugins/payara/hashes
 
-Returns one coherent readback of the stored WAR: its exact byte size/SHA-256
-and the SHA-256 of every contained file. Existing diff clients continue to use
-the `hashes` field; commissioning readers can pin the whole artifact.
-
-```bash
-curl http://localhost:9100/plugins/payara/hashes
-```
+Returns one coherent readback of the stored WAR: its exact byte size/raw
+SHA-256, its canonical entry-content SHA-256, and the SHA-256 of every contained
+file. Diff clients use the `hashes` field; deployment clients bind mutations to
+the raw base while verifying the logical target independently of ZIP metadata.
 
 Response:
 ```json
@@ -143,7 +280,8 @@ Response:
   "status": "ok",
   "artifact": {
     "size": 123456789,
-    "sha256": "0123456789abcdef..."
+    "sha256": "0123456789abcdef...",
+    "contentSha256": "fedcba9876543210..."
   },
   "hashes": {
     "WEB-INF/web.xml": "abc123...",
@@ -156,25 +294,68 @@ Response:
 When no WAR exists, `status` is `no_war`, `artifact` is `null` and `hashes`
 is empty.
 
+### POST /plugins/payara/boot-deployment/stage-artifact
+
+Narrow recovery-only staging for the `persistent ref + runtime app absent +
+local WAR absent` state. Copy `bootEpoch` from a fresh local status readback and
+pass it explicitly as the query parameter. It accepts a complete WAR as
+`application/octet-stream`, only over a direct loopback socket with no forwarded
+headers. Under the shared deployment lock and Payara mutation lease it requires
+the same epoch, `phase=payara-booting`, `owner=payara`, ref present, runtime app
+absent, and no UNKNOWN/quarantine both before writing and immediately before the
+create-exclusive commit. It refuses to overwrite an existing WAR, returns the
+stored SHA-256, and never invokes Payara or releases boot ownership.
+
+Invoke this recovery rail only with an audited same-host client that loads the
+Bearer from the private file internally and preserves the named authorization.
+Do not reconstruct it as an interactive `curl -H Authorization` command.
+
+### POST /plugins/payara/boot-deployment/recover
+
+Consumes one immediate, one-shot operator authorization for a stuck
+Payara-owned boot. Copy `bootEpoch` and `runtimeFingerprint` from a fresh local
+status readback, and `expectedArtifactSha256` from the staging/readback response.
+The manager rechecks exact refs/apps, DAS identity and WAR digest immediately
+before WAL arm, then rehashes the WAR again inside the armed WAL immediately
+before spawning deploy and after deploy returns. Persistent drift observed after
+undeploy therefore remains an UNKNOWN outcome and deploy is not spawned; the
+documented same-host pathname race limitations still apply.
+
+```json
+{
+  "bootEpoch": "current-epoch-from-status",
+  "runtimeFingerprint": "64-lowercase-hex-characters",
+  "expectedArtifactSha256": "64-lowercase-hex-characters",
+  "authorizationId": "GO-NODE-RECOVERY-001",
+  "expectedRuntimeListed": false,
+  "reason": "persistent ref exists but runtime application is absent",
+  "source": "audited-example-runbook"
+}
+```
+
+This route is also direct-loopback-only and rejects forwarding headers. Local
+socket trust is not cryptographic human authorization: production procedure must
+carry the named GO and preserve the request/result in the incident record.
+
 ### POST /plugins/payara/deploy
 
 Apply file changes and deploy. Files are base64-encoded.
 
-```bash
-curl -X POST http://localhost:9100/plugins/payara/deploy \
-  -H "Content-Type: application/json" \
-  -d '{
-    "files": [
-      {"path": "index.html", "content": "PGh0bWw+Li4uPC9odG1sPg=="}
-    ],
-    "deletions": ["old-file.css"]
-  }'
-```
+Every diff, full, binary, and chunk mutation requires a caller-generated
+lowercase UUIDv4 `deploymentId` before any decode, session, lock, or WAR change.
+Diff/full/chunk requests carry it in JSON; binary upload uses
+`x-znvault-deployment-id`; every chunk continuation repeats the exact UUID.
+The server never generates a fallback ID, so a caller can reconcile a lost
+response against `/deploy/status` without guessing which operation ran.
+
+Use `znvault payara deploy war` or `znvault payara deploy run`; those commands
+load the credential file and add the header without printing the token.
 
 Response:
 ```json
 {
   "status": "deployed",
+  "deploymentId": "00000000-0000-4000-8000-000000000001",
   "filesChanged": 1,
   "filesDeleted": 1,
   "message": "Deployment successful"
@@ -203,6 +384,7 @@ Get current Payara status.
 
 ```json
 {
+  "pluginVersion": "3.0.0",
   "running": true,
   "healthy": true,
   "domain": "domain1"
@@ -223,9 +405,8 @@ List deployed applications.
 
 Get a specific file from the WAR.
 
-```bash
-curl http://localhost:9100/plugins/payara/file/WEB-INF/web.xml
-```
+This read is authenticated because it can disclose application artifacts. Use
+an audited client that implements the file-backed credential contract.
 
 ## CLI Commands
 
@@ -235,6 +416,81 @@ The plugin adds a `payara` command group to `znvault`, organized by concern:
 - `znvault payara config …` — manage deployment configurations (peer of `deploy`)
 - `znvault payara restart/status/applications` — lifecycle & status (peers of `deploy`)
 - `znvault payara tls …` — TLS management (peer of `deploy`)
+
+### Control-plane credential files
+
+Agent setup creates an independent random credential on each node at
+`/etc/zn-vault-agent/payara-mutation-token` (or the absolute path named by the
+Agent's `ZNVAULT_CONTROL_TOKEN_FILE`). The plugin server reads that same path;
+it rejects a different `mutationAuthTokenFile`, because the Agent outer gate and
+plugin inner gate must compare the same bytes.
+
+The deploy controller cannot normally read the node's Agent-owned `0600` file.
+Provision an exact per-host copy over an approved encrypted channel into a
+controller-owned `0600` regular file, without displaying it. A secret manager is
+preferred. The following is an example for an already authorized SSH-CA window;
+stdout is redirected straight to a private temporary file and must never be run
+without the redirect:
+
+```bash
+set -euo pipefail
+control_dir=/secure/controller/znvault/payara-control
+control_dest="$control_dir/node-a"
+install -d -m 700 -- "$control_dir"
+umask 077
+control_tmp="$(mktemp "$control_dir/.node-a.XXXXXX")"
+trap 'rm -f -- "$control_tmp"' EXIT
+ssh -T sysadmin@192.0.2.55 \
+  'sudo -n -u zn-vault-agent /bin/cat -- /etc/zn-vault-agent/payara-mutation-token' \
+  >"$control_tmp"
+test -s "$control_tmp"
+chmod 600 -- "$control_tmp"
+mv -- "$control_tmp" "$control_dest"
+trap - EXIT
+```
+
+Repeat per host; do not assume two setup-generated tokens are equal. Configure
+only the local paths, never the values:
+
+```json
+{
+  "name": "staging",
+  "hosts": ["192.0.2.55", "192.0.2.56"],
+  "tunnel": true,
+  "mutationAuthTokenFiles": {
+    "192.0.2.55": "/secure/controller/znvault/payara-control/node-a",
+    "192.0.2.56": "/secure/controller/znvault/payara-control/node-b"
+  }
+}
+```
+
+`znvault payara config set-auth-token-file <config> <host> <path>` records one
+path. The singular `mutationAuthTokenFile` and CLI
+`--mutation-auth-token-file <path>` are explicit fleet-shared/single-command
+fallbacks only. All selected files are validated and loaded before any tunnel,
+network request, migration, or deployment. The Payara plugin 3 CLI then gates
+every target on Agent major 2 plus authenticated Agent-owned updater metadata.
+An already-compatible host must prove that root health, authenticated status,
+and updater `current` name the same exact Plugin 3 version. A Plugin 2 host is
+only a transient bootstrap candidate: its root-health version must exactly match
+the unique Payara record, whose `channel=dr-m4`, `updaterReady=true`, and
+`targetVersion=latest` fields must bind an offered Plugin 3 target. The CLI calls
+no Plugin 2 status or analysis route. With explicit update consent it updates all
+targets, verifies caller-request-ID/current/target receipts, waits for restart,
+and repeats a full Plugin 3 preflight for every host before proceeding.
+Migration-only commands do not bootstrap and require Plugin 3 directly. Plugin 3 does
+not register `--skip-version-check` or `--skip-preflight`; legacy invocations
+are rejected by argument parsing before config, credentials, tunnels, network,
+database migrations, or WAR operations are reached.
+
+For a rollout, all selected host analyses and all selected HAProxy connectivity
+checks form one global read-only boundary. No class may update its plugin, run a
+pre-deploy migration, or receive a WAR until every class and load balancer has
+passed. If plugin updates are requested, every class update completes before a
+second global host preflight replaces the stale observations. HAProxy is checked
+once at the boundary and is not checked again after migrations begin. Each
+class's TLS/CA policy is rebound immediately before its update and re-preflight,
+so process-global client state cannot leak from another class.
 
 ### Multi-Host Deployment Configs
 
@@ -521,11 +777,11 @@ to the app repo's migration CI (e.g. reject any `CREATE {VIEW|PROCEDURE|
 FUNCTION|TRIGGER}` in a migration file that lacks `SQL SECURITY INVOKER` and
 lacks an explicit, non-migrate `DEFINER=`) so this can't regress silently.
 
-### Tunneled Deployment (`tunnel: true`)
+### Tunneled Deployment (`tunnel: true`, default in plugin 3)
 
 Deploy agents bind their `:9100` deploy/health server to loopback only, so it
-is never exposed on the network. Set `tunnel: true` on a deploy config to route
-the deploy through an **SSH-CA-authenticated local port-forward** to each host
+is never exposed on the network. Plugin 3 defaults an omitted `tunnel` to `true`
+and routes the deploy through an **SSH-CA-authenticated local port-forward** to each host
 instead — the deploy opens one `znvault ssh forward` per host, rewrites only the
 fetched agent URL to `127.0.0.1:<ephemeral>`, runs the existing preflight + WAR
 transfer through the tunnel, and tears it down afterward.
@@ -545,15 +801,20 @@ transfer through the tunnel, and tears it down afterward.
 
 | Config field | Type | Required | Description |
 |--------------|------|----------|-------------|
-| `tunnel` | boolean | No | Route the deploy through a per-host SSH-CA port-forward (default: `false`) |
+| `tunnel` | boolean | No | Route the deploy through a per-host SSH-CA port-forward (plugin 3 default: `true`) |
 | `ssh.user` | string | No | SSH user for the forward (default: `sysadmin`, honoring `~/.ssh/config`) |
-| `ssh.readinessTimeoutMs` | number | No | How long to wait for the agent's `/health` through the tunnel before failing |
+| `ssh.readinessTimeoutMs` | number | No | How long to wait for the Agent's public, cached root `/health` through the tunnel before failing |
 
 Requires `@zincapp/znvault-cli` >= 4.5.0 (ships `znvault ssh forward`) and this
 plugin >= 1.18.0. See the
 [Deployment Guide → Tunneled Deploys](../docs/DEPLOYMENT_GUIDE.md#tunneled-deploys)
 for the full how-it-works, version matrix, loopback cutover procedure, and the
 important caution about `deploy --force` with `aggressiveMode`.
+
+Tunnel creation is fail-closed: a failed forward never falls back to the direct
+host while carrying a Bearer. Explicit `tunnel:false`/`--no-tunnel` is accepted
+only for loopback or verified HTTPS. Remote HTTP and unverified remote TLS are
+rejected before the credential is sent.
 
 ### Scheduler-aware deploy (quiesce)
 
@@ -928,16 +1189,21 @@ Or add to your CLI config (`~/.znvault/config.json`):
 
 ## How Diff Deployment Works
 
-1. CLI calculates SHA-256 hash for every file in local WAR
-2. CLI requests current hashes from agent (`GET /plugins/payara/hashes`)
+1. CLI reads the local WAR once into an immutable snapshot and calculates its
+   raw SHA-256, canonical entry-content SHA-256, and per-entry hashes
+2. CLI requests one coherent raw/canonical identity and current hashes from the
+   agent (`GET /plugins/payara/hashes`)
 3. CLI compares hashes to determine:
    - **Changed files**: Hash differs or file is new
    - **Deleted files**: Exists remotely but not locally
-4. CLI sends only changed files (base64-encoded) and deletion list
-5. Agent extracts current WAR to temp directory
+4. CLI sends only changed files (base64-encoded), the deletion list, the exact
+   expected raw base SHA-256 (or `null`), and the canonical target SHA-256
+5. Under the shared mutation lock, the agent revalidates and extracts those same
+   base bytes; drift aborts without modifying the WAR
 6. Agent applies changes (updates, creates, deletes files)
 7. Agent repackages WAR
-8. Agent stops Payara, deploys WAR, starts Payara
+8. Agent verifies the proposed target, deploys it, re-reads the stored artifact,
+   and returns a target-bound receipt that the CLI verifies
 
 This reduces deployment time from minutes (full WAR transfer) to seconds (incremental changes).
 
@@ -970,12 +1236,20 @@ The plugin responds to zn-vault-agent lifecycle events:
 
 ### onCertificateDeployed
 
-When `restartOnCertChange: true`, automatically restarts Payara after certificate deployment:
+Certificate events are informational only. `restartOnCertChange=true` is
+rejected at initialization because an event callback cannot safely coordinate a
+Payara restart with every other process-level mutation.
 
-```javascript
-// Plugin automatically handles this when certificates change
-// No action needed from user
-```
+### onKeyRotated
+
+For the configured managed key, atomically replaces `apiKeyFilePath` without a
+Payara restart. Events for other keys are ignored. Inline rotation and
+`restartOnKeyRotation=true` are rejected.
+
+### onSecretChanged
+
+Informational only. Non-empty `watchSecrets` is rejected; update startup
+environment through an explicit fenced deployment/restart procedure.
 
 ### healthCheck
 
@@ -994,6 +1268,12 @@ Reports Payara status to the agent's `/health` endpoint:
   }
 }
 ```
+
+Because the Agent root health/readiness probes are public, this hook is a
+five-second cached, single-flight snapshot. Concurrent probes cause at most one
+bounded refresh; the hook never forces status refresh, takes the deployment
+lock, synchronizes an epoch, or promotes boot readiness. Authenticated Payara
+requests and lifecycle/key events invalidate the snapshot.
 
 ## Development
 
@@ -1019,26 +1299,133 @@ npm run lint
 
 ### Test Coverage
 
-| Suite | Tests | Description |
-|-------|-------|-------------|
-| Unit | 31 | Core plugin, CLI, WAR deployer logic |
-| Integration | 49 | PayaraManager, WarDeployer, HTTP routes |
-| E2E | 17 | Full deployment flow, plugin factory |
-| **Total** | **97** | All tests passing |
+Run `npm test` for the authoritative count. The suite covers unit, integration,
+route, and E2E flows; agent-dependent E2E cases are skipped when no local agent is
+available.
 
 ## Requirements
 
-- Node.js 18+
-- Payara Server 5.x or 6.x
+- Node.js 22.13+
+- Payara Server with the `asadmin` commands used here (production is verified
+  separately against Payara 7.2025.2; do not infer commissioning from unit tests)
 - `asadmin` in PATH or at `$PAYARA_HOME/bin/asadmin`
-- Write access to WAR file location
-- sudo access for running as different user (if configured)
+- Linux procfs readable for `/proc/sys/kernel/random/boot_id` and each candidate
+  `/proc/<pid>/{cmdline,stat}`. `hidepid`, non-Linux hosts, malformed `ps -ww`, or
+  an unresolvable canonical domain root fail closed.
+- The WAR parent must permit an atomic same-directory temp file, metadata
+  preservation, rename, file fsync, and directory fsync. The Payara user must be
+  able to read the resulting regular non-empty WAR.
+- Local POSIX storage for `/var/lib/zn-vault-agent`, shared by every plugin
+  process on the host; no NFS or per-container copies. Parent ownership/mode must
+  prevent untrusted unlink/replacement. The pathname protocol cannot defend
+  against an actor that already has write authority over that directory.
+- If the agent is not the Payara user, passwordless non-interactive sudo for the
+  exact deployed command set. `setenv.conf` replacement invokes
+  `sudo -u <user> /usr/bin/bash -c <fixed-script> ...`, whose fixed script uses
+  `/usr/bin/tee`, `chmod`, `sync -f`, `mv`, and `rm`. Process cleanup requires
+  only `kill`/legacy `pkill` executed as the configured Payara user; the plugin
+  never requests root process authority. A same-domain JVM owned by another UID
+  stays visible but cannot be signalled and therefore fails the cleanup closed.
+  Validate the actual sudoers rule with `sudo -n` before activation; never put
+  credentials in argv or logs.
+- A loopback application readiness URL. For ZincAPI production use
+  `http://127.0.0.1:8080/public/health/ready`; a mere live DAS is not readiness.
+- `manageLifecycle=true`/omitted, no non-empty Agent `exec.command`, and no Agent
+  `globalReloadCmd`, `targets[].reloadCmd`, or `secretTargets[].reloadCmd`.
+- ZnVault Agent 2.x on the host. Agent 2.0.0 introduced the coordinated
+  ownership-safe lock used by certificate, secret, CLI, startup-cleanup, and
+  Payara mutations. Plugin 3 must not run with agent 1.x.
+- systemd must allow the lock owner to reach a terminal command result. With the
+  defaults, require `TimeoutStopSec >= 900` (`deployTimeout + 2 ×
+  operationTimeout + 60 s` margin) and a unit kill policy that terminates all
+  descendants after that bound. The currently observed 30-second host timeout
+  is incompatible and is a **NO_GO** gate, not a warning.
+
+## Supported package surface and versioning
+
+The supported root package surface is the plugin factory, CLI factory, session
+store, agent types, and pure WAR hash/diff helpers. `PayaraManager`,
+`WarDeployer`, their construction options, and raw route registration are no
+longer exported: constructing them directly bypassed the cross-process mutation
+fence. This is the intentional **breaking change** shipped in plugin 3.0.0. Do
+not backport it as a `2.7.x` patch or minor.
+
+Stable plugin 3 artifacts are initially published under the isolated npm
+dist-tag `dr-m4`; neither npm `latest` nor GitHub's latest-release pointer moves.
+Promotion requires a separate fleet/auto-update gate and is not part of the
+package release workflow.
+
+## Production commissioning gate
+
+Passing tests, building a tarball, or publishing a version is not deployment.
+Before a one-node reboot canary:
+
+1. Build and inspect the exact package; typecheck every known consumer against
+   the reduced public surface. Install it without activating lifecycle changes.
+2. Verify the effective node config: canonical Payara/domain paths, Payara user,
+   regular readable WAR, loopback readiness URL, `manageLifecycle=true`, no
+   non-empty Agent `exec.command`, no Agent reload command, and no competing
+   systemd controller.
+3. Verify private local-POSIX quarantine storage, the shared deployment-lock
+   pathname, and that plugin routes plus every agent certificate/secret writer
+   contend on it. Verify atomic `setenv.conf`/WAR replacement, sudo
+   non-interactively, exact procfs identity, `asadmin uptime`, strict refs/apps,
+   and a single DAS PID.
+4. Verify `systemctl show zn-vault-agent -p TimeoutStopUSec -p KillMode` against
+   the finite bound above. Confirm operator routes reject remote and forwarded
+   requests; their loopback/SSH boundary is node-local trust, not cryptographic
+   proof of the human GO.
+5. Obtain an exact named production GO for one serving-node reboot canary. During
+   boot, require `boot-owned-skip`, `deploymentAttempted=false`, zero explicit
+   undeploy/deploy from the plugin, one DAS, `bootDeployment.phase=ready`,
+   `readiness=health-verified`, and application/KMS readiness 2xx.
+6. Hold the canary through the normal monitoring window, then roll one node at a
+   time. Stop immediately on `UNKNOWN`, retained/quarantined lock, duplicate DAS,
+   contradictory inventory, non-ready health, or version drift.
+
+Rollback is permitted only when no startup/deploy task is active and both the
+WAL and deployment lock are absent after exact reconciliation. A retained record
+is a recovery incident, not authorization to downgrade.
 
 ## Migration from Python zinc_updater
 
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v3.0.0 — 2026-08-31
+- **Payara boot single-writer fence.** Startup now records a unique boot epoch,
+  treats persistent application refs as Payara-owned, and never undeploys or
+  redeploys an app merely because it appears in `list-applications`. Ownership
+  classification and deployment are serialized; errors fail closed. Startup is
+  fully awaited with a 105-second monotonic deadline inside the agent's
+  120-second plugin hook, and subprocess groups are terminally killed before a
+  timeout is returned. A missing WAR never causes
+  a restart; a running restored app is still classified from strict refs/runtime.
+- **External-restart and artifact fencing.** DAS uptime plus exact Linux process
+  identity rotate stale epochs; every async readiness commit uses the boot epoch
+  as a CAS token. PID startticks are rechecked immediately before signals, and
+  stopped+PID0 is rechecked after `setenv.conf` immediately before start. All in-process mutations share a
+  re-entrant lease, WAR deploy routes take one create-exclusive cross-process lock,
+  and WAR/`setenv.conf` replacement uses fsync plus atomic rename. Live locks do
+  not age out; stale locks require quiesced manual recovery.
+- **Durable ambiguity quarantine.** Application mutations arm a fixed-path WAL
+  keyed by canonical domain root; same-runtime attestation cannot clear any
+  ambiguous command. Lifecycle ambiguity retains a lock with reason/error/step.
+  Health and both status routes fail closed across processes and bypass cached
+  pre-deploy health.
+- **Strict inventory and undeploy contracts.** `listApplications()` propagates
+  command/parse failures, and undeploy must be confirmed absent before restart.
+- **Breaking supported surface.** Raw manager/deployer/route construction is no
+  longer exported, `manageLifecycle=false` is rejected, and every non-empty Agent
+  exec or reload command is rejected. Release only as a coordinated major version.
+- **Explicit stuck-boot recovery.** A loopback-only staging route can store only
+  a missing WAR without deployment. One-shot recovery is bound to boot epoch,
+  exact DAS fingerprint, expected runtime inventory and staged WAR SHA-256.
+- **Event-path closure.** Certificate/secret/key-triggered Payara restarts are
+  rejected; managed key files rotate atomically. Commissioning requires the
+  coordinated agent shared lock and a systemd stop timeout covering the maximum
+  fenced operation.
 
 ### v2.6.0
 - **Config templates: `export` / `import` + deploy-from-file.** A saved deploy

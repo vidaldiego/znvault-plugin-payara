@@ -29,13 +29,15 @@ export function registerConfigCommands(
     .option('-w, --war <path>', 'Path to WAR file')
     .option('-h, --hosts <hosts>', 'Comma-separated list of hosts')
     .option('-p, --port <port>', 'Agent port (default: 9100)', '9100')
+    .option('--mutation-auth-token-file <path>', 'Fleet-wide local Payara credential file (per-host mapping is preferred)')
     .option('--parallel', 'Deploy to hosts in parallel')
-    .option('--tunnel', 'Route deploys through an SSH-CA tunnel (for loopback-only agents)')
+    .option('--no-tunnel', 'Disable the default SSH-CA tunnel (requires verified HTTPS)')
     .option('-d, --description <desc>', 'Configuration description')
     .action(async (name: string, options: {
       war?: string;
       hosts?: string;
       port: string;
+      mutationAuthTokenFile?: string;
       parallel?: boolean;
       tunnel?: boolean;
       description?: string;
@@ -53,8 +55,9 @@ export function registerConfigCommands(
           hosts: options.hosts ? options.hosts.split(',').map(h => h.trim()) : [],
           warPath: options.war ?? '',
           port: parsePort(options.port),
+          mutationAuthTokenFile: options.mutationAuthTokenFile,
           parallel: options.parallel ?? false,
-          tunnel: options.tunnel ?? false,
+          tunnel: options.tunnel ?? true,
           description: options.description,
         };
 
@@ -69,6 +72,46 @@ export function registerConfigCommands(
           ctx.output.info(`  WAR: ${config.warPath}`);
         }
       }, 'Failed to create config');
+    });
+
+  configCmd
+    .command('set-auth-token-file <name> <host> <path>')
+    .description('Map one target host to its local private Payara credential file')
+    .action(async (name: string, host: string, path: string) => {
+      await withErrorHandling(ctx, async () => {
+        const { store, config } = await getConfigOrExit(ctx, name);
+        const configuredHosts = new Set([
+          ...(config.hosts ?? []),
+          ...(config.classes ?? []).flatMap(cls => cls.hosts),
+        ]);
+        if (!configuredHosts.has(host)) {
+          ctx.output.error(`Host '${host}' is not present in config '${name}'`);
+          process.exit(1);
+        }
+        config.mutationAuthTokenFiles ??= {};
+        config.mutationAuthTokenFiles[host] = path;
+        await saveDeployConfigs(store);
+        ctx.output.success(`Configured Payara credential file for ${host}`);
+      }, 'Failed to set Payara credential file');
+    });
+
+  configCmd
+    .command('clear-auth-token-file <name> <host>')
+    .description('Remove one target host Payara credential-file mapping')
+    .action(async (name: string, host: string) => {
+      await withErrorHandling(ctx, async () => {
+        const { store, config } = await getConfigOrExit(ctx, name);
+        if (!config.mutationAuthTokenFiles?.[host]) {
+          ctx.output.error(`No Payara credential file is configured for ${host}`);
+          process.exit(1);
+        }
+        delete config.mutationAuthTokenFiles[host];
+        if (Object.keys(config.mutationAuthTokenFiles).length === 0) {
+          delete config.mutationAuthTokenFiles;
+        }
+        await saveDeployConfigs(store);
+        ctx.output.success(`Cleared Payara credential file for ${host}`);
+      }, 'Failed to clear Payara credential file');
     });
 
   // deploy config list
@@ -134,6 +177,11 @@ export function registerConfigCommands(
         if (config.rootDir) {
           console.log(`  Root:        ${config.rootDir}`);
         }
+        const perHostAuthCount = Object.keys(config.mutationAuthTokenFiles ?? {}).length;
+        const payaraAuthDescription = perHostAuthCount > 0
+          ? `${perHostAuthCount} per-host file mapping(s)`
+          : config.mutationAuthTokenFile ?? ANSI.dim + '(not configured)' + ANSI.reset;
+        console.log(`  Payara Auth: ${payaraAuthDescription}`);
         console.log(`  Port:        ${config.port}`);
         // A multi-class config carries hosts/strategy/haproxy PER CLASS; the flat
         // top-level fields are defaults (often unset), so present them accordingly.
@@ -493,7 +541,7 @@ export function registerConfigCommands(
   // deploy config set <name> <key> <value>
   configCmd
     .command('set <name> <key> <value>')
-    .description('Set a configuration value (war, port, strategy, parallel, tunnel, description, tls, tls-port, rootdir)')
+    .description('Set a configuration value (war, port, strategy, parallel, tunnel, description, tls, tls-port, rootdir, mutation-auth-token-file)')
     .action(async (name: string, key: string, value: string) => {
       await withErrorHandling(ctx, async () => {
         const { store, config } = await getConfigOrExit(ctx, name);
@@ -511,6 +559,14 @@ export function registerConfigCommands(
               delete config.rootDir;
             } else {
               config.rootDir = value;
+            }
+            break;
+          case 'mutation-auth-token-file':
+          case 'mutationauthtokenfile':
+            if (value === '') {
+              delete config.mutationAuthTokenFile;
+            } else {
+              config.mutationAuthTokenFile = value;
             }
             break;
           case 'port':

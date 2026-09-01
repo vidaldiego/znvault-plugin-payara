@@ -4,19 +4,7 @@ This package uses npm OIDC Trusted Publishing for secure, tokenless releases fro
 
 ## Initial Setup (One-time)
 
-### 1. Create npm Package (First publish only)
-
-For the first publish, you need to use a classic npm token:
-
-```bash
-# Login to npm
-npm login
-
-# Publish manually first time
-npm publish --access public
-```
-
-### 2. Configure Trusted Publisher on npm
+### 1. Configure Trusted Publisher on npm
 
 ⚠️ **IMPORTANT**: These values MUST match EXACTLY (case-sensitive):
 
@@ -42,7 +30,7 @@ npm publish --access public
 - The GitHub owner (`vidaldiego`) must match exactly, not the npm scope (`@zincapp`)
 - For scoped packages like `@zincapp/*`, you may need org-level permissions on npm
 
-### 3. Create GitHub Environment
+### 2. Create GitHub Environment
 
 1. Go to your repo: https://github.com/vidaldiego/znvault-plugin-payara
 2. Navigate to **Settings** → **Environments**
@@ -54,40 +42,84 @@ npm publish --access public
 
 ### Automated Release (Recommended)
 
-1. Update version in `package.json`
-2. Commit the change
-3. Create and push a git tag:
+1. Update the version without creating an implicit partial release commit.
+2. Stage and validate the complete release snapshot.
+3. Commit, push, then create and push only the intended annotated tag:
 
 ```bash
-# Update version
-npm version patch  # or minor, major
+# Update package.json and package-lock.json without committing or tagging.
+npm version patch --no-git-tag-version  # or minor, major
 
-# Push with tags
-git push origin main --tags
+# The release commit must contain the complete reviewed tree, including new
+# files; staging only version metadata can silently omit release code.
+git add -A
+git diff --cached --check
+git status --short
+RELEASE_VERSION=$(node -p "require('./package.json').version")
+git commit -m "chore(release): v$RELEASE_VERSION"
+
+# Push the release commit and only the intended tag. Do not use --tags: local
+# historical tags may not have been published.
+git push origin HEAD:main
+git tag -a "v$RELEASE_VERSION" -m "v$RELEASE_VERSION"
+git push origin "refs/tags/v$RELEASE_VERSION"
 ```
 
 The GitHub Action will:
 1. Run tests
 2. Build the package
-3. Publish to npm with provenance
-4. Create a GitHub release
+3. Pack one tarball and verify that exact artifact's contents, installation,
+   imports, and version
+4. Publish the same digest-checked tarball to npm with provenance
+5. Create a GitHub release
 
-### Manual Release (Fallback)
+### Plugin 3 migration-channel fence
 
-If OIDC fails, you can still publish manually:
+Stable plugin 3 releases, including `3.0.0`, are intentionally published with
+the isolated npm dist-tag `dr-m4`. The workflow does **not** move `latest`, and
+the corresponding GitHub Release is created with `make_latest=false`. `dr-m4`
+is deliberately not a conventional updater channel such as `next` or `beta`.
 
-```bash
-npm login
-npm publish --access public
-```
+Publish and verify the dependency chain in this order:
+
+1. `@zincapp/znvault-deploy-core@0.2.4` with the authenticated request API and
+   transport fence;
+2. the exact Agent 2 release that consumes that core and owns the outer route
+   gate/setup contract;
+3. the exact Payara plugin 3 release whose dependency resolves to core 0.2.x and
+   whose dev/peer dependency resolves to that Agent 2 build.
+
+Before tagging the plugin, regenerate the lockfile from the public registry and
+verify it contains no `file:` tarball/path, resolves
+`@zincapp/znvault-deploy-core` to `0.2.x`, and resolves the Agent dev dependency
+to `2.x`. A locally packed dependency is suitable only for pre-publication
+testing and must not enter the release commit.
+
+Agent 2 and plugin 3 form one coordinated migration pair. Publishing their exact
+versions under `dr-m4` makes the artifacts available for explicit staging; it
+does not authorize an install, restart, rollout, or production commissioning.
+Promoting either package to npm `latest` requires a separate operational gate
+that proves the fleet auto-update policy, compatible pair availability, and
+per-host rollout controls. That promotion is intentionally absent from this
+workflow.
+
+### Release Recovery
+
+If OIDC publishing fails, correct the trusted-publisher or workflow issue and
+re-run the workflow for the exact existing tag. Do not bypass provenance or
+the test/build/audit/artifact gates with a local `npm publish`. The workflow
+packs exactly once in its publish job; recovery must reuse the existing tag and
+reproduce that source snapshot, never publish an independently packed directory.
 
 ## Verification
 
 After publishing, verify:
 
 1. **npm page**: https://www.npmjs.com/package/@zincapp/znvault-plugin-payara
-2. **Provenance badge**: Should show "Provenance" badge on npm
-3. **GitHub release**: Should be created automatically
+2. **Exact version**: `3.0.0` resolves under `dr-m4`
+3. **Dist-tags**: `latest` remains on the prior production-compatible release
+4. **Provenance badge**: Should show "Provenance" badge on npm
+5. **GitHub release**: Should be created automatically and must not be latest
 
 ## Troubleshooting
 
@@ -102,11 +134,12 @@ After publishing, verify:
 - npm couldn't match workflow to Trusted Publisher config
 - Double-check org/user, repo, workflow, environment settings
 
-### First publish fails
+### Publish fails before npm upload
 
-- First publish must use classic npm token
-- After first publish, configure Trusted Publisher
-- Subsequent publishes use OIDC
+- Verify the tag belongs to `main` and exactly matches `package.json`.
+- Verify the trusted publisher and `npm-publish` environment configuration.
+- Re-run the same workflow; do not create a replacement tag for different
+  source content.
 
 ## References
 

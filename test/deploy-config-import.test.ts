@@ -42,7 +42,12 @@ describe('config import', () => {
   beforeEach(() => { saveSpy.mockClear(); vi.mocked(confirmPrompt).mockClear(); Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true }); });
 
   it('imports a fresh config (creates it in the store)', async () => {
-    const p = tmpCfg({ name: 'fresh', warPath: 'w.war', rootDir: '/r' });
+    const p = tmpCfg({
+      name: 'fresh',
+      warPath: 'w.war',
+      rootDir: '/r',
+      hosts: ['192.0.2.10'],
+    });
     await runCmd(['import', p, '--with-root', '/root'], []);
     const saved = saveSpy.mock.calls[0]![0] as { configs: Record<string, { rootDir?: string; name: string }> };
     expect(saved.configs.fresh!.name).toBe('fresh');
@@ -50,7 +55,12 @@ describe('config import', () => {
   });
 
   it('upgrades an existing config after TTY confirm', async () => {
-    const p = tmpCfg({ name: 'existing', warPath: 'new.war', rootDir: '/x' });
+    const p = tmpCfg({
+      name: 'existing',
+      warPath: 'new.war',
+      rootDir: '/x',
+      hosts: ['192.0.2.10'],
+    });
     await runCmd(['import', p], []);
     expect(confirmPrompt).toHaveBeenCalled();
     const saved = saveSpy.mock.calls[0]![0] as { configs: Record<string, { warPath: string }> };
@@ -58,7 +68,12 @@ describe('config import', () => {
   });
 
   it('--force skips the prompt on an existing config', async () => {
-    const p = tmpCfg({ name: 'existing', warPath: 'forced.war', rootDir: '/x' });
+    const p = tmpCfg({
+      name: 'existing',
+      warPath: 'forced.war',
+      rootDir: '/x',
+      hosts: ['192.0.2.10'],
+    });
     await runCmd(['import', p, '--force'], []);
     expect(confirmPrompt).not.toHaveBeenCalled();
     expect(saveSpy).toHaveBeenCalled();
@@ -66,7 +81,12 @@ describe('config import', () => {
 
   it('non-TTY without --force on an existing name errors, does not save or hang', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
-    const p = tmpCfg({ name: 'existing', warPath: 'x.war', rootDir: '/x' });
+    const p = tmpCfg({
+      name: 'existing',
+      warPath: 'x.war',
+      rootDir: '/x',
+      hosts: ['192.0.2.10'],
+    });
     const lines: string[] = [];
     await runCmd(['import', p], lines).catch(() => {});
     expect(lines.join('\n')).toMatch(/exists; pass --force/);
@@ -75,7 +95,12 @@ describe('config import', () => {
   });
 
   it('--name overrides the stored name and store key', async () => {
-    const p = tmpCfg({ name: 'fromfile', warPath: 'w.war', rootDir: '/r' });
+    const p = tmpCfg({
+      name: 'fromfile',
+      warPath: 'w.war',
+      rootDir: '/r',
+      hosts: ['192.0.2.10'],
+    });
     await runCmd(['import', p, '--name', 'renamed', '--force'], []);
     const saved = saveSpy.mock.calls[0]![0] as { configs: Record<string, { name: string }> };
     expect(saved.configs.renamed!.name).toBe('renamed');

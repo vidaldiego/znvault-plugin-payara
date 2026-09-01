@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
 import { resolveUnderRoot } from '../src/secrets-handler.js';
 
 const ROOT = '/etc/zn-agent/node/';
@@ -62,6 +64,68 @@ describe('file: secret source (fetchSecrets)', () => {
   it('omits + does not throw when the path is outside the root', async () => {
     const out = await fetchSecrets(ctx, { X: 'file:/etc/shadow' }, logger, undefined, undefined, root);
     expect('X' in out).toBe(false);
+  });
+
+  it('rejects a final symlink even when its name is lexically under the root', async () => {
+    fs.symlinkSync('/etc/hosts', path.join(root, 'node-role'));
+    const out = await fetchSecrets(
+      ctx,
+      { ROLE: 'file:node-role' },
+      logger,
+      undefined,
+      undefined,
+      root
+    );
+    expect('ROLE' in out).toBe(false);
+  });
+
+  it('rejects an intermediate symlink that escapes the canonical root', async () => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'znfsrc-outside-'));
+    try {
+      fs.writeFileSync(path.join(outside, 'secret'), 'escaped');
+      fs.symlinkSync(outside, path.join(root, 'linked-dir'));
+      const out = await fetchSecrets(
+        ctx,
+        { ROLE: 'file:linked-dir/secret' },
+        logger,
+        undefined,
+        undefined,
+        root
+      );
+      expect('ROLE' in out).toBe(false);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a FIFO without blocking the event loop past the deadline', async () => {
+    const fifo = path.join(root, 'blocked');
+    execFileSync('mkfifo', [fifo]);
+    const startedAt = performance.now();
+    const out = await fetchSecrets(
+      ctx,
+      { ROLE: 'file:blocked' },
+      logger,
+      undefined,
+      undefined,
+      root,
+      performance.now() + 250
+    );
+    expect('ROLE' in out).toBe(false);
+    expect(performance.now() - startedAt).toBeLessThan(250);
+  });
+
+  it('rejects an oversized regular file', async () => {
+    fs.writeFileSync(path.join(root, 'too-large'), Buffer.alloc(64 * 1024 + 1, 0x61));
+    const out = await fetchSecrets(
+      ctx,
+      { ROLE: 'file:too-large' },
+      logger,
+      undefined,
+      undefined,
+      root
+    );
+    expect('ROLE' in out).toBe(false);
   });
 
   it('defaults the root to /etc/zn-agent/node/ when fileSourceRoot is absent', () => {

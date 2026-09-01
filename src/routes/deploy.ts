@@ -2,8 +2,6 @@
 // Deployment routes - handles WAR file deployment via asadmin
 
 import type { FastifyInstance } from 'fastify';
-import { writeFile, mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
 import type {
   DeployRequest,
   ChunkedDeployRequest,
@@ -13,6 +11,12 @@ import type { RouteContext } from './types.js';
 import { getErrorMessage } from '../utils/error.js';
 import {
   checkDeploymentInProgress,
+  DEPLOYMENT_ID_HEADER,
+  EXPECTED_BASE_SHA256_HEADER,
+  TARGET_CONTENT_SHA256_HEADER,
+  resolveDeploymentId,
+  resolveArtifactExpectation,
+  resolveBinaryArtifactExpectation,
   validateDeployRequest,
   decodeFileContents,
 } from './helpers.js';
@@ -40,15 +44,28 @@ export async function registerDeployRoutes(
    * Receives base64-encoded file contents for changed files
    */
   fastify.post<{ Body: DeployRequest }>('/deploy', async (request, reply) => {
-    const { files, deletions } = request.body;
+    const {
+      deploymentId: requestedDeploymentId,
+      artifact: requestedArtifact,
+      files,
+      deletions,
+    } = request.body;
+    const deploymentId = resolveDeploymentId(
+      requestedDeploymentId,
+      reply,
+      request.headers[DEPLOYMENT_ID_HEADER]
+    );
+    if (!deploymentId) return;
 
     // Validate request
     if (validateDeployRequest(request.body, reply)) {
       return;
     }
+    const artifact = resolveArtifactExpectation(requestedArtifact, reply);
+    if (!artifact) return;
 
     // Check if deployment is already in progress
-    if (checkDeploymentInProgress(deployer, reply)) {
+    if (checkDeploymentInProgress(deployer, deploymentId, reply)) {
       return;
     }
 
@@ -62,19 +79,26 @@ export async function registerDeployRoutes(
       }, 'Starting deployment via asadmin');
 
       // Deploy using asadmin deploy command (uses aggressive mode if configured)
-      const result = await deployer.applyChangesAuto(changedFiles, deletions);
+      const result = await deployer.applyChangesAuto(
+        changedFiles,
+        deletions,
+        deploymentId,
+        artifact
+      );
 
       const completedAt = Date.now();
 
-      if (result.success) {
+      if (result.success && result.deployed === true) {
         return {
           status: 'deployed',
+          deploymentId,
           completedAt,
           ...result,
         };
       } else {
         return reply.code(500).send({
           status: 'failed',
+          deploymentId,
           error: 'Deployment failed',
           completedAt,
           ...result,
@@ -85,6 +109,7 @@ export async function registerDeployRoutes(
       return reply.code(500).send({
         error: 'Deployment failed',
         message: getErrorMessage(err),
+        deploymentId,
       });
     }
   });
@@ -94,8 +119,19 @@ export async function registerDeployRoutes(
    * Triggers a full WAR deployment using asadmin deploy (no diff)
    * In aggressive mode: undeploy → stop → kill → start → deploy
    */
-  fastify.post('/deploy/full', async (request, reply) => {
-    if (checkDeploymentInProgress(deployer, reply)) {
+  fastify.post<{
+    Body?: { deploymentId?: string; artifact?: unknown };
+  }>('/deploy/full', async (request, reply) => {
+    const deploymentId = resolveDeploymentId(
+      request.body?.deploymentId,
+      reply,
+      request.headers[DEPLOYMENT_ID_HEADER]
+    );
+    if (!deploymentId) return;
+    const artifact = resolveArtifactExpectation(request.body?.artifact, reply);
+    if (!artifact) return;
+
+    if (checkDeploymentInProgress(deployer, deploymentId, reply)) {
       return;
     }
 
@@ -103,11 +139,12 @@ export async function registerDeployRoutes(
       logger.info('Starting full deployment via asadmin');
 
       // Use deployAuto which respects aggressive mode
-      const result = await deployer.deployAuto();
+      const result = await deployer.deployAuto(deploymentId, artifact);
       const completedAt = Date.now();
 
-      return {
+      const response = {
         status: result.deployed ? 'deployed' : 'failed',
+        deploymentId,
         message: result.deployed ? 'Full deployment successful' : 'Deployment failed',
         completedAt,
         deploymentTime: result.deploymentTime,
@@ -115,12 +152,18 @@ export async function registerDeployRoutes(
         applications: result.applications,
         appName: deployer.getAppName(),
         aggressiveMode: result.aggressiveMode,
+        artifact: result.artifact,
+        targetContentSha256: result.targetContentSha256,
       };
+      return result.deployed
+        ? response
+        : reply.code(500).send(response);
     } catch (err) {
       logger.error({ err }, 'Full deployment failed');
       return reply.code(500).send({
         error: 'Deployment failed',
         message: getErrorMessage(err),
+        deploymentId,
         completedAt: Date.now(),
       });
     }
@@ -135,7 +178,19 @@ export async function registerDeployRoutes(
    * Content-Type: application/octet-stream
    */
   fastify.post<{ Body: Buffer }>('/deploy/upload', async (request, reply) => {
-    if (checkDeploymentInProgress(deployer, reply)) {
+    const deploymentId = resolveDeploymentId(
+      request.headers[DEPLOYMENT_ID_HEADER],
+      reply
+    );
+    if (!deploymentId) return;
+    const artifact = resolveBinaryArtifactExpectation(
+      request.headers[EXPECTED_BASE_SHA256_HEADER],
+      request.headers[TARGET_CONTENT_SHA256_HEADER],
+      reply
+    );
+    if (!artifact) return;
+
+    if (checkDeploymentInProgress(deployer, deploymentId, reply)) {
       return;
     }
 
@@ -147,27 +202,23 @@ export async function registerDeployRoutes(
         return reply.code(400).send({
           error: 'Invalid request',
           message: 'No WAR file data received',
+          deploymentId,
         });
       }
 
-      // Get WAR path from deployer
-      const warPath = deployer.getWarPath();
-
-      // Ensure directory exists
-      await mkdir(dirname(warPath), { recursive: true });
-
-      // Write buffer to WAR path
-      await writeFile(warPath, warBuffer);
-
-      logger.info({ warPath, size: warBuffer.length }, 'WAR file uploaded, deploying via asadmin...');
-
-      // Deploy the WAR using asadmin deploy (respects aggressive mode)
-      const result = await deployer.deployAuto();
+      // Write and deploy under one lease so concurrent uploads cannot replace
+      // the artifact while asadmin is reading it.
+      const result = await deployer.deployUploadedWar(
+        warBuffer,
+        deploymentId,
+        artifact
+      );
       const completedAt = Date.now();
 
       if (result.deployed) {
         return {
           status: 'deployed',
+          deploymentId,
           message: 'WAR uploaded and deployed successfully via asadmin',
           completedAt,
           size: warBuffer.length,
@@ -176,10 +227,13 @@ export async function registerDeployRoutes(
           applications: result.applications,
           appName: deployer.getAppName(),
           aggressiveMode: result.aggressiveMode,
+          artifact: result.artifact,
+          targetContentSha256: result.targetContentSha256,
         };
       } else {
         return reply.code(500).send({
           status: 'failed',
+          deploymentId,
           error: 'Deployment failed',
           message: 'WAR uploaded but deployment via asadmin failed',
           completedAt,
@@ -194,6 +248,7 @@ export async function registerDeployRoutes(
       return reply.code(500).send({
         error: 'WAR upload failed',
         message: getErrorMessage(err),
+        deploymentId,
         completedAt: Date.now(),
       });
     }
@@ -203,12 +258,29 @@ export async function registerDeployRoutes(
    * POST /deploy/chunk
    * Upload files in chunks for large deployments
    *
-   * For first chunk: omit sessionId, include deletions
-   * For subsequent chunks: include sessionId from previous response
+   * For first chunk: omit sessionId, include deletions and caller deploymentId
+   * For subsequent chunks: include sessionId and repeat deploymentId exactly
    * For final chunk: set commit: true to apply all changes
    */
   fastify.post<{ Body: ChunkedDeployRequest }>('/deploy/chunk', async (request, reply) => {
-    const { sessionId, files, deletions, expectedFiles, commit } = request.body;
+    const {
+      deploymentId: requestedDeploymentId,
+      sessionId,
+      files,
+      deletions,
+      expectedFiles,
+      commit,
+      artifact: requestedArtifact,
+    } = request.body;
+
+    // Validate caller ownership before decoding files, creating a session, or
+    // attempting a deployment lock. Major 3 has no server-generated fallback.
+    const deploymentId = resolveDeploymentId(
+      requestedDeploymentId,
+      reply,
+      request.headers[DEPLOYMENT_ID_HEADER]
+    );
+    if (!deploymentId) return;
 
     // Validate request
     if (!Array.isArray(files)) {
@@ -229,11 +301,42 @@ export async function registerDeployRoutes(
           message: `Session ${sessionId} not found or expired`,
         });
       }
+      if (deploymentId !== session.deploymentId) {
+        return reply.code(409).send({
+          error: 'Chunk deployment identity mismatch',
+          message: 'The chunk session belongs to a different deployment operation.',
+          deploymentId: session.deploymentId,
+          requestedDeploymentId: deploymentId,
+          sameOperation: false,
+        });
+      }
+      if (requestedArtifact !== undefined) {
+        const artifact = resolveArtifactExpectation(requestedArtifact, reply);
+        if (!artifact) return;
+        if (
+          artifact.expectedBaseSha256 !== session.artifact.expectedBaseSha256
+          || artifact.targetContentSha256 !== session.artifact.targetContentSha256
+        ) {
+          return reply.code(409).send({
+            error: 'Chunk artifact identity mismatch',
+            message: 'The chunk session is bound to a different artifact operation.',
+            deploymentId: session.deploymentId,
+            sameOperation: false,
+          });
+        }
+      }
       // Add files to existing session
       sessionStore.addFiles(sessionId, files);
     } else {
+      const artifact = resolveArtifactExpectation(requestedArtifact, reply);
+      if (!artifact) return;
       // Create new session (automatically cleans up old sessions)
-      session = sessionStore.create(deletions ?? [], expectedFiles);
+      session = sessionStore.create(
+        deletions ?? [],
+        expectedFiles,
+        deploymentId,
+        artifact
+      );
       // Add initial files
       sessionStore.addFiles(session.id, files);
     }
@@ -242,6 +345,7 @@ export async function registerDeployRoutes(
     session = sessionStore.get(session.id)!;
 
     const response: ChunkedDeployResponse = {
+      deploymentId,
       sessionId: session.id,
       filesReceived: session.files.length,
       committed: false,
@@ -250,7 +354,7 @@ export async function registerDeployRoutes(
     // If commit requested, apply all changes using asadmin deploy
     if (commit) {
       // Check if deployment is already in progress
-      if (checkDeploymentInProgress(deployer, reply)) {
+      if (checkDeploymentInProgress(deployer, deploymentId, reply)) {
         return;
       }
 
@@ -265,7 +369,12 @@ export async function registerDeployRoutes(
         }, 'Committing chunked deployment via asadmin');
 
         // Deploy using asadmin deploy command (uses aggressive mode if configured)
-        const result = await deployer.applyChangesAuto(changedFiles, session.deletions);
+        const result = await deployer.applyChangesAuto(
+          changedFiles,
+          session.deletions,
+          deploymentId,
+          session.artifact
+        );
         const completedAt = Date.now();
 
         // Clean up session
@@ -282,6 +391,7 @@ export async function registerDeployRoutes(
         return reply.code(500).send({
           error: 'Deployment failed',
           message: getErrorMessage(err),
+          deploymentId,
           completedAt: Date.now(),
         });
       }
@@ -295,29 +405,96 @@ export async function registerDeployRoutes(
    * Check current deployment status - used for polling long-running deployments
    */
   fastify.get('/deploy/status', async (request, reply) => {
-    try {
+    const appName = deployer.getAppName();
+    const busyResponse = (
+      lock: Awaited<ReturnType<typeof deployer.getDeploymentLockStatus>>
+    ) => {
       const deployStatus = deployer.getDeploymentStatus();
-      const appDeployed = await deployer.isAppDeployed();
-      const payaraStatus = await ctx.payara.getStatus();
-
       return {
-        // Current deployment status
-        deploying: deployStatus.deploying,
-        deploymentId: deployStatus.deploymentId,
+        deploying: true,
+        deploymentId: deployStatus.deploymentId ?? lock.data?.deploymentId,
         startedAt: deployStatus.startedAt,
-        currentStep: deployStatus.currentStep,
+        currentStep: deployStatus.currentStep ?? lock.data?.step,
         elapsedMs: deployStatus.startedAt ? Date.now() - deployStatus.startedAt : undefined,
-
-        // Last deployment result (for checking if deployment completed)
         lastResult: deployStatus.lastResult,
+        lastDeploymentId: deployStatus.lastDeploymentId,
         lastCompletedAt: deployStatus.lastCompletedAt,
-
-        // Current state
-        appDeployed,
-        appName: deployer.getAppName(),
-        healthy: payaraStatus.healthy,
-        running: payaraStatus.running,
+        appDeployed: false,
+        appName,
+        healthy: false,
+        running: false,
+        bootDeployment: ctx.payara.getBootDeploymentStatus(appName),
+        deploymentLock: {
+          locked: lock.locked,
+          stale: lock.stale ?? false,
+          deploymentId: lock.data?.deploymentId,
+          step: lock.data?.step,
+        },
       };
+    };
+
+    try {
+      const initialLock = await deployer.getDeploymentLockStatus();
+      if (initialLock.locked || initialLock.stale) {
+        return busyResponse(initialLock);
+      }
+      const stableDeployStatus = deployer.getDeploymentStatus();
+
+      try {
+        return await deployer.withDeploymentFileLock(
+          `deploy-status:${appName}`,
+          'verify',
+          async () => {
+            const deployStatus = stableDeployStatus;
+            const appDeployed = await deployer.isAppDeployed();
+            const payaraStatus = await ctx.payara.getStatus(true);
+            await ctx.payara.readBootDeploymentStatus(appName);
+            const bootDeployment = ctx.payara.getBootDeploymentStatus(appName);
+            const fenceHealthy =
+              bootDeployment.phase === 'ready'
+              && !bootDeployment.mutationOutcomeUnknown;
+
+            return {
+              deploying: deployStatus.deploying,
+              deploymentId: deployStatus.deploymentId,
+              startedAt: deployStatus.startedAt,
+              currentStep: deployStatus.currentStep,
+              elapsedMs: deployStatus.startedAt
+                ? Date.now() - deployStatus.startedAt
+                : undefined,
+              lastResult: deployStatus.lastResult,
+              lastDeploymentId: deployStatus.lastDeploymentId,
+              lastCompletedAt: deployStatus.lastCompletedAt,
+              appDeployed,
+              appName,
+              healthy:
+                !deployStatus.deploying
+                && !ctx.payara.isMutationInProgress()
+                && payaraStatus.healthy
+                && payaraStatus.running
+                && appDeployed
+                && fenceHealthy,
+              running: payaraStatus.running,
+              bootDeployment,
+              deploymentLock: { locked: false, stale: false },
+            };
+          }
+        );
+      } catch (err) {
+        const racedLock = await deployer.getDeploymentLockStatus();
+        const message = getErrorMessage(err);
+        if (
+          racedLock.locked
+          || racedLock.stale
+          || message.includes('Deployment already in progress')
+          || message.includes('Unable to acquire deployment lock')
+        ) {
+          return busyResponse(racedLock.locked || racedLock.stale
+            ? racedLock
+            : { locked: true });
+        }
+        throw err;
+      }
     } catch (err) {
       logger.error({ err }, 'Failed to get deployment status');
       return reply.code(500).send({

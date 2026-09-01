@@ -20,6 +20,21 @@ import AdmZip from 'adm-zip';
 
 const AGENT_URL = process.env.AGENT_URL || 'http://localhost:9100';
 const TEST_DIR = join(tmpdir(), 'deploy-e2e-test');
+const DISPOSABLE_HARNESS_ID = 'znvault-payara-disposable-v1';
+
+function isLoopbackHttpUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    return url.protocol === 'http:'
+      && ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+const MUTATION_E2E_ENABLED = process.env.RUN_PAYARA_MUTATION_E2E === 'true'
+  && process.env.PAYARA_MUTATION_E2E_HARNESS_ID === DISPOSABLE_HARNESS_ID
+  && isLoopbackHttpUrl(AGENT_URL);
 
 interface WarFileHashes {
   [path: string]: string;
@@ -110,10 +125,9 @@ describe('Deploy E2E Tests', () => {
   });
 
   describe('Agent Health and Plugin', () => {
-    it('E2E-01: should have healthy agent', async () => {
+    it('E2E-01: should have healthy agent', async ({ skip }) => {
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       const response = await fetch(`${AGENT_URL}/health`);
@@ -123,10 +137,9 @@ describe('Deploy E2E Tests', () => {
       expect(health.status).toBe('healthy');
     });
 
-    it('E2E-02: should have Payara plugin loaded', async () => {
+    it('E2E-02: should have Payara plugin loaded', async ({ skip }) => {
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       const response = await fetch(`${AGENT_URL}/health`);
@@ -138,10 +151,9 @@ describe('Deploy E2E Tests', () => {
       expect(payaraPlugin.status).toBe('healthy');
     });
 
-    it('E2E-03: should have Payara status endpoint', async () => {
+    it('E2E-03: should have Payara status endpoint', async ({ skip }) => {
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       const response = await fetch(`${AGENT_URL}/plugins/payara/status`);
@@ -155,10 +167,9 @@ describe('Deploy E2E Tests', () => {
   });
 
   describe('WAR Hashes Endpoint', () => {
-    it('E2E-04: should return WAR file hashes', async () => {
+    it('E2E-04: should return WAR file hashes', async ({ skip }) => {
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       const response = await fetch(`${AGENT_URL}/plugins/payara/hashes`);
@@ -169,10 +180,9 @@ describe('Deploy E2E Tests', () => {
       expect(typeof data.hashes).toBe('object');
     });
 
-    it('E2E-05: should return SHA-256 hashes', async () => {
+    it('E2E-05: should return SHA-256 hashes', async ({ skip }) => {
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       const response = await fetch(`${AGENT_URL}/plugins/payara/hashes`);
@@ -327,19 +337,22 @@ describe('Deploy E2E Tests', () => {
   });
 
   describe('Agent Deployment Endpoint', () => {
-    // Note: These tests are skipped in CI because deployment triggers actual Payara restart
-    // which can take significant time. Run manually with longer timeout if needed.
-    it.skip('E2E-14: should accept deployment request', async () => {
+    // These calls can mutate/restart a real Payara domain. They are runnable,
+    // but require an explicitly disposable harness rather than mere reachability.
+    it('E2E-14: should accept deployment request', async ({ skip }) => {
+      if (!MUTATION_E2E_ENABLED) {
+        skip(`Mutation E2E requires loopback HTTP, RUN_PAYARA_MUTATION_E2E=true, and PAYARA_MUTATION_E2E_HARNESS_ID=${DISPOSABLE_HARNESS_ID}`);
+      }
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       // Get current hashes first (verify endpoint works)
       const hashResponse = await fetch(`${AGENT_URL}/plugins/payara/hashes`);
       await hashResponse.json(); // Just verify the response is valid JSON
 
-      // Prepare a small update (just metadata to avoid actual restart)
+      // An empty diff is still an explicit deployment request. In aggressive
+      // mode it can restart the whole domain, hence the disposable-harness gate.
       const response = await fetch(`${AGENT_URL}/plugins/payara/deploy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -349,16 +362,18 @@ describe('Deploy E2E Tests', () => {
         }),
       });
 
-      // Should succeed even with empty payload (no-op)
+      // Success means the explicit redeployment completed, with zero file deltas.
       expect(response.ok).toBe(true);
       const result = await response.json();
       expect(result.status).toBe('deployed');
     });
 
-    it.skip('E2E-15: should report deployment stats', async () => {
+    it('E2E-15: should report deployment stats', async ({ skip }) => {
+      if (!MUTATION_E2E_ENABLED) {
+        skip(`Mutation E2E requires loopback HTTP, RUN_PAYARA_MUTATION_E2E=true, and PAYARA_MUTATION_E2E_HARNESS_ID=${DISPOSABLE_HARNESS_ID}`);
+      }
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       const response = await fetch(`${AGENT_URL}/plugins/payara/deploy`, {
@@ -379,10 +394,9 @@ describe('Deploy E2E Tests', () => {
   });
 
   describe('Agent Applications Endpoint', () => {
-    it('E2E-16: should list deployed applications', async () => {
+    it('E2E-16: should list deployed applications', async ({ skip }) => {
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
       const response = await fetch(`${AGENT_URL}/plugins/payara/applications`);
@@ -395,21 +409,22 @@ describe('Deploy E2E Tests', () => {
   });
 
   describe('Agent Restart Endpoint', () => {
-    // Note: Restart test skipped in CI because it triggers actual Payara restart
-    it.skip('E2E-17: should have restart endpoint', async () => {
+    it('E2E-17: should restart through the endpoint', async ({ skip }) => {
+      if (!MUTATION_E2E_ENABLED) {
+        skip(`Mutation E2E requires loopback HTTP, RUN_PAYARA_MUTATION_E2E=true, and PAYARA_MUTATION_E2E_HARNESS_ID=${DISPOSABLE_HARNESS_ID}`);
+      }
       if (!agentAvailable) {
-        console.log('   Skipped: Agent not available');
-        return;
+        skip('Agent not available');
       }
 
-      // Just verify the endpoint exists (don't actually restart in tests)
+      // This is a real lifecycle mutation in the explicitly enabled harness.
       const response = await fetch(`${AGENT_URL}/plugins/payara/restart`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       });
 
-      // Should succeed (mock Payara will handle it)
+      // The explicitly disposable harness must complete the lifecycle mutation.
       expect(response.ok).toBe(true);
     });
   });

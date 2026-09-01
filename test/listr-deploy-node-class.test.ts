@@ -114,6 +114,7 @@ function makeSuccessResult() {
       message: 'ok',
       deploymentTime: 10,
       appName: 'TestApp',
+      deployed: true,
       completedAt: Date.now(),
     },
   };
@@ -134,6 +135,9 @@ function makeOptions(hosts: string[], overrides: Partial<ListrDeployOptions> = {
     port: PORT,
     force: false,
     analysisMap: makeAnalysisMap(hosts),
+    mutationAuthTokens: new Map(
+      hosts.map(host => [host, `test-payara-control-token-${host}`])
+    ),
     haproxy: {
       hosts: ['198.51.100.20'],
       backend: 'api_servers',
@@ -307,6 +311,21 @@ describe('2. Worker batch failure is non-blocking', () => {
     expect(options.ctx.output.warn).toHaveBeenCalledWith(expect.stringContaining(WORKER));
   });
 
+  it('records a worker without a terminal receipt as failed', async () => {
+    vi.mocked(deployMod.deployToHost).mockImplementation(async (_ctx, host) =>
+      host === WORKER ? { success: true } : makeSuccessResult()
+    );
+
+    const result = await executeListrDeployment(
+      parseDeploymentStrategy('1+R'),
+      HOSTS,
+      makeOptions(HOSTS)
+    );
+
+    expect(result.workerFailed).toBe(1);
+    expect(result.results.get(WORKER)).toEqual({ success: true });
+  });
+
   it('still deploys serving nodes when worker fails', async () => {
     const deployedSuccessfully: string[] = [];
     vi.mocked(deployMod.deployToHost).mockImplementation(async (_ctx, host) => {
@@ -364,6 +383,136 @@ describe('3. No serverMap configured: one class, behavior unchanged', () => {
 
     expect(order[0]).toBe(WORKER); // unchanged config order
     expect(options.ctx.output.warn).not.toHaveBeenCalledWith(expect.stringContaining('serving'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3a. Sequential/finite strategy coverage
+// ---------------------------------------------------------------------------
+describe('3a. Strategy coverage is complete or fails closed', () => {
+  const HOSTS = [SERVING_1, SERVING_2, SERVING_3];
+
+  it('sequential creates one ordered task for every serving host', async () => {
+    const order = captureDeployOrder();
+
+    const result = await executeListrDeployment(
+      parseDeploymentStrategy('sequential'),
+      HOSTS,
+      makeOptions(HOSTS, { haproxy: undefined })
+    );
+
+    expect(order).toEqual(HOSTS);
+    expect(result.successful).toBe(3);
+    expect(Array.from(result.results.keys())).toEqual(HOSTS);
+  });
+
+  it('rejects a finite canary plan that leaves a serving tail untouched', async () => {
+    await expect(executeListrDeployment(
+      parseDeploymentStrategy('1+1'),
+      HOSTS,
+      makeOptions(HOSTS, { haproxy: undefined })
+    )).rejects.toThrow(/covers 2 of 3 serving hosts/);
+
+    expect(deployMod.deployToHost).not.toHaveBeenCalled();
+  });
+
+  it('does not count a transport-only success as a deployment receipt', async () => {
+    vi.mocked(deployMod.deployToHost).mockImplementation(async (_ctx, host) =>
+      host === SERVING_2
+        ? { success: true }
+        : makeSuccessResult()
+    );
+
+    const result = await executeListrDeployment(
+      parseDeploymentStrategy('sequential'),
+      HOSTS,
+      makeOptions(HOSTS, { haproxy: undefined })
+    );
+
+    expect(result.failed).toBe(1);
+    expect(result.successful).toBe(2);
+    expect(result.results.get(SERVING_2)).toEqual({ success: true });
+  });
+
+  it('records a pre-deploy credential failure and continues no false-green', async () => {
+    const options = makeOptions(HOSTS, {
+      haproxy: undefined,
+      mutationAuthTokens: new Map([
+        [SERVING_1, `test-payara-control-token-${SERVING_1}`],
+        [SERVING_3, `test-payara-control-token-${SERVING_3}`],
+      ]),
+    });
+
+    const result = await executeListrDeployment(
+      parseDeploymentStrategy('sequential'),
+      HOSTS,
+      options
+    );
+
+    expect(result.failed).toBe(1);
+    expect(result.results.get(SERVING_2)).toMatchObject({
+      success: false,
+      error: expect.stringContaining('credential'),
+    });
+  });
+
+  it('records a pre-deploy drain failure and never dispatches that host', async () => {
+    vi.mocked(haproxyMod.drainServer).mockImplementation(async (_config, host) =>
+      host === SERVING_2
+        ? {
+            success: false,
+            results: [{ host: '198.51.100.20', success: false, error: 'drain rejected' }],
+          }
+        : {
+            success: true,
+            results: [{ host: '198.51.100.20', success: true }],
+          }
+    );
+
+    const result = await executeListrDeployment(
+      parseDeploymentStrategy('sequential'),
+      HOSTS,
+      makeOptions(HOSTS)
+    );
+
+    expect(result.failed).toBe(1);
+    expect(result.successful).toBe(2);
+    expect(result.results.get(SERVING_2)).toMatchObject({
+      success: false,
+      error: expect.stringContaining('drain'),
+    });
+    expect(vi.mocked(deployMod.deployToHost).mock.calls.map(call => call[1]))
+      .not.toContain(SERVING_2);
+  });
+
+  it('keeps a post-receipt ready failure in the non-canary result', async () => {
+    vi.mocked(haproxyMod.readyServer).mockImplementation(async (_config, host) =>
+      host === SERVING_2
+        ? {
+            success: false,
+            results: [{ host: '198.51.100.20', success: false, error: 'ready rejected' }],
+          }
+        : {
+            success: true,
+            results: [{ host: '198.51.100.20', success: true }],
+          }
+    );
+
+    const result = await executeListrDeployment(
+      parseDeploymentStrategy('sequential'),
+      HOSTS,
+      makeOptions(HOSTS)
+    );
+
+    // Listr's non-canary exitOnError:false must not turn the thrown orchestration
+    // error into a clean context merely because the deploy receipt already exists.
+    expect(result.results.get(SERVING_2)).toMatchObject({
+      success: true,
+      result: { success: true, deployed: true },
+    });
+    expect(result.failed).toBe(1);
+    expect(result.successful).toBe(2);
+    expect(result.aborted).toBe(false);
   });
 });
 
