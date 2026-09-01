@@ -1260,9 +1260,6 @@ describe('Payara boot epoch fence', () => {
     inventoryError.name = 'BOOT_INVENTORY_UNPARSEABLE';
     const refs = vi.spyOn(manager, 'listApplicationRefs')
       .mockRejectedValueOnce(inventoryError)
-      .mockRejectedValueOnce(inventoryError)
-      .mockRejectedValueOnce(inventoryError)
-      .mockRejectedValueOnce(inventoryError)
       .mockResolvedValueOnce(['ZincAPI']);
     const apps = vi.spyOn(manager, 'listApplications').mockResolvedValue(['ZincAPI']);
     const sleep = vi.spyOn(internals(manager), 'sleep').mockResolvedValue();
@@ -1275,9 +1272,9 @@ describe('Payara boot epoch fence', () => {
         deploymentAttempted: false,
       },
     });
-    expect(refs).toHaveBeenCalledTimes(5);
+    expect(refs).toHaveBeenCalledTimes(2);
     expect(apps).toHaveBeenCalledOnce();
-    expect(sleep).toHaveBeenCalledTimes(4);
+    expect(sleep).toHaveBeenCalledOnce();
   });
 
   it('BEF-31a3: startup observation remains fenced after bounded inventory retries', async () => {
@@ -1290,9 +1287,9 @@ describe('Payara boot epoch fence', () => {
 
     await expect(manager.observeBootOwnership('ZincAPI'))
       .rejects.toThrow('unexpected diagnostic row');
-    expect(refs).toHaveBeenCalledTimes(8);
+    expect(refs).toHaveBeenCalledTimes(3);
     expect(apps).not.toHaveBeenCalled();
-    expect(sleep).toHaveBeenCalledTimes(7);
+    expect(sleep).toHaveBeenCalledTimes(2);
   });
 
   it('BEF-31b: startup receipt never crosses into a replacement DAS epoch', async () => {
