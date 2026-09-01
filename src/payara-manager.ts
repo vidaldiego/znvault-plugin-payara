@@ -50,8 +50,11 @@ import {
 const DEFAULT_BOOT_OWNERSHIP_TIMEOUT_MS = 90000;
 const DEFAULT_BOOT_OWNERSHIP_POLL_INTERVAL_MS = 2000;
 const DEFAULT_BOOT_OWNERSHIP_ABSENCE_GRACE_MS = 20000;
-const STARTUP_INVENTORY_MAX_ATTEMPTS = 3;
-const STARTUP_INVENTORY_RETRY_DELAY_MS = 200;
+// Payara 7 can briefly return a successful but non-inventory response while
+// its admin path settles after an agent attach. Keep the parser fail-closed,
+// but allow a finite 14-second retry window inside the shared startup deadline.
+const STARTUP_INVENTORY_MAX_ATTEMPTS = 8;
+const STARTUP_INVENTORY_RETRY_DELAY_MS = 2000;
 const DEFAULT_MUTATION_QUARANTINE_PATH =
   '/var/lib/zn-vault-agent/payara-mutation-quarantine/state.json';
 const COMMAND_OUTPUT_LIMIT_BYTES = 1024 * 1024;
