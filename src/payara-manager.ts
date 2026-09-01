@@ -723,20 +723,23 @@ export class PayaraManager {
       throw err;
     }
     const afterMs = Date.now();
-    const uptimeLine = output
+    const machineReadableLines = output
       .split(/\r?\n/u)
       .map(line => line.trim())
-      .find(Boolean);
-    const legacyMilliseconds = output.match(/Total milliseconds:\s*(\d+)/iu)?.[1];
-    const uptimeToken = uptimeLine && /^\d+$/u.test(uptimeLine)
-      ? uptimeLine
+      .filter(line => /^\d+$/u.test(line));
+    const legacyMilliseconds = [
+      ...output.matchAll(/Total milliseconds:\s*(\d+)/giu),
+    ].map(match => match[1]);
+    const uptimeTokens = machineReadableLines.length > 0
+      ? machineReadableLines
       : legacyMilliseconds;
-    if (!uptimeToken) {
+    if (uptimeTokens.length !== 1) {
       throw bootOwnershipError(
         'BOOT_RUNTIME_IDENTITY_UNPARSEABLE',
         'Unexpected output from uptime'
       );
     }
+    const [uptimeToken] = uptimeTokens;
     const uptimeMs = Number(uptimeToken);
     if (!Number.isSafeInteger(uptimeMs) || uptimeMs < 0) {
       throw bootOwnershipError(

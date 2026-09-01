@@ -787,6 +787,31 @@ describe('Payara boot epoch fence', () => {
     }
   });
 
+  it('BEF-18a2: command status before machine-readable uptime remains parseable', async () => {
+    const manager = makeManager();
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(60_000_000);
+    vi.spyOn(internals(manager), 'asadminCommand').mockResolvedValue(
+      'Command uptime executed successfully.\n53977602\n'
+    );
+
+    try {
+      await expect(internals(manager).readRuntimeStartedAtMs())
+        .resolves.toBe(6_022_398);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('BEF-18a3: ambiguous machine-readable uptime remains fail-closed', async () => {
+    const manager = makeManager();
+    vi.spyOn(internals(manager), 'asadminCommand').mockResolvedValue(
+      '1000\n2000\nCommand uptime executed successfully.\n'
+    );
+
+    await expect(internals(manager).readRuntimeStartedAtMs())
+      .rejects.toThrow('BOOT_RUNTIME_IDENTITY_UNPARSEABLE');
+  });
+
   it('BEF-18b: localized terse uptime cannot silently identify a runtime', async () => {
     const manager = makeManager();
     vi.spyOn(internals(manager), 'asadminCommand')
