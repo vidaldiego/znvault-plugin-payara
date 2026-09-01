@@ -2237,10 +2237,13 @@ export class PayaraManager {
       const inventoryTimeoutMs = deadlineMs === undefined
         ? 10000
         : this.remainingLifecycleBudget(deadlineMs, 'startup application inventory');
-      const [refs, apps] = await Promise.all([
-        this.listApplicationRefs(inventoryTimeoutMs),
-        this.listApplications(inventoryTimeoutMs),
-      ]);
+      // Keep asadmin inventory commands sequential. Payara 7 can return a
+      // diagnostic/non-inventory response when two CLI processes query the
+      // same DAS concurrently during early startup; a strict parser then
+      // correctly fences the boot but cannot classify ownership. The extra
+      // read latency is bounded by the shared startup deadline.
+      const refs = await this.listApplicationRefs(inventoryTimeoutMs);
+      const apps = await this.listApplications(inventoryTimeoutMs);
       if (state.bootEpoch !== expectedBootEpoch) {
         throw bootOwnershipError(
           'BOOT_EPOCH_CHANGED',

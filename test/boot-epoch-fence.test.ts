@@ -1230,6 +1230,30 @@ describe('Payara boot epoch fence', () => {
     }
   });
 
+  it('BEF-31a: startup observation never overlaps Payara inventory commands', async () => {
+    const manager = makeManager();
+    let refsCompleted = false;
+    const refs = vi.spyOn(manager, 'listApplicationRefs').mockImplementation(async () => {
+      await Promise.resolve();
+      refsCompleted = true;
+      return ['ZincAPI'];
+    });
+    const apps = vi.spyOn(manager, 'listApplications').mockImplementation(async () => {
+      if (!refsCompleted) {
+        throw new Error('concurrent asadmin inventory');
+      }
+      return ['ZincAPI'];
+    });
+
+    await expect(manager.observeBootOwnership('ZincAPI')).resolves.toMatchObject({
+      owner: 'payara',
+      runtimeListed: true,
+    });
+    expect(refs).toHaveBeenCalledOnce();
+    expect(apps).toHaveBeenCalledOnce();
+    expect(refs.mock.invocationCallOrder[0]).toBeLessThan(apps.mock.invocationCallOrder[0]);
+  });
+
   it('BEF-31b: startup receipt never crosses into a replacement DAS epoch', async () => {
     let runtimeIdentity = 'startup-receipt-das-a';
     const manager = makeManager({
