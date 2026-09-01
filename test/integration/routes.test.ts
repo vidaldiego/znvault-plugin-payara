@@ -640,12 +640,21 @@ describe('HTTP Routes Integration', () => {
       const bootDeployment = {
         appName: 'TestApp',
         bootEpoch: 'boot-epoch-status',
+        runtimeFingerprint: 'a'.repeat(64),
         phase: 'payara-booting' as const,
         readiness: 'unverified' as const,
         mutationOutcomeUnknown: false,
         startupActive: false,
         startedAt: '2026-08-31T10:00:00.000Z',
         evidenceSource: 'persistent-application-ref',
+        startupReceipt: {
+          outcome: 'boot-owned-skip' as const,
+          deploymentAttempted: false as const,
+          bootEpoch: 'boot-epoch-status',
+          runtimeFingerprint: 'a'.repeat(64),
+          runtimeListed: false,
+          observedAt: '2026-08-31T10:00:01.000Z',
+        },
       };
       vi.spyOn(payaraManager, 'readBootDeploymentStatus').mockResolvedValue(
         bootDeployment,
@@ -674,6 +683,7 @@ describe('HTTP Routes Integration', () => {
       expect(body.pluginVersion).toBe('3.0.0-test');
       expect(body.domain).toBe(mockPayara.domain);
       expect(body.bootDeployment).toEqual(bootDeployment);
+      expect(body.bootDeployment.startupReceipt).toEqual(bootDeployment.startupReceipt);
       expect(payaraManager.readBootDeploymentStatus).toHaveBeenCalledWith(
         'TestApp',
       );

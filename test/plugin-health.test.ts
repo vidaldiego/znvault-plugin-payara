@@ -25,6 +25,7 @@ const runtime: PayaraStatus = {
 const baseBoot: BootDeploymentStatus = {
   appName: 'ZincAPI',
   bootEpoch: 'epoch-1',
+  runtimeFingerprint: 'a'.repeat(64),
   phase: 'ready',
   readiness: 'health-verified',
   owner: 'payara',
@@ -32,6 +33,14 @@ const baseBoot: BootDeploymentStatus = {
   mutationOutcomeUnknown: false,
   startupActive: false,
   startedAt: new Date(0).toISOString(),
+  startupReceipt: {
+    outcome: 'boot-owned-skip',
+    deploymentAttempted: false,
+    bootEpoch: 'epoch-1',
+    runtimeFingerprint: 'a'.repeat(64),
+    runtimeListed: true,
+    observedAt: '2026-09-01T10:00:00.000Z',
+  },
 };
 
 const healthyEvaluation = {
@@ -98,5 +107,23 @@ describe('plugin health deployment fence', () => {
     );
     expect(result.status).toBe('unhealthy');
     expect(result.message).toContain('Payara is stopped');
+  });
+
+  it('PH-05: exposes the exact startup skip receipt in plugin health details', () => {
+    const result = buildHealthStatus(
+      config,
+      runtime,
+      true,
+      baseBoot,
+      healthyEvaluation
+    );
+    expect(result.details?.bootDeployment?.startupReceipt).toEqual({
+      outcome: 'boot-owned-skip',
+      deploymentAttempted: false,
+      bootEpoch: 'epoch-1',
+      runtimeFingerprint: 'a'.repeat(64),
+      runtimeListed: true,
+      observedAt: '2026-09-01T10:00:00.000Z',
+    });
   });
 });

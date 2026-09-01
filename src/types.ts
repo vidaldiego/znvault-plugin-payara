@@ -240,6 +240,17 @@ export type BootDeploymentPhase =
   | 'ready'
   | 'blocked';
 
+/** Immutable evidence that startup observed Payara ownership and skipped deploy. */
+export interface BootStartupReceipt {
+  outcome: 'boot-owned-skip';
+  deploymentAttempted: false;
+  bootEpoch: string;
+  /** SHA-256 token for the exact DAS boot_id/PID/startticks identity. */
+  runtimeFingerprint: string;
+  runtimeListed: boolean;
+  observedAt: string;
+}
+
 /** Read-only status exposed to operators so readiness attestations are epoch-bound. */
 export interface BootDeploymentStatus {
   appName: string;
@@ -256,6 +267,8 @@ export interface BootDeploymentStatus {
   startedAt: string;
   readyAt?: string;
   evidenceSource?: string;
+  /** Startup-only receipt retained for this exact DAS epoch. */
+  startupReceipt?: BootStartupReceipt;
 }
 
 /** Audited external evidence used when no application health endpoint is configured. */

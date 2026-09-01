@@ -610,6 +610,7 @@ export type {
   BootDeploymentPhase,
   BootDeploymentReadiness,
   BootDeploymentStatus,
+  BootStartupReceipt,
   BootReadinessAttestation,
   BootRecoveryAuthorization,
   BootRecoveryResult,

@@ -189,6 +189,15 @@ boot epoch:
   `status=healthy`, and that entry's `details.startupReconciliation=complete`;
 - the authenticated CLI/client read of `/plugins/payara/status` reports
   `pluginVersion=3.x`, `running=true`, `healthy=true`, and `appDeployed=true`;
+- that same fresh authenticated status reports `bootDeployment.owner=payara`,
+  `bootDeployment.phase=ready`, `bootDeployment.readiness=health-verified`,
+  and `bootDeployment.runtimeListed=true`;
+- `bootDeployment.startupReceipt.outcome=boot-owned-skip` and
+  `bootDeployment.startupReceipt.deploymentAttempted=false`, with the receipt's
+  `bootEpoch` and `runtimeFingerprint` exactly equal to the enclosing
+  `bootDeployment` values. A missing or mismatched receipt is a NO-GO; an
+  `agent`-owned recovery boot cannot be used as commissioning evidence and must
+  be followed by a clean Payara-owned boot;
 - the exact domain has one DAS process and a stable runtime fingerprint;
 - the expected persistent reference and runtime application agree;
 - the application readiness endpoint returns 2xx;

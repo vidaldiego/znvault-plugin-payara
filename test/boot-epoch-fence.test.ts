@@ -1132,17 +1132,58 @@ describe('Payara boot epoch fence', () => {
     vi.stubGlobal('fetch', health);
 
     try {
-      await expect(manager.reconcileBootOwnershipWithoutArtifact('ZincAPI'))
-        .resolves.toMatchObject({
-          phase: 'payara-booting',
-          readiness: 'unverified',
-          owner: 'payara',
+      const observed = await manager.reconcileBootOwnershipWithoutArtifact('ZincAPI');
+      expect(observed).toMatchObject({
+        phase: 'payara-booting',
+        readiness: 'unverified',
+        owner: 'payara',
+        runtimeListed: true,
+        startupReceipt: {
+          outcome: 'boot-owned-skip',
+          deploymentAttempted: false,
+          bootEpoch: observed.bootEpoch,
+          runtimeFingerprint: observed.runtimeFingerprint,
           runtimeListed: true,
-        });
+          observedAt: expect.any(String),
+        },
+      });
       expect(health).not.toHaveBeenCalled();
+
+      const promoted = await manager.readBootDeploymentStatus('ZincAPI');
+      expect(promoted).toMatchObject({
+        phase: 'ready',
+        readiness: 'health-verified',
+        startupReceipt: observed.startupReceipt,
+      });
+      expect(health).toHaveBeenCalledOnce();
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('BEF-31b: startup receipt never crosses into a replacement DAS epoch', async () => {
+    let runtimeIdentity = 'startup-receipt-das-a';
+    const manager = makeManager({
+      runtimeIdentityProvider: async () => runtimeIdentity,
+      runtimeIdentitySyncProvider: () => runtimeIdentity,
+    });
+    vi.spyOn(manager, 'listApplicationRefs').mockResolvedValue(['ZincAPI']);
+    vi.spyOn(manager, 'listApplications').mockResolvedValue(['ZincAPI']);
+
+    const observed = await manager.observeBootOwnership('ZincAPI');
+    expect(observed.startupReceipt).toMatchObject({
+      outcome: 'boot-owned-skip',
+      bootEpoch: observed.bootEpoch,
+      runtimeFingerprint: observed.runtimeFingerprint,
+      runtimeListed: true,
+      observedAt: expect.any(String),
+    });
+
+    runtimeIdentity = 'startup-receipt-das-b';
+    const replacement = await manager.readBootDeploymentStatus('ZincAPI');
+    expect(replacement.bootEpoch).not.toBe(observed.bootEpoch);
+    expect(replacement.runtimeFingerprint).not.toBe(observed.runtimeFingerprint);
+    expect(replacement.startupReceipt).toBeUndefined();
   });
 
   it('BEF-32: one-shot recovery is bound to exact epoch/runtime and replaces only ref-present app-absent', async () => {

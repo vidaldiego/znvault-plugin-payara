@@ -23,6 +23,7 @@ import type {
   BootDeploymentOwnership,
   BootDeploymentReadiness,
   BootDeploymentStatus,
+  BootStartupReceipt,
   BootRecoveryAuthorization,
   BootRecoveryResult,
   BootReadinessAttestation,
@@ -259,6 +260,7 @@ interface InternalBootDeploymentState {
   startedAtMs: number;
   readyAtMs?: number;
   evidenceSource?: string;
+  startupReceipt?: BootStartupReceipt;
   owner?: 'payara' | 'agent';
   runtimeListed?: boolean;
   mutationOutcomeUnknown: boolean;
@@ -598,6 +600,9 @@ export class PayaraManager {
       startedAt: new Date(state.startedAtMs).toISOString(),
       ...(state.readyAtMs ? { readyAt: new Date(state.readyAtMs).toISOString() } : {}),
       ...(state.evidenceSource ? { evidenceSource: state.evidenceSource } : {}),
+      ...(state.startupReceipt
+        ? { startupReceipt: { ...state.startupReceipt } }
+        : {}),
     };
   }
 
@@ -685,6 +690,7 @@ export class PayaraManager {
       state.readiness = 'unverified';
       state.startedAtMs = this.currentBootStartedAtMs;
       state.readyAtMs = undefined;
+      state.startupReceipt = undefined;
       if (!preserveUnknownOutcome) {
         state.evidenceSource = evidenceSource;
       }
@@ -2232,12 +2238,27 @@ export class PayaraManager {
       const runtimeListed = apps.includes(appName);
 
       if (referenced) {
+        const runtimeFingerprint = this.runtimeFingerprint();
+        if (!runtimeFingerprint) {
+          throw bootOwnershipError(
+            'BOOT_RUNTIME_IDENTITY_UNKNOWN',
+            `Cannot record startup ownership without the exact ${this.domain} DAS identity`
+          );
+        }
         state.phase = 'payara-booting';
         state.readiness = 'unverified';
         state.owner = 'payara';
         state.runtimeListed = runtimeListed;
         state.reservationToken = undefined;
         state.evidenceSource = 'startup-persistent-reference-observed';
+        state.startupReceipt = {
+          outcome: 'boot-owned-skip',
+          deploymentAttempted: false,
+          bootEpoch: expectedBootEpoch,
+          runtimeFingerprint,
+          runtimeListed,
+          observedAt: new Date().toISOString(),
+        };
         return this.getBootDeploymentStatus(appName);
       }
 

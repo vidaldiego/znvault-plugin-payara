@@ -13,7 +13,7 @@ Payara application server management plugin for ZnVault Agent and CLI. Enables i
 ## Installation
 
 ```bash
-npm install @zincapp/znvault-plugin-payara@3.0.0
+npm install @zincapp/znvault-plugin-payara@3.0.1
 ```
 
 Plugin 3 requires Agent 2 and is initially fenced under the isolated `dr-m4`
@@ -384,7 +384,7 @@ Get current Payara status.
 
 ```json
 {
-  "pluginVersion": "3.0.0",
+  "pluginVersion": "3.0.1",
   "running": true,
   "healthy": true,
   "domain": "domain1"
@@ -1376,9 +1376,12 @@ Before a one-node reboot canary:
    requests; their loopback/SSH boundary is node-local trust, not cryptographic
    proof of the human GO.
 5. Obtain an exact named production GO for one serving-node reboot canary. During
-   boot, require `boot-owned-skip`, `deploymentAttempted=false`, zero explicit
-   undeploy/deploy from the plugin, one DAS, `bootDeployment.phase=ready`,
-   `readiness=health-verified`, and application/KMS readiness 2xx.
+   boot, require `bootDeployment.startupReceipt.outcome=boot-owned-skip`,
+   `bootDeployment.startupReceipt.deploymentAttempted=false`, and receipt
+   `bootEpoch`/`runtimeFingerprint` equality with the enclosing boot status.
+   Also require zero explicit undeploy/deploy from the plugin, one DAS,
+   `bootDeployment.phase=ready`, `readiness=health-verified`, and application/KMS
+   readiness 2xx. A missing receipt or an epoch/fingerprint mismatch is a NO-GO.
 6. Hold the canary through the normal monitoring window, then roll one node at a
    time. Stop immediately on `UNKNOWN`, retained/quarantined lock, duplicate DAS,
    contradictory inventory, non-ready health, or version drift.
@@ -1392,6 +1395,13 @@ is a recovery incident, not authorization to downgrade.
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v3.0.1 — 2026-09-01
+- **Auditable clean-start receipt.** A Payara-owned startup observation now
+  publishes `bootDeployment.startupReceipt` through both plugin health and the
+  authenticated status route. The receipt binds `boot-owned-skip` and
+  `deploymentAttempted=false` to the exact boot epoch and hashed DAS runtime
+  identity, and is cleared whenever a replacement runtime rotates the epoch.
 
 ### v3.0.0 — 2026-08-31
 - **Payara boot single-writer fence.** Startup now records a unique boot epoch,

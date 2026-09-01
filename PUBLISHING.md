@@ -116,7 +116,8 @@ reproduce that source snapshot, never publish an independently packed directory.
 After publishing, verify:
 
 1. **npm page**: https://www.npmjs.com/package/@zincapp/znvault-plugin-payara
-2. **Exact version**: `3.0.0` resolves under `dr-m4`
+2. **Exact version**: the version matching the pushed `v$RELEASE_VERSION` tag
+   resolves under `dr-m4`
 3. **Dist-tags**: `latest` remains on the prior production-compatible release
 4. **Provenance badge**: Should show "Provenance" badge on npm
 5. **GitHub release**: Should be created automatically and must not be latest
