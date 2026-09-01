@@ -184,8 +184,10 @@ describe('PayaraManager Integration', () => {
         .mockResolvedValueOnce(true)      // guard: domain is running → proceed
         .mockResolvedValue(false);        // wait: admin port closed by stop-domain
       // asadmin stop-domain succeeds (no-op for the test).
-      vi.spyOn(
-        manager as unknown as { asadminCommand: (args: string[]) => Promise<string> },
+      const asadminSpy = vi.spyOn(
+        manager as unknown as {
+          asadminCommand: (args: string[], timeoutMs?: number) => Promise<string>;
+        },
         'asadminCommand'
       ).mockImplementation(async args =>
         args[0] === 'list-domains' ? `${mockPayara.domain} not running\n` : ''
@@ -212,6 +214,10 @@ describe('PayaraManager Integration', () => {
       // stop() must use the strict PID probe until the JVM drains to empty.
       expect(pidSpy).toHaveBeenCalled();
       expect(pollCount).toBeGreaterThanOrEqual(3);
+      expect(asadminSpy).toHaveBeenCalledWith(
+        ['stop-domain', '--timeout=120', mockPayara.domain],
+        130_000
+      );
       isRunningSpy.mockRestore();
       pidSpy.mockRestore();
     });

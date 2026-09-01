@@ -54,6 +54,7 @@ const STARTUP_INVENTORY_MAX_ATTEMPTS = 3;
 const STARTUP_INVENTORY_RETRY_DELAY_MS = 200;
 const DEFAULT_MUTATION_QUARANTINE_PATH =
   '/var/lib/zn-vault-agent/payara-mutation-quarantine/state.json';
+const ASADMIN_STOP_CLIENT_GRACE_MS = 10_000;
 const COMMAND_OUTPUT_LIMIT_BYTES = 1024 * 1024;
 const COMMAND_TERMINATION_GRACE_MS = 250;
 const COMMAND_TERMINAL_WAIT_MS = 1000;
@@ -1622,7 +1623,20 @@ export class PayaraManager {
     this.logger.info({ domain: this.domain }, 'Stopping Payara domain');
 
     try {
-      await this.asadminCommand(['stop-domain', this.domain]);
+      // Payara's stop-domain subcommand has its own 60-second default timeout.
+      // Thread the configured lifecycle budget into the subcommand as well as
+      // the client process, otherwise a healthy but slow JVM shutdown becomes
+      // an ambiguous dispatched operation while our outer budget still has
+      // time remaining. The client gets only a bounded transport grace so it
+      // can receive Payara's terminal response at the timeout edge.
+      const stopTimeoutSeconds = Math.max(
+        1,
+        Math.ceil(this.operationTimeout / 1000)
+      );
+      await this.asadminCommand(
+        ['stop-domain', `--timeout=${stopTimeoutSeconds}`, this.domain],
+        this.operationTimeout + ASADMIN_STOP_CLIENT_GRACE_MS
+      );
     } catch (err) {
       // A rejected client can still complete remotely, so even a momentary
       // stopped observation cannot authorize a successor DAS under this lock.
