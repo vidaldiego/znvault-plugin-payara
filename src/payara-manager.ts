@@ -323,6 +323,7 @@ function parseTerseApplicationNames(
 export class PayaraManager {
   private readonly payaraHome: string;
   private readonly domainRoot: string;
+  private readonly asadminClientDir: string;
   private readonly asadmin: string;
   readonly domain: string;
   private readonly user: string;
@@ -386,6 +387,10 @@ export class PayaraManager {
     } catch {
       this.domainRoot = resolvedDomainRoot;
     }
+    // systemd may hide the target account's real HOME with ProtectHome=yes.
+    // Keep Payara's client cache inside the already protected domain config
+    // directory so command-model diagnostics never contaminate stdout.
+    this.asadminClientDir = join(this.domainRoot, 'config', '.gfclient');
     this.domain = options.domain;
     this.user = options.user;
     this.healthEndpoint = options.healthEndpoint;
@@ -1282,7 +1287,10 @@ export class PayaraManager {
     acceptedExitCodes: readonly number[] = [0]
   ): Promise<{ stdout: string; stderr: string }> {
     const effectiveTimeout = timeout ?? this.operationTimeout;
-    const processEnvironment = buildPayaraProcessEnv();
+    const processEnvironment: NodeJS.ProcessEnv = {
+      ...buildPayaraProcessEnv(),
+      AS_GFCLIENT: this.asadminClientDir,
+    };
     const javaHome = processEnvironment.JAVA_HOME;
     if (!javaHome) {
       throw new Error('JAVA_HOME is unavailable for Payara command execution');
@@ -1298,6 +1306,7 @@ export class PayaraManager {
           this.user,
           '/usr/bin/env',
           `JAVA_HOME=${javaHome}`,
+          `AS_GFCLIENT=${this.asadminClientDir}`,
           command,
           ...args,
         ]

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import pino from 'pino';
@@ -33,7 +33,7 @@ describe('Payara command target-user environment', () => {
     spawnMock.mockReset();
   });
 
-  it('sets HOME to the Payara account before invoking its admin CLI', async () => {
+  it('binds the Payara client cache to the protected domain config directory', async () => {
     const root = mkdtempSync(join(tmpdir(), 'payara-command-home-'));
     const targetUser = userInfo().username === 'payara' ? 'payara-alt' : 'payara';
     try {
@@ -68,15 +68,29 @@ describe('Payara command target-user environment', () => {
       );
 
       expect(spawnMock).toHaveBeenCalledOnce();
-      const [command, args] = spawnMock.mock.calls[0] as [string, string[]];
+      const [command, args, options] = spawnMock.mock.calls[0] as [
+        string,
+        string[],
+        { env: NodeJS.ProcessEnv },
+      ];
       expect(command).toBe('/usr/bin/sudo');
-      expect(args.slice(0, 5)).toEqual([
+      const clientDir = join(
+        realpathSync(root),
+        'glassfish',
+        'domains',
+        'production',
+        'config',
+        '.gfclient'
+      );
+      expect(args.slice(0, 6)).toEqual([
         '-H',
         '-u',
         targetUser,
         '/usr/bin/env',
         expect.stringMatching(/^JAVA_HOME=\//),
+        `AS_GFCLIENT=${clientDir}`,
       ]);
+      expect(options.env.AS_GFCLIENT).toBe(clientDir);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
