@@ -1254,6 +1254,44 @@ describe('Payara boot epoch fence', () => {
     expect(refs.mock.invocationCallOrder[0]).toBeLessThan(apps.mock.invocationCallOrder[0]);
   });
 
+  it('BEF-31a2: startup observation retries a transient strict inventory rejection', async () => {
+    const manager = makeManager();
+    const inventoryError = new Error('unexpected diagnostic row');
+    inventoryError.name = 'BOOT_INVENTORY_UNPARSEABLE';
+    const refs = vi.spyOn(manager, 'listApplicationRefs')
+      .mockRejectedValueOnce(inventoryError)
+      .mockResolvedValueOnce(['ZincAPI']);
+    const apps = vi.spyOn(manager, 'listApplications').mockResolvedValue(['ZincAPI']);
+    const sleep = vi.spyOn(internals(manager), 'sleep').mockResolvedValue();
+
+    await expect(manager.observeBootOwnership('ZincAPI')).resolves.toMatchObject({
+      owner: 'payara',
+      runtimeListed: true,
+      startupReceipt: {
+        outcome: 'boot-owned-skip',
+        deploymentAttempted: false,
+      },
+    });
+    expect(refs).toHaveBeenCalledTimes(2);
+    expect(apps).toHaveBeenCalledOnce();
+    expect(sleep).toHaveBeenCalledOnce();
+  });
+
+  it('BEF-31a3: startup observation remains fenced after bounded inventory retries', async () => {
+    const manager = makeManager();
+    const inventoryError = new Error('unexpected diagnostic row');
+    inventoryError.name = 'BOOT_INVENTORY_UNPARSEABLE';
+    const refs = vi.spyOn(manager, 'listApplicationRefs').mockRejectedValue(inventoryError);
+    const apps = vi.spyOn(manager, 'listApplications');
+    const sleep = vi.spyOn(internals(manager), 'sleep').mockResolvedValue();
+
+    await expect(manager.observeBootOwnership('ZincAPI'))
+      .rejects.toThrow('unexpected diagnostic row');
+    expect(refs).toHaveBeenCalledTimes(3);
+    expect(apps).not.toHaveBeenCalled();
+    expect(sleep).toHaveBeenCalledTimes(2);
+  });
+
   it('BEF-31b: startup receipt never crosses into a replacement DAS epoch', async () => {
     let runtimeIdentity = 'startup-receipt-das-a';
     const manager = makeManager({

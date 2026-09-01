@@ -50,6 +50,8 @@ import {
 const DEFAULT_BOOT_OWNERSHIP_TIMEOUT_MS = 90000;
 const DEFAULT_BOOT_OWNERSHIP_POLL_INTERVAL_MS = 2000;
 const DEFAULT_BOOT_OWNERSHIP_ABSENCE_GRACE_MS = 20000;
+const STARTUP_INVENTORY_MAX_ATTEMPTS = 3;
+const STARTUP_INVENTORY_RETRY_DELAY_MS = 200;
 const DEFAULT_MUTATION_QUARANTINE_PATH =
   '/var/lib/zn-vault-agent/payara-mutation-quarantine/state.json';
 const COMMAND_OUTPUT_LIMIT_BYTES = 1024 * 1024;
@@ -2234,16 +2236,55 @@ export class PayaraManager {
         );
       }
       const expectedBootEpoch = state.bootEpoch;
-      const inventoryTimeoutMs = deadlineMs === undefined
-        ? 10000
-        : this.remainingLifecycleBudget(deadlineMs, 'startup application inventory');
       // Keep asadmin inventory commands sequential. Payara 7 can return a
       // diagnostic/non-inventory response when two CLI processes query the
       // same DAS concurrently during early startup; a strict parser then
       // correctly fences the boot but cannot classify ownership. The extra
       // read latency is bounded by the shared startup deadline.
-      const refs = await this.listApplicationRefs(inventoryTimeoutMs);
-      const apps = await this.listApplications(inventoryTimeoutMs);
+      let refs: string[] | undefined;
+      let apps: string[] | undefined;
+      for (let attempt = 1; attempt <= STARTUP_INVENTORY_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          const refsTimeoutMs = deadlineMs === undefined
+            ? 10000
+            : this.remainingLifecycleBudget(deadlineMs, 'startup application refs');
+          refs = await this.listApplicationRefs(refsTimeoutMs);
+          const appsTimeoutMs = deadlineMs === undefined
+            ? 10000
+            : this.remainingLifecycleBudget(deadlineMs, 'startup runtime applications');
+          apps = await this.listApplications(appsTimeoutMs);
+          break;
+        } catch (err) {
+          const retryable = err instanceof Error
+            && err.name === 'BOOT_INVENTORY_UNPARSEABLE';
+          if (!retryable || attempt === STARTUP_INVENTORY_MAX_ATTEMPTS) {
+            throw err;
+          }
+          this.logger.warn(
+            { appName, attempt, maxAttempts: STARTUP_INVENTORY_MAX_ATTEMPTS },
+            'Startup inventory was not parseable; retrying strict read'
+          );
+          this.requireLifecycleBudget(
+            deadlineMs,
+            10000 + STARTUP_INVENTORY_RETRY_DELAY_MS,
+            'startup inventory retry identity'
+          );
+          await this.sleep(STARTUP_INVENTORY_RETRY_DELAY_MS);
+          await this.synchronizeRuntimeEpochUnlocked();
+          if (state.bootEpoch !== expectedBootEpoch) {
+            throw bootOwnershipError(
+              'BOOT_EPOCH_CHANGED',
+              `Boot epoch changed while retrying startup inventory for ${appName}`
+            );
+          }
+        }
+      }
+      if (!refs || !apps) {
+        throw bootOwnershipError(
+          'BOOT_INVENTORY_UNPARSEABLE',
+          `Startup inventory for ${appName} did not produce a strict result`
+        );
+      }
       if (state.bootEpoch !== expectedBootEpoch) {
         throw bootOwnershipError(
           'BOOT_EPOCH_CHANGED',

@@ -13,7 +13,7 @@ Payara application server management plugin for ZnVault Agent and CLI. Enables i
 ## Installation
 
 ```bash
-npm install @zincapp/znvault-plugin-payara@3.0.4
+npm install @zincapp/znvault-plugin-payara@3.0.5
 ```
 
 Plugin 3 requires Agent 2 and is initially fenced under the isolated `dr-m4`
@@ -384,7 +384,7 @@ Get current Payara status.
 
 ```json
 {
-  "pluginVersion": "3.0.4",
+  "pluginVersion": "3.0.5",
   "running": true,
   "healthy": true,
   "domain": "domain1"
@@ -1395,6 +1395,12 @@ is a recovery incident, not authorization to downgrade.
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v3.0.5 — 2026-09-01
+- **Bounded strict inventory retry.** A transient unparseable Payara 7 startup
+  inventory response is retried at most twice. Every retry stays sequential,
+  revalidates the exact DAS epoch, remains inside the startup deadline, and
+  never relaxes the inventory parser or authorizes a mutation.
 
 ### v3.0.4 — 2026-09-01
 - **Serialized startup inventory.** Startup now reads persistent application
