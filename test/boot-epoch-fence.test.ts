@@ -22,6 +22,7 @@ interface PayaraManagerInternals {
   getPayaraProcessPidsStrict: () => Promise<number[]>;
   minimumBootOwnershipAbsenceGraceMs: () => number;
   monotonicNowMs: () => number;
+  readRuntimeStartedAtMs: () => Promise<number | undefined>;
   sleep: (ms: number) => Promise<void>;
   waitForRunning: (timeoutMs: number) => Promise<void>;
   writeSetenvConfInternal: () => Promise<void>;
@@ -766,6 +767,49 @@ describe('Payara boot epoch fence', () => {
 
     await expect(identityInternals.readRuntimeIdentity())
       .rejects.toThrow('BOOT_RUNTIME_IDENTITY_CHANGED_DURING_PROBE');
+  });
+
+  it('BEF-18a: runtime identity requests Payara machine-readable uptime', async () => {
+    const manager = makeManager();
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(60_000_000);
+    const command = vi.spyOn(internals(manager), 'asadminCommand')
+      .mockResolvedValue('53977602\nCommand uptime executed successfully.\n');
+
+    try {
+      await expect(internals(manager).readRuntimeStartedAtMs())
+        .resolves.toBe(6_022_398);
+      expect(command).toHaveBeenCalledWith(
+        ['uptime', '--milliseconds=true'],
+        10000
+      );
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it('BEF-18b: localized terse uptime cannot silently identify a runtime', async () => {
+    const manager = makeManager();
+    vi.spyOn(internals(manager), 'asadminCommand')
+      .mockResolvedValue('Up 14 hrs 58 mins\nCommand uptime executed successfully.\n');
+
+    await expect(internals(manager).readRuntimeStartedAtMs())
+      .rejects.toThrow('BOOT_RUNTIME_IDENTITY_UNPARSEABLE');
+  });
+
+  it('BEF-18c: legacy explicit total milliseconds remains accepted', async () => {
+    const manager = makeManager();
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(5_000);
+    vi.spyOn(internals(manager), 'asadminCommand').mockResolvedValue(
+      'Uptime: 0 days, 0 hours, 0 minutes, 1 seconds, Total milliseconds: 1000\n' +
+      'Command uptime executed successfully.\n'
+    );
+
+    try {
+      await expect(internals(manager).readRuntimeStartedAtMs())
+        .resolves.toBe(4_000);
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it('BEF-19: a strict PID inventory failure cannot authorize start-domain', async () => {

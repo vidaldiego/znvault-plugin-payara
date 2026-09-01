@@ -712,7 +712,10 @@ export class PayaraManager {
     const beforeMs = Date.now();
     let output: string;
     try {
-      output = await this.asadminCommand(['uptime'], 10000);
+      // Payara 7 renders the default duration as a localized terse string
+      // (for example, "Up 14 hrs 58 mins"). Request the command's stable
+      // machine-readable form instead of parsing presentation text.
+      output = await this.asadminCommand(['uptime', '--milliseconds=true'], 10000);
     } catch (err) {
       if (!(await this.isRunningStrict())) {
         return undefined;
@@ -720,14 +723,21 @@ export class PayaraManager {
       throw err;
     }
     const afterMs = Date.now();
-    const match = output.match(/Total milliseconds:\s*(\d+)/i);
-    if (!match?.[1]) {
+    const uptimeLine = output
+      .split(/\r?\n/u)
+      .map(line => line.trim())
+      .find(Boolean);
+    const legacyMilliseconds = output.match(/Total milliseconds:\s*(\d+)/iu)?.[1];
+    const uptimeToken = uptimeLine && /^\d+$/u.test(uptimeLine)
+      ? uptimeLine
+      : legacyMilliseconds;
+    if (!uptimeToken) {
       throw bootOwnershipError(
         'BOOT_RUNTIME_IDENTITY_UNPARSEABLE',
         'Unexpected output from uptime'
       );
     }
-    const uptimeMs = Number(match[1]);
+    const uptimeMs = Number(uptimeToken);
     if (!Number.isSafeInteger(uptimeMs) || uptimeMs < 0) {
       throw bootOwnershipError(
         'BOOT_RUNTIME_IDENTITY_UNPARSEABLE',

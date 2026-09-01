@@ -13,7 +13,7 @@ Payara application server management plugin for ZnVault Agent and CLI. Enables i
 ## Installation
 
 ```bash
-npm install @zincapp/znvault-plugin-payara@3.0.1
+npm install @zincapp/znvault-plugin-payara@3.0.2
 ```
 
 Plugin 3 requires Agent 2 and is initially fenced under the isolated `dr-m4`
@@ -384,7 +384,7 @@ Get current Payara status.
 
 ```json
 {
-  "pluginVersion": "3.0.1",
+  "pluginVersion": "3.0.2",
   "running": true,
   "healthy": true,
   "domain": "domain1"
@@ -1395,6 +1395,13 @@ is a recovery incident, not authorization to downgrade.
 See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Python-based zinc_updater.
 
 ## Changelog
+
+### v3.0.2 — 2026-09-01
+- **Payara 7 runtime identity.** The boot fence now requests `uptime` in its
+  machine-readable millisecond form, avoiding localized terse output such as
+  `Up 14 hrs 58 mins` while preserving the older explicit `Total milliseconds`
+  response as a compatibility fallback and keeping runtime identification
+  fail-closed.
 
 ### v3.0.1 — 2026-09-01
 - **Auditable clean-start receipt.** A Payara-owned startup observation now

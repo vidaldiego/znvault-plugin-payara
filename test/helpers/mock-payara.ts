@@ -170,7 +170,11 @@ case "$COMMAND" in
 
   uptime)
     if [ "$RUNNING" = "true" ]; then
-      echo "Uptime: 0 days, 0 hours, 0 minutes, 1 seconds, Total milliseconds: 1000"
+      if [[ " $* " != *" --milliseconds=true "* ]]; then
+        echo "Machine-readable uptime was not requested." >&2
+        exit 1
+      fi
+      echo "1000"
       echo "Command uptime executed successfully."
       exit 0
     fi
