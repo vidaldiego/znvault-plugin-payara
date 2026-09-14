@@ -248,8 +248,11 @@ export async function writeSetenvConf(
   validatePathArgument(payaraHome, 'payaraHome');
   validatePayaraIdentifier(domain, 'Payara domain');
 
+  // Preserve the historical contract for installations that do not ask this
+  // plugin to manage any secrets. An empty in-memory map is not evidence that
+  // an existing setenv.conf is plugin-owned or safe to erase.
   if (Object.keys(environment).length === 0) {
-    logger.debug('No environment variables to write');
+    logger.debug('No managed environment variables to write');
     return;
   }
 

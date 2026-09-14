@@ -121,6 +121,21 @@ describe('atomic setenv.conf replacement', () => {
     }
   });
 
+  it('preserves an existing setenv.conf when no managed environment was supplied', async () => {
+    await writeSetenvConf(
+      {},
+      {
+        payaraHome: '/opt/payara',
+        domain: 'zincapi',
+        user: 'payara',
+        logger: pino({ level: 'silent' }),
+      },
+    );
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(stdin).toBe('');
+  });
+
   it.each(['BAD-NAME', '1BAD', 'BAD$(id)'])(
     'rejects invalid environment variable name %s before spawning',
     async (key) => {
