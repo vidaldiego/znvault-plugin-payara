@@ -7,6 +7,11 @@ import { DeploymentLock, type LockData } from '../src/deployment-lock.js';
 
 describe('DeploymentLock', () => {
   const logger = pino({ level: 'silent' });
+  const outageScope = {
+    outageOwnerId: '11111111-1111-4111-8111-111111111111',
+    targetContentSha256: 'a'.repeat(64),
+    outageCapabilitySha256: 'b'.repeat(64),
+  };
   let testDir: string;
   let lockPath: string;
   let locks: DeploymentLock[];
@@ -113,7 +118,7 @@ describe('DeploymentLock', () => {
     expect(inspection).not.toHaveProperty('stale');
   });
 
-  it('reports a dead-owner lock as stale but refuses automatic takeover', async () => {
+  it('reports a dead-owner lock as stale but requires scoped recovery evidence', async () => {
     const deadPid = 987654321;
     vi.spyOn(process, 'kill').mockImplementation((pid, signal) => {
       if (pid === deadPid && signal === 0) {
@@ -122,11 +127,15 @@ describe('DeploymentLock', () => {
       return true;
     });
     const stale: LockData = {
+      lockVersion: 2,
       pid: deadPid,
+      processInstanceId: '11111111-1111-4111-8111-111111111111',
       started: Date.now() - 700_000,
       deploymentId: 'dead-owner-deployment',
       step: 'deploy',
-      ownerToken: 'dead-owner-token',
+      ownerToken: '22222222-2222-4222-8222-222222222222',
+      ownerKind: 'payara-outage',
+      ...outageScope,
     };
     await writeFile(lockPath, JSON.stringify(stale));
 
@@ -140,6 +149,73 @@ describe('DeploymentLock', () => {
     await expect(contender.acquire('replacement'))
       .rejects.toThrow('STALE_DEPLOYMENT_LOCK');
     expect(await readLock()).toEqual(stale);
+
+    const authorize = vi.fn(async () => undefined);
+    await expect(contender.acquire('replacement', {
+      outageScope,
+      authorizeStaleTakeover: authorize,
+    })).resolves.toBeUndefined();
+    expect(authorize).toHaveBeenCalledOnce();
+    expect(await readLock()).toMatchObject({
+      pid: process.pid,
+      deploymentId: 'replacement',
+      ownerToken: expect.any(String),
+      processInstanceId: expect.any(String),
+    });
+  });
+
+  it('recognizes a recycled current PID by its different process incarnation', async () => {
+    const recycled: LockData = {
+      lockVersion: 2,
+      pid: process.pid,
+      processInstanceId: '11111111-1111-4111-8111-111111111111',
+      started: Date.now() - 1_000,
+      deploymentId: 'previous-process-with-recycled-pid',
+      step: 'verify',
+      ownerToken: '22222222-2222-4222-8222-222222222222',
+      ownerKind: 'payara-outage',
+      ...outageScope,
+    };
+    await writeFile(lockPath, JSON.stringify(recycled));
+    const contender = makeLock();
+
+    await expect(contender.isLocked()).resolves.toMatchObject({
+      locked: false,
+      stale: true,
+      data: recycled,
+    });
+    await expect(contender.acquire(
+      'pid-reuse-recovery',
+      { outageScope, authorizeStaleTakeover: async () => undefined },
+    )).resolves.toBeUndefined();
+    expect(await readLock()).toMatchObject({
+      pid: process.pid,
+      deploymentId: 'pid-reuse-recovery',
+      processInstanceId: expect.not.stringMatching(/^11111111-/u),
+    });
+  });
+
+  it('never uses outage evidence to replace a stale general or legacy lock', async () => {
+    const staleGeneral: LockData = {
+      lockVersion: 2,
+      pid: process.pid,
+      processInstanceId: '11111111-1111-4111-8111-111111111111',
+      started: Date.now() - 1_000,
+      deploymentId: 'agent-secret-reload',
+      step: 'verify',
+      ownerToken: '22222222-2222-4222-8222-222222222222',
+      ownerKind: 'general',
+    };
+    await writeFile(lockPath, JSON.stringify(staleGeneral));
+    const contender = makeLock();
+    const authorize = vi.fn(async () => undefined);
+
+    await expect(contender.acquire('outage-recovery', {
+      outageScope,
+      authorizeStaleTakeover: authorize,
+    })).rejects.toThrow('STALE_DEPLOYMENT_LOCK_SCOPE_MISMATCH');
+    expect(authorize).not.toHaveBeenCalled();
+    expect(await readLock()).toEqual(staleGeneral);
   });
 
   it('updates the acquired inode and removes it on a normal release', async () => {
@@ -231,7 +307,7 @@ describe('DeploymentLock', () => {
   );
 
   it.each(['release', 'quarantine'] as const)(
-    'defers SIGTERM after O_EXCL during initialization, then %ss safely and replays once',
+    'keeps partial initialization private, then %ss safely and replays SIGTERM once',
     async completion => {
       const originalHandler = vi.fn();
       process.on('SIGTERM', originalHandler);
@@ -252,7 +328,7 @@ describe('DeploymentLock', () => {
       try {
         const acquisition = lock.acquire(`initializing-${completion}`);
         await gate.entered;
-        await expect(stat(lockPath)).resolves.toBeDefined();
+        await expect(stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
 
         process.emit('SIGTERM', 'SIGTERM');
         expect(lock.isPendingShutdown()).toBe(true);
@@ -337,13 +413,16 @@ describe('DeploymentLock', () => {
     const lock = makeLock();
     const gate = makeGate();
     const internals = lock as unknown as {
-      handleExistingLock(attempt: number): Promise<boolean>;
+      replaceStaleLock(
+        replacementData: LockData,
+        options: unknown,
+      ): Promise<unknown>;
     };
-    const originalHandleExisting = internals.handleExistingLock.bind(lock);
-    vi.spyOn(internals, 'handleExistingLock').mockImplementation(async attempt => {
+    const originalReplaceStaleLock = internals.replaceStaleLock.bind(lock);
+    vi.spyOn(internals, 'replaceStaleLock').mockImplementation(async (...args) => {
       gate.markEntered();
       await gate.resume;
-      return originalHandleExisting(attempt);
+      return originalReplaceStaleLock(...args);
     });
 
     try {

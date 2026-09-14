@@ -2,22 +2,51 @@
 // File-based deployment lock with shutdown-signal deferral
 
 import { randomUUID } from 'node:crypto';
-import { open, rename, rm, stat } from 'node:fs/promises';
+import { link, open, rename, rm, stat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import type { Stats } from 'node:fs';
+import { dirname } from 'node:path';
 import type { Logger } from 'pino';
+import {
+  currentProcessOwnerEvidence,
+  ProcessEpochMutex,
+  processOwnerIsAlive,
+  type ProcessEpochLease,
+  type ProcessEpochMutexOptions,
+} from './process-epoch-mutex.js';
 
 export interface LockData {
+  /** Version 2 binds automatic recovery to one exact Payara fleet outage. */
+  lockVersion?: 2;
   pid: number;
   started: number;
   deploymentId: string;
   step: DeploymentStep;
   /** Unique acquisition identity. Absent only on legacy lock files. */
   ownerToken?: string;
+  /** Distinguishes a recycled PID from the process that created this lock. */
+  processInstanceId?: string;
+  /** Linux boot-id plus /proc start ticks, when available. */
+  processIdentity?: string;
+  ownerKind?: 'general' | 'payara-outage';
+  outageOwnerId?: string;
+  targetContentSha256?: string;
+  outageCapabilitySha256?: string;
   /** Durable fail-closed lifecycle quarantine metadata. */
   quarantined?: true;
   reason?: string;
   errorName?: string;
+}
+
+export interface DeploymentLockOutageScope {
+  outageOwnerId: string;
+  targetContentSha256: string;
+  outageCapabilitySha256: string;
+}
+
+export interface DeploymentLockAcquireOptions {
+  outageScope?: DeploymentLockOutageScope;
+  authorizeStaleTakeover?: (staleLock: Readonly<LockData>) => void | Promise<void>;
 }
 
 export type DeploymentStep =
@@ -53,6 +82,9 @@ const ACQUIRE_ATTEMPTS = 8;
 const ACQUIRE_RETRY_MS = 10;
 const INCOMPLETE_LOCK_GRACE_MS = 1_000;
 const MAX_LOCK_BYTES = 64 * 1024;
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const DEFERRED_SIGNALS = ['SIGTERM', 'SIGINT'] as const;
 const PROCESS_SIGNAL_DEFERRAL_KEY = Symbol.for(
   '@zincapp/znvault-mutation-signal-deferral/v1'
@@ -240,14 +272,50 @@ const parseLockData = (raw: string): LockData | undefined => {
       value.deploymentId.length === 0 ||
       typeof value.step !== 'string' ||
       !DEPLOYMENT_STEPS.has(value.step as DeploymentStep) ||
+      (value.lockVersion !== undefined && value.lockVersion !== 2) ||
       (value.ownerToken !== undefined &&
         (typeof value.ownerToken !== 'string' || value.ownerToken.length === 0)) ||
+      (value.processInstanceId !== undefined &&
+        (typeof value.processInstanceId !== 'string'
+          || !/^[0-9a-f-]{36}$/u.test(value.processInstanceId))) ||
+      (value.processIdentity !== undefined &&
+        (typeof value.processIdentity !== 'string' || value.processIdentity.length > 256)) ||
+      (value.ownerKind !== undefined
+        && value.ownerKind !== 'general' && value.ownerKind !== 'payara-outage') ||
+      (value.outageOwnerId !== undefined
+        && (typeof value.outageOwnerId !== 'string' || !UUID_V4_PATTERN.test(value.outageOwnerId))) ||
+      (value.targetContentSha256 !== undefined
+        && (typeof value.targetContentSha256 !== 'string'
+          || !SHA256_PATTERN.test(value.targetContentSha256))) ||
+      (value.outageCapabilitySha256 !== undefined
+        && (typeof value.outageCapabilitySha256 !== 'string'
+          || !SHA256_PATTERN.test(value.outageCapabilitySha256))) ||
       (value.quarantined !== undefined && value.quarantined !== true) ||
       (value.reason !== undefined &&
         (typeof value.reason !== 'string' || value.reason.length === 0 || value.reason.length > 512)) ||
       (value.errorName !== undefined &&
         (typeof value.errorName !== 'string' || value.errorName.length === 0 || value.errorName.length > 128))
     ) {
+      return undefined;
+    }
+
+    if (value.lockVersion === 2) {
+      if (!value.processInstanceId
+        || !value.ownerToken || !/^[0-9a-f-]{36}$/u.test(value.ownerToken)
+        || (value.ownerKind !== 'general' && value.ownerKind !== 'payara-outage')) {
+        return undefined;
+      }
+      if (value.ownerKind === 'general') {
+        if (value.outageOwnerId || value.targetContentSha256 || value.outageCapabilitySha256) {
+          return undefined;
+        }
+      } else if (!value.outageOwnerId
+        || !value.targetContentSha256
+        || !value.outageCapabilitySha256) {
+        return undefined;
+      }
+    } else if (value.ownerKind || value.outageOwnerId
+      || value.targetContentSha256 || value.outageCapabilitySha256) {
       return undefined;
     }
 
@@ -274,10 +342,19 @@ export class DeploymentLock {
   private ownedData: LockData | null = null;
   private ownedIdentity: FileIdentity | null = null;
   private ownedHandle: FileHandle | null = null;
+  private readonly coordinationMutex: ProcessEpochMutex;
+  private readonly processOwnerOptions: ProcessEpochMutexOptions;
+  private coordinationLease: ProcessEpochLease | null = null;
 
-  constructor(logger: Logger, lockPath = '/var/lib/zn-vault-agent/znvault-deploy.lock') {
+  constructor(
+    logger: Logger,
+    lockPath = '/var/lib/zn-vault-agent/znvault-deploy.lock',
+    coordinationOptions: ProcessEpochMutexOptions = {},
+  ) {
     this.lockPath = lockPath;
     this.logger = logger;
+    this.processOwnerOptions = coordinationOptions;
+    this.coordinationMutex = new ProcessEpochMutex(lockPath, coordinationOptions);
   }
 
   /** Check whether the lock exists and is valid. */
@@ -320,17 +397,34 @@ export class DeploymentLock {
    * Throws if another deployment is in progress or contention cannot be
    * resolved within a bounded number of retries.
    */
-  async acquire(deploymentId: string): Promise<void> {
+  async acquire(
+    deploymentId: string,
+    options: DeploymentLockAcquireOptions = {},
+  ): Promise<void> {
     if (this.acquired || this.ownedHandle || this.currentDeploymentId !== null) {
       throw new Error(`Deployment lock instance already acquired by ${this.currentDeploymentId}`);
     }
+    if (options.authorizeStaleTakeover && !options.outageScope) {
+      throw new Error('DEPLOYMENT_LOCK_RECOVERY_SCOPE_REQUIRED');
+    }
+    if (options.outageScope && (
+      !UUID_V4_PATTERN.test(options.outageScope.outageOwnerId)
+      || !SHA256_PATTERN.test(options.outageScope.targetContentSha256)
+      || !SHA256_PATTERN.test(options.outageScope.outageCapabilitySha256)
+    )) {
+      throw new Error('DEPLOYMENT_LOCK_OUTAGE_SCOPE_INVALID');
+    }
 
     const lockData: LockData = {
+      lockVersion: 2,
+      ...currentProcessOwnerEvidence(this.processOwnerOptions.processIdentity),
       pid: process.pid,
       started: Date.now(),
       deploymentId,
       step: 'init',
       ownerToken: randomUUID(),
+      ownerKind: options.outageScope ? 'payara-outage' : 'general',
+      ...(options.outageScope ?? {}),
     };
 
     // Install the shutdown fence before the first asynchronous filesystem
@@ -340,33 +434,40 @@ export class DeploymentLock {
 
     try {
       this.registerSignalHandlers();
+      try {
+        this.coordinationLease = this.coordinationMutex.acquire(
+          `deployment-lock:${deploymentId}`,
+        );
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('PROCESS_EPOCH_ACTIVE:')) {
+          throw new Error(`Deployment already in progress: ${error.message}`);
+        }
+        throw error;
+      }
       for (let attempt = 1; attempt <= ACQUIRE_ATTEMPTS; attempt += 1) {
-        let handle: FileHandle;
-        try {
-          // 'wx+' is create-exclusive (like 'wx') plus read access for ownership checks.
-          handle = await open(this.lockPath, 'wx+', 0o644);
-        } catch (error) {
-          if (!isErrno(error, 'EEXIST')) {
-            throw error;
-          }
-
-          const shouldRetry = await this.handleExistingLock(attempt);
-          if (shouldRetry && attempt < ACQUIRE_ATTEMPTS) {
+        let handle = await this.createFreshLock(lockData);
+        if (!handle) {
+          const replacement = await this.replaceStaleLock(
+            lockData,
+            options,
+          );
+          if (replacement) {
+            handle = replacement;
+          } else if (attempt < ACQUIRE_ATTEMPTS) {
             await delay(ACQUIRE_RETRY_MS);
             continue;
+          } else {
+            throw new Error(
+              `Unable to acquire deployment lock after ${ACQUIRE_ATTEMPTS} attempts: ` +
+              `${this.lockPath} remained contended`
+            );
           }
-
-          throw new Error(
-            `Unable to acquire deployment lock after ${ACQUIRE_ATTEMPTS} attempts: ` +
-            `${this.lockPath} remained contended`
-          );
         }
 
         let identity: FileIdentity | undefined;
         let retryInitialization = false;
         try {
           identity = identityOf(await handle.stat());
-          await this.writeHandle(handle, lockData);
           const pathSnapshot = await this.readSnapshot();
           if (
             !pathSnapshot ||
@@ -376,6 +477,10 @@ export class DeploymentLock {
             retryInitialization = attempt < ACQUIRE_ATTEMPTS;
             throw new Error('Deployment lock ownership changed while it was being initialized');
           }
+
+          // Persist the pathname itself, not only its contents. A successful
+          // acquire must remain authoritative across a power loss.
+          await this.syncLockDirectory();
 
           this.acquired = true;
           this.ownedData = lockData;
@@ -401,6 +506,7 @@ export class DeploymentLock {
 
       throw new Error(`Unable to acquire deployment lock: ${this.lockPath}`);
     } catch (error) {
+      this.releaseCoordinationLease();
       this.currentDeploymentId = null;
       this.finishSignalDeferral();
       throw error;
@@ -462,7 +568,8 @@ export class DeploymentLock {
       if (this.ownedIdentity && this.ownedData?.ownerToken) {
         const removed = await this.removeOwnedPath(
           this.ownedIdentity,
-          this.ownedData.ownerToken
+          this.ownedData.ownerToken,
+          () => this.releaseCoordinationLease(),
         );
         if (removed) {
           this.logger.info({ deploymentId }, 'Deployment lock released');
@@ -493,6 +600,11 @@ export class DeploymentLock {
       this.ownedData = null;
       this.ownedIdentity = null;
       this.ownedHandle = null;
+      try {
+        this.releaseCoordinationLease();
+      } catch (error) {
+        releaseError ??= error instanceof Error ? error : new Error(String(error));
+      }
       this.finishSignalDeferral();
     }
 
@@ -545,6 +657,7 @@ export class DeploymentLock {
     this.ownedData = null;
     this.ownedIdentity = null;
     this.ownedHandle = null;
+    this.releaseCoordinationLease();
     this.finishSignalDeferral();
     this.logger.error(
       { deploymentId, lockPath: this.lockPath, reason },
@@ -557,10 +670,13 @@ export class DeploymentLock {
     return processSignalDeferral.pendingSignal !== null;
   }
 
-  private async handleExistingLock(attempt: number): Promise<boolean> {
+  private async replaceStaleLock(
+    replacementData: LockData,
+    options: DeploymentLockAcquireOptions,
+  ): Promise<FileHandle | undefined> {
     const snapshot = await this.readSnapshot();
     if (!snapshot) {
-      return true;
+      return undefined;
     }
 
     const inspection = this.inspectSnapshot(snapshot);
@@ -577,18 +693,116 @@ export class DeploymentLock {
         );
       }
 
-      return attempt < ACQUIRE_ATTEMPTS;
+      return undefined;
     }
 
     if (!inspection.stale) {
-      return attempt < ACQUIRE_ATTEMPTS;
+      return undefined;
+    }
+    const staleData = inspection.data;
+    if (staleData?.quarantined) {
+      throw new Error(
+        'STALE_DEPLOYMENT_LOCK_QUARANTINED: explicit lifecycle reconciliation is required for ' +
+        `${staleData.deploymentId}`,
+      );
+    }
+    const scope = options.outageScope;
+    const scopedOutageLock = Boolean(
+      staleData
+      && staleData.lockVersion === 2
+      && staleData.ownerKind === 'payara-outage'
+      && scope
+      && staleData.outageOwnerId === scope.outageOwnerId
+      && staleData.targetContentSha256 === scope.targetContentSha256
+      && staleData.outageCapabilitySha256 === scope.outageCapabilitySha256,
+    );
+    if (!scopedOutageLock || !staleData || !options.authorizeStaleTakeover) {
+      throw new Error(
+        'STALE_DEPLOYMENT_LOCK_SCOPE_MISMATCH: automatic takeover is limited to an exact ' +
+        `Payara outage lock; observed ${staleData?.deploymentId ?? this.lockPath}`,
+      );
+    }
+    await options.authorizeStaleTakeover(staleData);
+    const revalidated = await this.readSnapshot();
+    if (!revalidated
+      || !sameIdentity(revalidated.identity, snapshot.identity)
+      || revalidated.raw !== snapshot.raw) {
+      throw new Error('STALE_DEPLOYMENT_LOCK_CHANGED: stale lock changed during fenced takeover');
     }
 
-    throw new Error(
-      'STALE_DEPLOYMENT_LOCK: automatic takeover is disabled for ' +
-      `${inspection.data?.deploymentId ?? this.lockPath}; verify the dead owner ` +
-      'and remove the lock while deployment entry points are quiesced'
-    );
+    // Write the successor first, then atomically replace the exact revalidated
+    // stale pathname. There is no O_EXCL gap in which an older plugin that does
+    // not know the coordination epochs could acquire the deployment lock.
+    const replacementPath = `${this.lockPath}.takeover-${randomUUID()}`;
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(replacementPath, 'wx+', 0o644);
+      await this.writeHandle(handle, replacementData);
+      const replacementIdentity = identityOf(await handle.stat());
+      const beforeRename = await this.readSnapshot();
+      if (!beforeRename
+        || !sameIdentity(beforeRename.identity, snapshot.identity)
+        || beforeRename.raw !== snapshot.raw) {
+        throw new Error('STALE_DEPLOYMENT_LOCK_CHANGED: stale lock changed before atomic takeover');
+      }
+      await rename(replacementPath, this.lockPath);
+      await this.syncLockDirectory();
+      const installed = await this.readSnapshot();
+      if (!installed
+        || !sameIdentity(installed.identity, replacementIdentity)
+        || installed.data?.ownerToken !== replacementData.ownerToken) {
+        throw new Error('STALE_DEPLOYMENT_LOCK_CHANGED: successor lock was not installed exactly');
+      }
+      this.logger.warn(
+        { previousDeploymentId: staleData.deploymentId, lockPath: this.lockPath },
+        'Recovered deployment lock from a proven dead process owner',
+      );
+      return handle;
+    } catch (error) {
+      await handle?.close().catch(() => undefined);
+      await rm(replacementPath, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /** Publish a fully written inode with a no-replace hard link. */
+  private async createFreshLock(lockData: LockData): Promise<FileHandle | undefined> {
+    const temporaryPath = `${this.lockPath}.acquiring-${randomUUID()}`;
+    let handle: FileHandle | undefined;
+    let publishedIdentity: FileIdentity | undefined;
+    try {
+      handle = await open(temporaryPath, 'wx+', 0o644);
+      await this.writeHandle(handle, lockData);
+      publishedIdentity = identityOf(await handle.stat());
+      try {
+        await link(temporaryPath, this.lockPath);
+      } catch (error) {
+        if (!isErrno(error, 'EEXIST')) throw error;
+        await handle.close();
+        handle = undefined;
+        return undefined;
+      }
+      await rm(temporaryPath);
+      await this.syncLockDirectory();
+      return handle;
+    } catch (error) {
+      if (publishedIdentity) {
+        await this.removeOwnedPath(publishedIdentity, lockData.ownerToken);
+      }
+      await handle?.close().catch(() => undefined);
+      throw error;
+    } finally {
+      await rm(temporaryPath, { force: true }).catch(() => undefined);
+    }
+  }
+
+  private async syncLockDirectory(): Promise<void> {
+    const directory = await open(dirname(this.lockPath), 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
   }
 
   private inspectSnapshot(snapshot: LockSnapshot): LockInspection {
@@ -600,20 +814,22 @@ export class DeploymentLock {
         : { locked: true, stale: false };
     }
 
+    if (data.processInstanceId) {
+      return processOwnerIsAlive({
+        pid: data.pid,
+        processInstanceId: data.processInstanceId,
+        ...(data.processIdentity ? { processIdentity: data.processIdentity } : {}),
+      }, this.processOwnerOptions)
+        ? { locked: true, stale: false, data }
+        : { locked: false, stale: true, data };
+    }
+
     try {
       process.kill(data.pid, 0);
-      // A live owner remains authoritative regardless of elapsed duration.
-      // Deployments may legitimately exceed the old ten-minute threshold.
       return { locked: true, stale: false, data };
     } catch (error) {
-      // EPERM means the process exists but belongs to another user.
-      if (isErrno(error, 'EPERM')) {
-        return { locked: true, stale: false, data };
-      }
-      if (isErrno(error, 'ESRCH')) {
-        return { locked: false, stale: true, data };
-      }
-      // Unknown process-probe failures must not authorize takeover.
+      if (isErrno(error, 'EPERM')) return { locked: true, stale: false, data };
+      if (isErrno(error, 'ESRCH')) return { locked: false, stale: true, data };
       return { locked: true, stale: false, data };
     }
   }
@@ -696,7 +912,8 @@ export class DeploymentLock {
    */
   private async removeOwnedPath(
     identity: FileIdentity,
-    ownerToken: string | undefined
+    ownerToken: string | undefined,
+    onPathDetached?: () => void,
   ): Promise<boolean> {
     const tombstonePath = `${this.lockPath}.released-${randomUUID()}`;
     try {
@@ -709,6 +926,8 @@ export class DeploymentLock {
       }
 
       await rename(this.lockPath, tombstonePath);
+      await this.syncLockDirectory();
+      onPathDetached?.();
       const moved = await this.readSnapshotAt(tombstonePath);
       if (
         !moved
@@ -723,6 +942,7 @@ export class DeploymentLock {
       }
 
       await rm(tombstonePath);
+      await this.syncLockDirectory();
       return true;
     } catch (error) {
       if (!isErrno(error, 'ENOENT')) {
@@ -746,5 +966,12 @@ export class DeploymentLock {
     if (!this.signalDeferralActive) return;
     this.signalDeferralActive = false;
     leaveProcessSignalDeferral(this.signalDeferralParticipant);
+  }
+
+  private releaseCoordinationLease(): void {
+    const lease = this.coordinationLease;
+    if (!lease) return;
+    this.coordinationLease = null;
+    this.coordinationMutex.release(lease);
   }
 }
