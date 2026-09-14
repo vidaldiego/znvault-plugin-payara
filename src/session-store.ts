@@ -69,7 +69,9 @@ export class SessionStore {
     deletions: string[],
     expectedFiles: number | undefined,
     deploymentId: string,
-    artifact: DeploymentArtifactExpectation
+    artifact: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapabilitySha256?: string,
   ): ChunkedDeploySession {
     if (!UUID_V4_PATTERN.test(deploymentId)) {
       throw new Error(
@@ -83,6 +85,8 @@ export class SessionStore {
       id: randomUUID(),
       deploymentId,
       artifact,
+      ...(outageOwnerId ? { outageOwnerId } : {}),
+      ...(outageCapabilitySha256 ? { outageCapabilitySha256 } : {}),
       createdAt: Date.now(),
       files: [],
       deletions,

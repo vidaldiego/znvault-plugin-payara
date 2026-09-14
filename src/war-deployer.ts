@@ -1,9 +1,10 @@
 // Path: src/war-deployer.ts
 // WAR file deployer with diff-based updates - uses asadmin deploy commands only
 
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { linkSync, readFileSync, renameSync, unlinkSync } from 'node:fs';
+import { hostname } from 'node:os';
 import { writeFile, mkdir, rm, stat, lstat, readFile, open } from 'node:fs/promises';
 import { join, dirname, normalize, isAbsolute, basename } from 'node:path';
 import AdmZip from 'adm-zip';
@@ -24,7 +25,13 @@ import type {
   PostStartDeploymentPolicy,
   PostStartDeploymentResult,
 } from './types.js';
-import { DeploymentLock, type DeploymentStep } from './deployment-lock.js';
+import {
+  DeploymentLock,
+  type DeploymentLockAcquireOptions,
+  type DeploymentLockOutageScope,
+  type DeploymentStep,
+  type LockData,
+} from './deployment-lock.js';
 import { DeploymentJournal } from './deployment-journal.js';
 import { createTempDir, cleanupTempDir, withTempDir } from './utils/temp-dir.js';
 import { getErrorMessage } from './utils/error.js';
@@ -35,8 +42,71 @@ import {
   calculateWarContentSha256,
   calculateWarEntryHashes,
 } from './war-utils.js';
+import {
+  PreparedStopReceiptStore,
+  type PreparedStopReceipt,
+  type PreparedStopScope,
+} from './prepared-stop-receipt.js';
+import { SchedulerDeploymentHoldStore } from './scheduler-deployment-hold.js';
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const DEFAULT_PREPARED_STOP_RECEIPT_PATH =
+  '/var/lib/zn-vault-agent/payara-prepared-stop/state.json';
+
+const OUTAGE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+
+export function outageCapabilitySha256(capability: string): string {
+  if (!OUTAGE_CAPABILITY_PATTERN.test(capability)) {
+    throw outageFenceError(
+      'OUTAGE_FENCE_CAPABILITY_INVALID',
+      'A 32-byte base64url outage capability is required',
+    );
+  }
+  const decoded = Buffer.from(capability, 'base64url');
+  if (decoded.length !== 32 || decoded.toString('base64url') !== capability) {
+    throw outageFenceError(
+      'OUTAGE_FENCE_CAPABILITY_INVALID',
+      'A canonical 32-byte base64url outage capability is required',
+    );
+  }
+  return createHash('sha256').update('znvault-payara-outage/v1\0').update(decoded).digest('hex');
+}
+
+export interface PreparedStopStatus {
+  outageFenced: boolean;
+  preparedStopped: boolean;
+  running: boolean;
+  processCount: number;
+  receiptPhase?: 'arming' | 'prepared' | 'stopped' | 'rollout' | 'deployed' | 'releasing';
+  receiptId?: string;
+  outageOwnerId?: string;
+  targetContentSha256?: string;
+  artifact?: WarArtifactIdentity;
+  currentArtifact?: WarArtifactIdentity;
+  deployedArtifact?: WarArtifactIdentity;
+  capabilityBound?: boolean;
+  schedulerDeploymentHold?: boolean;
+  applicationDeployed?: boolean;
+  /** A dead process left the shared mutation lock; only exact recovery may replace it. */
+  mutationLockStale?: true;
+  mutationLockOwnerKind?: 'general' | 'payara-outage' | 'legacy-or-invalid';
+}
+
+function outageFenceError(code: string, message: string): Error {
+  const error = new Error(`${code}: ${message}`);
+  error.name = code;
+  return error;
+}
+
+function isOutageFenceError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = error.name !== 'Error'
+    ? error.name
+    : error.message.match(/^([A-Z][A-Z0-9_]+):/)?.[1] ?? '';
+  return code.startsWith('OUTAGE_FENCE_');
+}
 
 /**
  * Validate and sanitize a file path to prevent directory traversal attacks.
@@ -115,6 +185,9 @@ export class WarDeployer {
   private readonly payara: PayaraManager;
   private readonly logger: Logger;
   private readonly aggressiveMode: boolean;
+  private readonly preparedStopStore?: PreparedStopReceiptStore;
+  private readonly preparedStopScope?: PreparedStopScope;
+  private readonly schedulerDeploymentHoldStore?: SchedulerDeploymentHoldStore;
 
   // Lock to prevent concurrent deployments (in-memory)
   private deployLock = false;
@@ -138,11 +211,42 @@ export class WarDeployer {
     this.logger = options.logger;
     this.aggressiveMode = options.aggressiveMode ?? false;
 
+    if (
+      typeof options.preparedStopReceiptPath === 'string'
+      && !isAbsolute(options.preparedStopReceiptPath)
+    ) {
+      throw new Error('PREPARED_STOP_RECEIPT_PATH_INVALID: path must be absolute');
+    }
+    if (options.domain && options.preparedStopReceiptPath !== false) {
+      this.preparedStopScope = {
+        hostIdentity: options.hostIdentity ?? hostname(),
+        domain: options.domain,
+        appName: options.appName,
+      };
+      this.preparedStopStore = new PreparedStopReceiptStore(
+        options.preparedStopReceiptPath ?? DEFAULT_PREPARED_STOP_RECEIPT_PATH,
+      );
+      const holdPath = options.schedulerDeploymentHoldPath
+        ?? join(dirname(options.preparedStopReceiptPath ?? DEFAULT_PREPARED_STOP_RECEIPT_PATH),
+          '.znvault-scheduler-deployment-hold.json');
+      if (!isAbsolute(holdPath)) {
+        throw new Error('SCHEDULER_DEPLOYMENT_HOLD_PATH_INVALID: path must be absolute');
+      }
+      this.schedulerDeploymentHoldStore = new SchedulerDeploymentHoldStore(holdPath);
+    }
+
     // Initialize file-based lock, journal, and status tracker
     this.fileLock = new DeploymentLock(options.logger, options.deploymentLockPath);
     this.journal = new DeploymentJournal(options.logger);
     this.statusTracker = new DeploymentStatusTracker(options.logger);
     this.payara.registerApplication?.(this.appName);
+  }
+
+  private capabilityMatches(receipt: PreparedStopReceipt, capability: string | undefined): boolean {
+    if (!capability) return false;
+    const actual = Buffer.from(outageCapabilitySha256(capability), 'hex');
+    const expected = Buffer.from(receipt.outageCapabilitySha256, 'hex');
+    return actual.length === expected.length && timingSafeEqual(actual, expected);
   }
 
   /**
@@ -196,6 +300,801 @@ export class WarDeployer {
     } finally {
       await handle?.close().catch(() => undefined);
     }
+  }
+
+  private requirePreparedStopStore(): {
+    store: PreparedStopReceiptStore;
+    scope: PreparedStopScope;
+  } {
+    if (!this.preparedStopStore || !this.preparedStopScope) {
+      throw new Error(
+        'PREPARED_STOP_RECEIPT_STORE_REQUIRED: domain-bound durable storage is not configured',
+      );
+    }
+    return { store: this.preparedStopStore, scope: this.preparedStopScope };
+  }
+
+  private artifactMatches(
+    expected: WarArtifactIdentity,
+    actual: WarArtifactIdentity | null,
+  ): boolean {
+    return Boolean(
+      actual
+      && actual.size === expected.size
+      && actual.sha256 === expected.sha256
+      && actual.contentSha256 === expected.contentSha256,
+    );
+  }
+
+  private receiptAllowsArtifact(
+    receipt: PreparedStopReceipt,
+    actual: WarArtifactIdentity | null,
+  ): actual is WarArtifactIdentity {
+    if (!actual) return false;
+    if (receipt.phase === 'arming' || receipt.phase === 'prepared' || receipt.phase === 'stopped') {
+      return this.artifactMatches(receipt.artifact, actual);
+    }
+    if (receipt.phase === 'rollout') {
+      return this.artifactMatches(receipt.artifact, actual)
+        || actual.contentSha256 === receipt.targetContentSha256;
+    }
+    return Boolean(
+      receipt.deployedArtifact
+      && this.artifactMatches(receipt.deployedArtifact, actual),
+    );
+  }
+
+  private assertOutageMutationAllowed(
+    outageOwnerId?: string,
+    outageCapability?: string,
+    allowUnarmedOwner = false,
+    allowArmingWithoutHold = false,
+  ): PreparedStopReceipt | undefined {
+    if (!this.preparedStopStore || !this.preparedStopScope) {
+      if (outageOwnerId) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_NOT_ARMED',
+          'This plugin instance has no domain-bound outage fence',
+        );
+      }
+      return undefined;
+    }
+    const receipt = this.preparedStopStore.read(this.preparedStopScope);
+    if (!receipt) {
+      if (this.schedulerDeploymentHoldStore?.read()) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_ORPHANED_HOLD',
+          'The scheduler boot hold exists without its mutation receipt; local recovery is required',
+        );
+      }
+      if (outageOwnerId && !allowUnarmedOwner) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_NOT_ARMED',
+          'No durable outage fence exists for this application',
+        );
+      }
+      return undefined;
+    }
+    const hold = this.schedulerDeploymentHoldStore?.read();
+    if (hold && (
+      hold.outageId !== receipt.outageOwnerId
+      || hold.targetContentSha256 !== receipt.targetContentSha256
+    )) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_HOLD_MISMATCH',
+        'The mutation receipt and scheduler boot hold have different owners or targets',
+      );
+    }
+    if (
+      !hold
+      && receipt.phase !== 'releasing'
+      && !(allowArmingWithoutHold && receipt.phase === 'arming')
+    ) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_HOLD_MISSING',
+        'The active mutation receipt lost its scheduler boot hold; local recovery is required',
+      );
+    }
+    if (!outageOwnerId) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_ACTIVE',
+        'Payara mutations are reserved by an active full-fleet rollout',
+      );
+    }
+    if (!UUID_V4_PATTERN.test(outageOwnerId)) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_OWNER_INVALID',
+        'A caller-owned lowercase UUIDv4 is required for the active outage',
+      );
+    }
+    if (receipt.outageOwnerId !== outageOwnerId) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_OWNER_MISMATCH',
+        'The active outage belongs to a different rollout owner',
+      );
+    }
+    if (!this.capabilityMatches(receipt, outageCapability)) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_CAPABILITY_MISMATCH',
+        'The active outage requires its separate 32-byte capability',
+      );
+    }
+    return receipt;
+  }
+
+  private async beginOutageRollout(
+    outageOwnerId: string | undefined,
+    outageCapability: string | undefined,
+    artifactExpectation?: DeploymentArtifactExpectation,
+  ): Promise<void> {
+    const receipt = this.assertOutageMutationAllowed(outageOwnerId, outageCapability);
+    if (!receipt) return;
+    if (!artifactExpectation) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_TARGET_REQUIRED',
+        'The owning rollout must carry its exact artifact target',
+      );
+    }
+    if (receipt.targetContentSha256 !== artifactExpectation.targetContentSha256) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_TARGET_MISMATCH',
+        'The deployment target differs from the target bound to the outage',
+      );
+    }
+    if (receipt.phase === 'stopped') {
+      const runtime = await this.payara.getStrictRuntimeStopStatus();
+      if (runtime.running || runtime.processCount !== 0) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_PID0_REQUIRED',
+          'The owning rollout may start only from running=false/processCount=0',
+        );
+      }
+    }
+    if (receipt.phase !== 'releasing') {
+      this.schedulerDeploymentHoldStore?.assert(
+        receipt.outageOwnerId,
+        receipt.targetContentSha256,
+        receipt.outageCapabilitySha256,
+      );
+    }
+    const { store, scope } = this.requirePreparedStopStore();
+    if (receipt.phase === 'deployed' || receipt.phase === 'releasing') {
+      const currentArtifact = await this.getCurrentArtifactIdentity();
+      if (
+        !receipt.deployedArtifact
+        || !this.artifactMatches(receipt.deployedArtifact, currentArtifact)
+        || currentArtifact?.contentSha256 !== artifactExpectation.targetContentSha256
+      ) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_TARGET_MISMATCH',
+          'A deployed-phase retry requires the exact already committed target artifact',
+        );
+      }
+    } else {
+      store.markRollout(
+        scope,
+        receipt.outageOwnerId,
+        artifactExpectation.targetContentSha256,
+      );
+    }
+  }
+
+  private async markOutageDeploymentApplied(
+    outageOwnerId: string | undefined,
+    outageCapability: string | undefined,
+  ): Promise<void> {
+    if (!outageOwnerId) return;
+    const receipt = this.assertOutageMutationAllowed(outageOwnerId, outageCapability);
+    if (!receipt) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_NOT_ARMED',
+        'Cannot commit an outage deployment without its durable fence',
+      );
+    }
+    const artifact = await this.getCurrentArtifactIdentity();
+    if (!artifact) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_TARGET_MISSING',
+        'The deployed WAR is absent while committing the outage receipt',
+      );
+    }
+    const { store, scope } = this.requirePreparedStopStore();
+    if (receipt.phase !== 'releasing') {
+      store.markDeployed(scope, outageOwnerId, artifact);
+    }
+  }
+
+  private async inspectPreparedStopUnlocked(): Promise<PreparedStopStatus> {
+    const { store, scope } = this.requirePreparedStopStore();
+    const receipt = store.read(scope);
+    const runtime = await this.payara.getStrictRuntimeStopStatus();
+    if (runtime.running !== (runtime.processCount > 0)) {
+      throw new Error(
+        'PREPARED_STOP_RUNTIME_INCONSISTENT: running and process-count evidence disagree',
+      );
+    }
+    if (!receipt) {
+      if (this.schedulerDeploymentHoldStore?.read()) {
+        throw new Error(
+          'SCHEDULER_DEPLOYMENT_HOLD_ORPHANED: boot hold exists without its mutation receipt',
+        );
+      }
+      if (!runtime.running) {
+        return {
+          outageFenced: false,
+          preparedStopped: false,
+          running: false,
+          processCount: 0,
+        };
+      }
+      const artifact = await this.getCurrentArtifactIdentity();
+      const applicationDeployed = await this.isAppDeployed();
+      return {
+        outageFenced: false,
+        preparedStopped: false,
+        running: true,
+        processCount: runtime.processCount,
+        applicationDeployed,
+        ...(artifact ? { deployedArtifact: artifact } : {}),
+      };
+    }
+
+    const artifact = await this.getCurrentArtifactIdentity();
+    if (!this.receiptAllowsArtifact(receipt, artifact)) {
+      throw new Error(
+        'PREPARED_STOP_RECEIPT_STALE: current WAR is neither the fenced base nor the bound rollout target',
+      );
+    }
+    if (receipt.phase === 'stopped' && runtime.running) {
+      throw new Error(
+        'PREPARED_STOP_RECEIPT_STALE: Payara restarted after the stopped receipt was committed',
+      );
+    }
+    const hold = this.schedulerDeploymentHoldStore?.read();
+    const holdMatches = Boolean(
+      hold
+      && hold.outageId === receipt.outageOwnerId
+      && hold.targetContentSha256 === receipt.targetContentSha256,
+    );
+    if (hold && !holdMatches) {
+      throw new Error(
+        'SCHEDULER_DEPLOYMENT_HOLD_MISMATCH: marker owner or target differs from the outage receipt',
+      );
+    }
+    const recoverableArmingWithoutHold =
+      receipt.phase === 'arming'
+      && !hold
+      && runtime.running
+      && runtime.processCount > 0;
+    if (receipt.phase !== 'releasing' && !hold && !recoverableArmingWithoutHold) {
+      throw new Error(
+        'SCHEDULER_DEPLOYMENT_HOLD_MISSING: active outage lost its durable scheduler boot hold',
+      );
+    }
+    const applicationDeployed = runtime.running
+      ? await this.isAppDeployed()
+      : false;
+    return {
+      outageFenced: true,
+      preparedStopped:
+        !runtime.running
+        && runtime.processCount === 0
+        && receipt.phase === 'stopped',
+      running: runtime.running,
+      processCount: runtime.processCount,
+      receiptPhase: receipt.phase,
+      receiptId: receipt.receiptId,
+      outageOwnerId: receipt.outageOwnerId,
+      targetContentSha256: receipt.targetContentSha256,
+      capabilityBound: true,
+      schedulerDeploymentHold: holdMatches,
+      applicationDeployed,
+      artifact: { ...receipt.artifact },
+      currentArtifact: { ...artifact },
+      ...(receipt.deployedArtifact
+        ? { deployedArtifact: { ...receipt.deployedArtifact } }
+        : {}),
+    };
+  }
+
+  /** Read and verify the durable prepared-stop receipt under the shared lock. */
+  async getPreparedStopStatus(): Promise<PreparedStopStatus> {
+    const deploymentLock = await this.fileLock.isLocked();
+    if (deploymentLock.stale) {
+      // Observation may classify durable state, but a stale mutation outcome
+      // never completes startup. Only an exact capability-authorized recovery
+      // route may replace an outage-scoped v2 lock.
+      const status = await this.inspectPreparedStopUnlocked();
+      return {
+        ...status,
+        mutationLockStale: true,
+        mutationLockOwnerKind:
+          deploymentLock.data?.ownerKind ?? 'legacy-or-invalid',
+      };
+    }
+    const { store, scope } = this.requirePreparedStopStore();
+    const receipt = store.read(scope);
+    const outageScope: DeploymentLockOutageScope | undefined = receipt
+      ? {
+          outageOwnerId: receipt.outageOwnerId,
+          targetContentSha256: receipt.targetContentSha256,
+          outageCapabilitySha256: receipt.outageCapabilitySha256,
+        }
+      : undefined;
+    return this.withReadOnlyDeploymentFileLock(
+      `prepared-stop-status:${this.appName}`,
+      'verify',
+      () => this.inspectPreparedStopUnlocked(),
+      outageScope,
+    );
+  }
+
+  /**
+   * Remove the persistent application ref, arm durable evidence, stop Payara,
+   * and commit the terminal receipt. A prepared receipt plus a fresh PID0 proof
+   * makes this operation re-entrant after either the CLI or agent restarts.
+   */
+  async stopForDeployment(
+    outageOwnerId: string,
+    targetContentSha256: string,
+    outageCapability: string,
+  ): Promise<PreparedStopStatus> {
+    if (!UUID_V4_PATTERN.test(outageOwnerId)) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_OWNER_INVALID',
+        'A caller-owned lowercase UUIDv4 is required for the fleet outage',
+      );
+    }
+    if (!SHA256_PATTERN.test(targetContentSha256)) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_TARGET_INVALID',
+        'A lowercase target content SHA-256 is required for the fleet outage',
+      );
+    }
+    const capabilitySha256 = outageCapabilitySha256(outageCapability);
+    // This is the only mutation allowed to introduce a new fence. The outer
+    // lock accepts an unarmed owner exactly here; the operation then either
+    // arms it durably or verifies an existing owner before touching Payara.
+    return this.withDeploymentFileLockInternal(
+      `stop-for-deployment:${this.appName}`,
+      'stop',
+      async () => {
+        const { store, scope } = this.requirePreparedStopStore();
+        let receipt: PreparedStopReceipt | undefined = store.read(scope);
+        const initialRuntime = await this.payara.getStrictRuntimeStopStatus();
+        if (initialRuntime.running !== (initialRuntime.processCount > 0)) {
+          throw new Error(
+            'PREPARED_STOP_RUNTIME_INCONSISTENT: running and process-count evidence disagree',
+          );
+        }
+
+        if (receipt) {
+          this.assertOutageMutationAllowed(
+            outageOwnerId,
+            outageCapability,
+            false,
+            true,
+          );
+          if (receipt.targetContentSha256 !== targetContentSha256) {
+            throw outageFenceError(
+              'OUTAGE_FENCE_TARGET_MISMATCH',
+              'The requested WAR target differs from the active outage target',
+            );
+          }
+          const artifact = await this.getCurrentArtifactIdentity();
+          if (!this.receiptAllowsArtifact(receipt, artifact)) {
+            throw new Error(
+              'PREPARED_STOP_RECEIPT_STALE: current WAR does not match the active outage',
+            );
+          }
+          if (receipt.phase === 'stopped' && initialRuntime.running) {
+            throw new Error(
+              'PREPARED_STOP_RECEIPT_STALE: Payara restarted after the stopped receipt was committed',
+            );
+          }
+          if (!initialRuntime.running) {
+            if (
+              receipt.phase === 'rollout'
+              || receipt.phase === 'deployed'
+              || receipt.phase === 'releasing'
+            ) {
+              throw outageFenceError(
+                'OUTAGE_FENCE_RECOVERY_REQUIRED',
+                'Payara stopped after rollout began; persistent application ownership is ambiguous',
+              );
+            }
+            if (receipt.phase === 'arming') {
+              throw outageFenceError(
+                'OUTAGE_FENCE_RECOVERY_REQUIRED',
+                'Payara stopped before persistent application ownership preparation was committed',
+              );
+            }
+            receipt = receipt.phase === 'stopped'
+              ? receipt
+              : store.markStopped(scope, receipt.receiptId);
+            return {
+              outageFenced: true,
+              preparedStopped: true,
+              running: false,
+              processCount: 0,
+              receiptPhase: receipt.phase,
+              receiptId: receipt.receiptId,
+              outageOwnerId: receipt.outageOwnerId,
+              targetContentSha256: receipt.targetContentSha256,
+              artifact: { ...receipt.artifact },
+            };
+          }
+          if (receipt.phase === 'rollout' || receipt.phase === 'deployed' || receipt.phase === 'releasing') {
+            throw outageFenceError(
+              'OUTAGE_FENCE_PHASE_INVALID',
+              `Cannot repeat deployment stop from phase '${receipt.phase}'`,
+            );
+          }
+          if (receipt.phase === 'arming' && !this.schedulerDeploymentHoldStore?.read()) {
+            const holdStore = this.schedulerDeploymentHoldStore;
+            if (!holdStore) {
+              throw outageFenceError(
+                'OUTAGE_FENCE_HOLD_STORE_REQUIRED',
+                'The scheduler deployment hold store is required for outage recovery',
+              );
+            }
+            // A crash may commit the receipt before publishing the scheduler
+            // marker. Only the exact owner, capability, target, live runtime,
+            // and unchanged base artifact reach this point under the same
+            // deployment lock, so the missing marker can be armed safely
+            // before application ownership is changed.
+            holdStore.arm(
+              receipt.outageOwnerId,
+              receipt.targetContentSha256,
+              receipt.outageCapabilitySha256,
+            );
+          }
+        } else {
+          if (!initialRuntime.running) {
+            throw new Error(
+              'PREPARED_STOP_RECEIPT_MISSING: Payara is stopped without durable application-absence evidence',
+            );
+          }
+          const artifact = await this.getCurrentArtifactIdentity();
+          if (!artifact) {
+            throw new Error(
+              'PREPARED_STOP_ARTIFACT_MISSING: no previous WAR exists to bind the deployment stop',
+            );
+          }
+          receipt = store.arm(
+            scope,
+            artifact,
+            outageOwnerId,
+            targetContentSha256,
+            capabilitySha256,
+          );
+          // Persist the mutation owner first. If the process dies before the
+          // boot hold is armed, recovery has exact owner/target/capability
+          // evidence while the scheduler remains in its historical state.
+          // Once the marker exists, every crash state therefore also has its
+          // matching receipt; a marker-only state is never produced.
+          this.schedulerDeploymentHoldStore?.arm(
+            outageOwnerId,
+            targetContentSha256,
+            capabilitySha256,
+          );
+        }
+
+        // Persist the mutation receipt before removing Payara's application
+        // reference. A crash or EIO after this point remains fenced, and a
+        // retry can safely repeat this idempotent preparation step.
+        if (receipt.phase === 'arming' && initialRuntime.running) {
+          await this.payara.prepareAggressiveRestart(this.appName);
+          receipt = store.markPrepared(scope, receipt.receiptId);
+        }
+
+        // A previous attempt may have armed the receipt and failed before the
+        // terminal stop. The exact artifact and the prepared ref-removal proof
+        // above make repeating only the stop safe.
+        if (await this.payara.isRunningStrict()) {
+          await this.payara.stop();
+        }
+        const stoppedRuntime = await this.payara.getStrictRuntimeStopStatus();
+        if (stoppedRuntime.running || stoppedRuntime.processCount !== 0) {
+          throw new Error(
+            'PREPARED_STOP_NOT_PROVEN: expected running=false/processCount=0 after stop',
+          );
+        }
+        const stoppedReceipt = receipt.phase === 'stopped'
+          ? receipt
+          : store.markStopped(scope, receipt.receiptId);
+        return {
+          outageFenced: true,
+          preparedStopped: true,
+          running: false,
+          processCount: 0,
+          receiptPhase: stoppedReceipt.phase,
+          receiptId: stoppedReceipt.receiptId,
+          outageOwnerId: stoppedReceipt.outageOwnerId,
+          targetContentSha256: stoppedReceipt.targetContentSha256,
+          artifact: { ...stoppedReceipt.artifact },
+        };
+      },
+      true,
+      outageOwnerId,
+      outageCapability,
+      true,
+      false,
+      true,
+      targetContentSha256,
+    );
+  }
+
+  /**
+   * Persist the release decision only after the exact target is live and
+   * inventory-visible. The route then asks znapi to atomically finalize the
+   * marker and latch while traffic is still drained.
+   */
+  async prepareOutageRelease(
+    outageOwnerId: string,
+    targetContentSha256: string,
+    outageCapability: string,
+  ): Promise<{ releasePrepared: true; alreadyPrepared: boolean }> {
+    return this.withDeploymentFileLockInternal(
+      `release-outage-fence:${this.appName}`,
+      'verify',
+      async () => {
+        if (!UUID_V4_PATTERN.test(outageOwnerId)) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_OWNER_INVALID',
+            'A caller-owned lowercase UUIDv4 is required to release the outage',
+          );
+        }
+        if (!SHA256_PATTERN.test(targetContentSha256)) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_TARGET_INVALID',
+            'A lowercase target content SHA-256 is required to release the outage',
+          );
+        }
+        outageCapabilitySha256(outageCapability);
+        const { store, scope } = this.requirePreparedStopStore();
+        const receipt = store.read(scope);
+        const runtime = await this.payara.getStrictRuntimeStopStatus();
+        const artifact = await this.getCurrentArtifactIdentity();
+        const appDeployed = runtime.running
+          ? await this.isAppDeployed()
+          : false;
+
+        if (!receipt) throw outageFenceError(
+          'OUTAGE_FENCE_NOT_ARMED',
+          'Cannot prepare release without the durable mutation fence',
+        );
+        this.assertOutageMutationAllowed(outageOwnerId, outageCapability);
+        if (
+          (receipt.phase !== 'deployed' && receipt.phase !== 'releasing')
+          || receipt.targetContentSha256 !== targetContentSha256
+          || !receipt.deployedArtifact
+          || !this.artifactMatches(receipt.deployedArtifact, artifact)
+          || !runtime.running
+          || runtime.processCount === 0
+          || !appDeployed
+        ) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_RELEASE_UNPROVEN',
+            'The exact deployed target and running application were not proven',
+          );
+        }
+        if (receipt.phase === 'releasing') {
+          return { releasePrepared: true, alreadyPrepared: true };
+        }
+        store.markReleasing(scope, outageOwnerId);
+        return { releasePrepared: true, alreadyPrepared: false };
+      },
+      false,
+      outageOwnerId,
+      outageCapability,
+      false,
+      true,
+    );
+  }
+
+  /**
+   * Validate an exact releasing receipt around the API-owned marker/latch
+   * transaction. By default this only observes state; recovery may request a
+   * parent-directory fsync to make an already-observed absence durable.
+   */
+  async inspectOutageReleaseState(
+    outageOwnerId: string,
+    targetContentSha256: string,
+    outageCapability: string,
+    confirmMarkerAbsenceDurably = false,
+  ): Promise<{ markerAlreadyAbsent: boolean }> {
+    return this.withDeploymentFileLockInternal(
+      `inspect-outage-release:${this.appName}`,
+      'verify',
+      async () => {
+        if (!SHA256_PATTERN.test(targetContentSha256)) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_TARGET_INVALID',
+            'A lowercase target content SHA-256 is required to finalize the outage',
+          );
+        }
+        const receipt = this.assertOutageMutationAllowed(outageOwnerId, outageCapability);
+        const runtime = await this.payara.getStrictRuntimeStopStatus();
+        const artifact = await this.getCurrentArtifactIdentity();
+        if (
+          !receipt
+          || receipt.phase !== 'releasing'
+          || receipt.targetContentSha256 !== targetContentSha256
+          || !receipt.deployedArtifact
+          || !this.artifactMatches(receipt.deployedArtifact, artifact)
+          || !runtime.running
+          || runtime.processCount === 0
+          || !(await this.isAppDeployed())
+        ) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_RELEASE_UNPROVEN',
+            'Exact releasing owner, capability, target, and live application were not proven',
+          );
+        }
+        const holdStore = this.schedulerDeploymentHoldStore;
+        if (!holdStore) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_RELEASE_UNPROVEN',
+            'Scheduler deployment hold storage is unavailable',
+          );
+        }
+        const markerAlreadyAbsent = !holdStore.read();
+        if (markerAlreadyAbsent && confirmMarkerAbsenceDurably) {
+          // The API may have restarted after unlinking the marker but before
+          // durably syncing its parent directory. Commit that exact absence
+          // locally before an identity-free API status readback is accepted.
+          holdStore.confirmAbsentDurably();
+        }
+        return { markerAlreadyAbsent };
+      },
+      false,
+      outageOwnerId,
+      outageCapability,
+      false,
+      true,
+    );
+  }
+
+  async finalizeOutageFence(
+    outageOwnerId: string,
+    targetContentSha256: string,
+    outageCapability: string,
+  ): Promise<{ finalized: true }> {
+    return this.withDeploymentFileLockInternal(
+      `finalize-outage-fence:${this.appName}`,
+      'verify',
+      async () => {
+        if (!SHA256_PATTERN.test(targetContentSha256)) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_TARGET_INVALID',
+            'A lowercase target content SHA-256 is required to finalize the outage',
+          );
+        }
+        const { store, scope } = this.requirePreparedStopStore();
+        const receipt = this.assertOutageMutationAllowed(outageOwnerId, outageCapability);
+        if (
+          !receipt
+          || receipt.phase !== 'releasing'
+          || receipt.targetContentSha256 !== targetContentSha256
+          || this.schedulerDeploymentHoldStore?.read()
+        ) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_FINALIZE_UNPROVEN',
+            'Scheduler resume must be proven before finalizing the mutation fence',
+          );
+        }
+        const runtime = await this.payara.getStrictRuntimeStopStatus();
+        const artifact = await this.getCurrentArtifactIdentity();
+        if (!runtime.running || runtime.processCount === 0
+          || !receipt.deployedArtifact
+          || !this.artifactMatches(receipt.deployedArtifact, artifact)
+          || !(await this.isAppDeployed())) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_FINALIZE_UNPROVEN',
+            'Exact live target is not proven at finalization',
+          );
+        }
+        store.clearOwned(scope, outageOwnerId);
+        return { finalized: true };
+      },
+      false,
+      outageOwnerId,
+      outageCapability,
+      false,
+      true,
+    );
+  }
+
+  /** Direct-loopback operator escape after an explicitly investigated failure. */
+  async recoverOutageFence(
+    outageOwnerId: string,
+    targetContentSha256: string,
+    outageCapability: string,
+    reason: string,
+    finalizeSchedulerDeployment: (
+      outageId: string,
+      targetContentSha256: string,
+      outageCapability: string,
+    ) => Promise<unknown>,
+    getSchedulerDeploymentStatus: () => Promise<unknown>,
+  ): Promise<{ recovered: true }> {
+    return this.withDeploymentFileLockInternal(
+      `recover-outage-fence:${this.appName}`,
+      'verify',
+      async () => {
+        const normalizedReason = reason.trim();
+        if (normalizedReason.length < 12 || normalizedReason.length > 1_024) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_RECOVERY_REASON_INVALID',
+            'Recovery requires a reason between 12 and 1024 characters',
+          );
+        }
+        const { store, scope } = this.requirePreparedStopStore();
+        const receipt = store.read(scope);
+        const hold = this.schedulerDeploymentHoldStore?.read();
+        if (!UUID_V4_PATTERN.test(outageOwnerId)) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_OWNER_INVALID',
+            'A caller-owned lowercase UUIDv4 is required for recovery',
+          );
+        }
+        if (!SHA256_PATTERN.test(targetContentSha256)) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_TARGET_INVALID',
+            'A lowercase target content SHA-256 is required for recovery',
+          );
+        }
+        const capabilitySha256 = outageCapabilitySha256(outageCapability);
+        if (!receipt) throw outageFenceError(
+          'OUTAGE_FENCE_OWNER_MISMATCH',
+          'Recovery requires the durable mutation receipt; a marker alone is not enough evidence',
+        );
+        if (
+          receipt.outageOwnerId !== outageOwnerId
+          || receipt.targetContentSha256 !== targetContentSha256
+          || !this.capabilityMatches(receipt, outageCapability)
+        ) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_OWNER_MISMATCH',
+            'The active outage belongs to a different rollout authorization',
+          );
+        }
+        if (hold) {
+          if (
+            hold.outageId !== outageOwnerId
+            || hold.targetContentSha256 !== targetContentSha256
+            || hold.capabilitySha256 !== capabilitySha256
+          ) {
+            throw outageFenceError(
+              'OUTAGE_FENCE_HOLD_MISMATCH',
+              'The scheduler hold differs from the recovery authorization',
+            );
+          }
+          await finalizeSchedulerDeployment(
+            outageOwnerId,
+            targetContentSha256,
+            outageCapability,
+          );
+          this.schedulerDeploymentHoldStore?.confirmAbsentDurably();
+        } else {
+          await getSchedulerDeploymentStatus();
+          this.schedulerDeploymentHoldStore?.confirmAbsentDurably();
+        }
+        store.clearOwned(scope, outageOwnerId);
+        this.logger.warn(
+          { appName: this.appName, outageOwnerId, reason: normalizedReason },
+          'Operator explicitly cleared the durable full-fleet outage fence',
+        );
+        return { recovered: true };
+      },
+      false,
+      outageOwnerId,
+      outageCapability,
+      false,
+      true,
+      true,
+    );
   }
 
   private validateArtifactExpectation(
@@ -389,7 +1288,9 @@ export class WarDeployer {
     changedFiles: FileChange[],
     deletedFiles: string[],
     requestedDeploymentId?: string,
-    artifactExpectation?: DeploymentArtifactExpectation
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapability?: string,
   ): Promise<DeployResult> {
     if (this.deployLock) {
       throw new Error('Deployment already in progress');
@@ -407,13 +1308,23 @@ export class WarDeployer {
         let operationError: unknown;
 
         try {
-          await this.fileLock.acquire(deploymentId);
+          await this.fileLock.acquire(
+            deploymentId,
+            this.outageLockAcquireOptions(
+              outageOwnerId,
+              outageCapability,
+              artifactExpectation?.targetContentSha256,
+              false,
+              false,
+            ),
+          );
           fileLockAcquired = true;
           await this.fileLock.updateStep('war-update');
           const workingDir = await createTempDir('war-deploy');
           tempDir = workingDir;
           return await this.withOwnedDeploymentLockContext(() =>
             this.withPayaraLease(`apply-changes:${this.appName}`, async () => {
+            await this.beginOutageRollout(outageOwnerId, outageCapability, artifactExpectation);
             this.logger.info({
               changed: changedFiles.length,
               deleted: deletedFiles.length,
@@ -462,7 +1373,11 @@ export class WarDeployer {
 
             this.logger.info({ warPath: this.warPath }, 'WAR file updated');
             await this.fileLock.updateStep('deploy');
-            const deployResult = await this.deploy();
+            const deployResult = await this.deploy(
+              outageOwnerId,
+              artifactExpectation,
+              outageCapability,
+            );
             await this.fileLock.updateStep('verify');
             artifact = await this.verifyTargetArtifact(artifactExpectation);
             const duration = Date.now() - startTime;
@@ -484,6 +1399,7 @@ export class WarDeployer {
           );
         } catch (err) {
           operationError = err;
+          if (isOutageFenceError(err)) throw err;
           const duration = Date.now() - startTime;
           this.logger.error({ err, duration }, 'Deployment failed');
 
@@ -528,14 +1444,24 @@ export class WarDeployer {
   async applyChangesWithoutDeploy(
     changedFiles: FileChange[],
     deletedFiles: string[],
-    artifactExpectation?: DeploymentArtifactExpectation
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapability?: string,
   ): Promise<WarArtifactIdentity> {
-    return this.withDeploymentLock(`war-update:${this.appName}`, 'war-update', () =>
-      this.applyChangesWithoutDeployUnlocked(
-        changedFiles,
-        deletedFiles,
-        artifactExpectation
-      )
+    return this.withOutageAwareDeploymentLock(
+      `war-update:${this.appName}`,
+      'war-update',
+      async () => {
+        await this.beginOutageRollout(outageOwnerId, outageCapability, artifactExpectation);
+        return this.applyChangesWithoutDeployUnlocked(
+          changedFiles,
+          deletedFiles,
+          artifactExpectation,
+        );
+      },
+      outageOwnerId,
+      outageCapability,
+      artifactExpectation?.targetContentSha256,
     );
   }
 
@@ -596,15 +1522,31 @@ export class WarDeployer {
    *
    * IMPORTANT: This does NOT use autodeploy. It uses explicit asadmin commands.
    */
-  async deploy(): Promise<{ deployed: boolean; applications: string[] }> {
-    return this.withDeploymentLock(
+  async deploy(
+    outageOwnerId?: string,
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageCapability?: string,
+  ): Promise<{ deployed: boolean; applications: string[] }> {
+    return this.withOutageAwareDeploymentLock(
       `war-deploy:${this.appName}`,
       'deploy',
-      () => this.deployUnlocked()
+      async () => {
+        await this.beginOutageRollout(outageOwnerId, outageCapability, artifactExpectation);
+        const result = await this.deployUnlocked(outageOwnerId, artifactExpectation, outageCapability);
+        await this.markOutageDeploymentApplied(outageOwnerId, outageCapability);
+        return result;
+      },
+      outageOwnerId,
+      outageCapability,
+      artifactExpectation?.targetContentSha256,
     );
   }
 
-  private async deployUnlocked(): Promise<{ deployed: boolean; applications: string[] }> {
+  private async deployUnlocked(
+    outageOwnerId?: string,
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageCapability?: string,
+  ): Promise<{ deployed: boolean; applications: string[] }> {
     if (!(await this.warExists())) {
       throw new Error(`WAR_NOT_FOUND: no WAR file exists at ${this.warPath}`);
     }
@@ -619,7 +1561,12 @@ export class WarDeployer {
       await this.fileLock.updateStep('start');
       await this.payara.start({ waitForApplicationHealth: false });
       await this.fileLock.updateStep('deploy');
-      const result = await this.deployAfterStart('require-agent-owned');
+      const result = await this.deployAfterStart(
+        'require-agent-owned',
+        outageOwnerId,
+        artifactExpectation,
+        outageCapability,
+      );
       if (result.outcome !== 'agent-deployed') {
         throw new Error('BOOT_OWNER_CONFLICT: Payara owns the post-start deployment');
       }
@@ -655,9 +1602,13 @@ export class WarDeployer {
    * only after a continuous absence proof and a final fresh-deploy recheck.
    */
   async deployAfterStart(
-    policy: PostStartDeploymentPolicy
+    policy: PostStartDeploymentPolicy,
+    outageOwnerId?: string,
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageCapability?: string,
   ): Promise<PostStartDeploymentResult> {
-    return this.withDeploymentLock(`post-start-deploy:${this.appName}`, 'deploy', async () => {
+    return this.withOutageAwareDeploymentLock(`post-start-deploy:${this.appName}`, 'deploy', async () => {
+      await this.beginOutageRollout(outageOwnerId, outageCapability, artifactExpectation);
       if (!(await this.warExists())) {
         throw new Error(`WAR_NOT_FOUND: No WAR file exists at ${this.warPath}`);
       }
@@ -681,7 +1632,7 @@ export class WarDeployer {
         );
       }
       return result;
-    });
+    }, outageOwnerId, outageCapability, artifactExpectation?.targetContentSha256);
   }
 
   /**
@@ -748,12 +1699,16 @@ export class WarDeployer {
    */
   async deployAuto(
     deploymentId?: string,
-    artifactExpectation?: DeploymentArtifactExpectation
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapability?: string,
   ): Promise<AutoDeployResult> {
     return this.deployAutoWithPreparation(
       undefined,
       deploymentId,
-      artifactExpectation
+      artifactExpectation,
+      outageOwnerId,
+      outageCapability,
     );
   }
 
@@ -761,7 +1716,9 @@ export class WarDeployer {
   async deployUploadedWar(
     warBuffer: Buffer,
     deploymentId?: string,
-    artifactExpectation?: DeploymentArtifactExpectation
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapability?: string,
   ): Promise<AutoDeployResult> {
     const uploadedHashes = calculateWarEntryHashes(warBuffer);
     if (Object.keys(uploadedHashes).length === 0) {
@@ -788,7 +1745,7 @@ export class WarDeployer {
         { warPath: this.warPath, size: warBuffer.length },
         'WAR file uploaded under deployment lease'
       );
-    }, deploymentId, artifactExpectation);
+    }, deploymentId, artifactExpectation, outageOwnerId, outageCapability);
   }
 
   /**
@@ -887,7 +1844,9 @@ export class WarDeployer {
   private async deployAutoWithPreparation(
     preparation?: (artifactBootEpoch: string) => Promise<void>,
     requestedDeploymentId?: string,
-    artifactExpectation?: DeploymentArtifactExpectation
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapability?: string,
   ): Promise<AutoDeployResult> {
     if (this.deployLock) {
       throw new Error('Deployment already in progress');
@@ -904,10 +1863,20 @@ export class WarDeployer {
         let operationError: unknown;
 
         try {
-          await this.fileLock.acquire(deploymentId);
+          await this.fileLock.acquire(
+            deploymentId,
+            this.outageLockAcquireOptions(
+              outageOwnerId,
+              outageCapability,
+              artifactExpectation?.targetContentSha256,
+              false,
+              false,
+            ),
+          );
           fileLockAcquired = true;
           return await this.withOwnedDeploymentLockContext(() =>
             this.withPayaraLease(`deploy-auto:${this.appName}`, async () => {
+        await this.beginOutageRollout(outageOwnerId, outageCapability, artifactExpectation);
         if (artifactExpectation) {
           await this.readArtifactBaseForMutation(artifactExpectation);
         }
@@ -946,7 +1915,12 @@ export class WarDeployer {
 
           this.setDeploymentStep('deploying');
           await this.fileLock.updateStep('deploy');
-          const postStart = await this.deployAfterStart('require-agent-owned');
+          const postStart = await this.deployAfterStart(
+            'require-agent-owned',
+            outageOwnerId,
+            artifactExpectation,
+            outageCapability,
+          );
           if (postStart.outcome !== 'agent-deployed') {
             throw new Error('BOOT_OWNER_CONFLICT: Payara retained deployment ownership');
           }
@@ -957,6 +1931,7 @@ export class WarDeployer {
           if (artifactExpectation) {
             artifact = await this.verifyTargetArtifact(artifactExpectation);
           }
+          await this.markOutageDeploymentApplied(outageOwnerId, outageCapability);
 
           const result = {
             deployed: isDeployed,
@@ -974,7 +1949,7 @@ export class WarDeployer {
           // Normal hot deploy
           this.setDeploymentStep('deploying');
           await this.fileLock.updateStep('deploy');
-          const result = await this.deploy();
+          const result = await this.deploy(outageOwnerId, artifactExpectation, outageCapability);
 
           this.setDeploymentStep('verifying');
           await this.fileLock.updateStep('verify');
@@ -1049,9 +2024,37 @@ export class WarDeployer {
   async withDeploymentLock<T>(
     label: string,
     step: DeploymentStep,
-    operation: () => Promise<T>
+    operation: () => Promise<T>,
   ): Promise<T> {
-    return this.withDeploymentFileLockInternal(label, step, operation, true);
+    return this.withDeploymentFileLockInternal(
+      label,
+      step,
+      operation,
+      true,
+    );
+  }
+
+  /** Internal mutation lock that may re-enter one exact owned fleet outage. */
+  private async withOutageAwareDeploymentLock<T>(
+    label: string,
+    step: DeploymentStep,
+    operation: () => Promise<T>,
+    outageOwnerId?: string,
+    outageCapability?: string,
+    targetContentSha256?: string,
+  ): Promise<T> {
+    return this.withDeploymentFileLockInternal(
+      label,
+      step,
+      operation,
+      true,
+      outageOwnerId,
+      outageCapability,
+      false,
+      false,
+      false,
+      targetContentSha256,
+    );
   }
 
   /**
@@ -1066,11 +2069,40 @@ export class WarDeployer {
     return this.withDeploymentFileLockInternal(label, step, operation, false);
   }
 
+  /** Observation-only serialization that cannot authorize Payara/WAR mutation. */
+  async withReadOnlyDeploymentFileLock<T>(
+    label: string,
+    step: DeploymentStep,
+    operation: () => Promise<T>,
+    outageScope?: DeploymentLockOutageScope,
+  ): Promise<T> {
+    return this.withDeploymentFileLockInternal(
+      label,
+      step,
+      operation,
+      false,
+      undefined,
+      undefined,
+      false,
+      true,
+      false,
+      outageScope?.targetContentSha256,
+      outageScope,
+    );
+  }
+
   private async withDeploymentFileLockInternal<T>(
     label: string,
     step: DeploymentStep,
     operation: () => Promise<T>,
-    acquirePayaraLease: boolean
+    acquirePayaraLease: boolean,
+    outageOwnerId?: string,
+    outageCapability?: string,
+    allowUnarmedOutageOwner = false,
+    skipOutageFenceCheck = false,
+    allowStaleReceiptWithoutHold = false,
+    outageTargetContentSha256?: string,
+    outageScopeOverride?: DeploymentLockOutageScope,
   ): Promise<T> {
     const inheritedToken = this.deploymentLockContext.getStore();
     if (
@@ -1078,6 +2110,13 @@ export class WarDeployer {
       && inheritedToken === this.activeDeploymentLockToken
     ) {
       await this.fileLock.updateStep(step);
+      if (!skipOutageFenceCheck) {
+        this.assertOutageMutationAllowed(
+          outageOwnerId,
+          outageCapability,
+          allowUnarmedOutageOwner,
+        );
+      }
       return this.withCoordinatedPayaraOperation(label, acquirePayaraLease, operation);
     }
 
@@ -1090,10 +2129,26 @@ export class WarDeployer {
     let fileLockAcquired = false;
     let operationError: unknown;
     try {
-      await this.fileLock.acquire(deploymentId);
+      const lockOptions = this.outageLockAcquireOptions(
+        outageOwnerId,
+        outageCapability,
+        outageTargetContentSha256,
+        allowUnarmedOutageOwner,
+        allowStaleReceiptWithoutHold,
+        outageScopeOverride,
+      );
+      await this.fileLock.acquire(deploymentId, lockOptions);
       fileLockAcquired = true;
       return await this.withOwnedDeploymentLockContext(async () => {
         await this.fileLock.updateStep(step);
+        if (!skipOutageFenceCheck) {
+          this.assertOutageMutationAllowed(
+            outageOwnerId,
+            outageCapability,
+            allowUnarmedOutageOwner,
+            allowStaleReceiptWithoutHold,
+          );
+        }
         return this.withCoordinatedPayaraOperation(label, acquirePayaraLease, operation);
       });
     } catch (err) {
@@ -1108,6 +2163,140 @@ export class WarDeployer {
         this.deployLock = false;
       }
     }
+  }
+
+  private outageLockAcquireOptions(
+    outageOwnerId: string | undefined,
+    outageCapability: string | undefined,
+    targetContentSha256: string | undefined,
+    allowUnarmedOutageOwner: boolean,
+    allowReceiptWithoutHold: boolean,
+    scopeOverride?: DeploymentLockOutageScope,
+  ): DeploymentLockAcquireOptions {
+    if (scopeOverride) return { outageScope: scopeOverride };
+    // Artifact expectations are part of every normal deployment. They do not
+    // turn an otherwise ordinary operation into an outage-scoped mutation.
+    if (!outageOwnerId && !outageCapability) return {};
+    if (!outageOwnerId || !outageCapability) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_AUTHORIZATION_INCOMPLETE',
+        'Outage lock ownership requires both owner and private capability',
+      );
+    }
+    const capabilitySha256 = outageCapabilitySha256(outageCapability);
+    const { store, scope } = this.requirePreparedStopStore();
+    const receipt = store.read(scope);
+    if (receipt) {
+      if (targetContentSha256 && receipt.targetContentSha256 !== targetContentSha256) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_TARGET_MISMATCH',
+          'The requested deployment lock target differs from the durable outage receipt',
+        );
+      }
+      if (receipt.outageOwnerId !== outageOwnerId
+        || receipt.outageCapabilitySha256 !== capabilitySha256) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_CAPABILITY_MISMATCH',
+          'The requested deployment lock differs from the durable outage receipt',
+        );
+      }
+      targetContentSha256 = receipt.targetContentSha256;
+    } else if (!allowUnarmedOutageOwner) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_NOT_ARMED',
+        'An outage-scoped deployment lock requires its durable receipt',
+      );
+    }
+    if (!targetContentSha256 || !SHA256_PATTERN.test(targetContentSha256)) {
+      throw outageFenceError(
+        'OUTAGE_FENCE_TARGET_INVALID',
+        'An outage-scoped deployment lock requires the exact rollout target',
+      );
+    }
+    const outageScope: DeploymentLockOutageScope = {
+      outageOwnerId,
+      targetContentSha256,
+      outageCapabilitySha256: capabilitySha256,
+    };
+    return {
+      outageScope,
+      authorizeStaleTakeover: this.staleOutageTakeoverAuthorization(
+        outageScope,
+        outageCapability,
+        allowUnarmedOutageOwner,
+        allowReceiptWithoutHold,
+      ),
+    };
+  }
+
+  private staleOutageTakeoverAuthorization(
+    outageScope: DeploymentLockOutageScope,
+    outageCapability: string,
+    allowUnarmedOutageOwner: boolean,
+    allowReceiptWithoutHold: boolean,
+  ): (staleLock: Readonly<LockData>) => Promise<void> {
+    return async staleLock => {
+      const { store, scope } = this.requirePreparedStopStore();
+      const receipt = store.read(scope);
+      if (staleLock.lockVersion !== 2
+        || staleLock.ownerKind !== 'payara-outage'
+        || staleLock.outageOwnerId !== outageScope.outageOwnerId
+        || staleLock.targetContentSha256 !== outageScope.targetContentSha256
+        || staleLock.outageCapabilitySha256 !== outageScope.outageCapabilitySha256) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_LOCK_SCOPE_MISMATCH',
+          'The stale lock is not the exact durable Payara outage authorization',
+        );
+      }
+      const hold = this.schedulerDeploymentHoldStore?.read();
+      if (!receipt) {
+        if (!allowUnarmedOutageOwner || hold) {
+          throw outageFenceError(
+            'OUTAGE_FENCE_CAPABILITY_MISMATCH',
+            'A stale deployment lock can be recovered only by its exact durable outage authorization',
+          );
+        }
+        // First stop may die after publishing its scoped lock but before
+        // persisting the receipt. No Payara or scheduler mutation has occurred.
+        return;
+      }
+      if (
+        receipt.outageOwnerId !== outageScope.outageOwnerId
+        || receipt.targetContentSha256 !== outageScope.targetContentSha256
+        || !this.capabilityMatches(receipt, outageCapability)
+      ) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_CAPABILITY_MISMATCH',
+          'A stale deployment lock can be recovered only by its exact durable outage authorization',
+        );
+      }
+      if (hold && (
+        hold.outageId !== receipt.outageOwnerId
+        || hold.targetContentSha256 !== receipt.targetContentSha256
+        || hold.capabilitySha256 !== receipt.outageCapabilitySha256
+      )) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_HOLD_MISMATCH',
+          'The scheduler hold changed before stale-lock recovery',
+        );
+      }
+      if (!hold
+        && receipt.phase !== 'releasing'
+        && !(allowUnarmedOutageOwner && receipt.phase === 'arming')
+        && !allowReceiptWithoutHold) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_HOLD_MISSING',
+          'Stale-lock recovery requires the exact scheduler hold outside an explicit recovery request',
+        );
+      }
+      const artifact = await this.getCurrentArtifactIdentity();
+      if (!this.receiptAllowsArtifact(receipt, artifact)) {
+        throw outageFenceError(
+          'OUTAGE_FENCE_TARGET_MISMATCH',
+          'The WAR changed before stale-lock recovery',
+        );
+      }
+    };
   }
 
   private async closeDeploymentLock(operationError?: unknown): Promise<void> {
@@ -1413,9 +2602,10 @@ export class WarDeployer {
       await this.fileLock.acquire(deploymentId);
       fileLockAcquired = true;
       await this.fileLock.updateStep('undeploy');
-      await this.withPayaraLease(`war-undeploy:${this.appName}`, () =>
-        this.payara.undeploy(this.appName)
-      );
+      this.assertOutageMutationAllowed();
+      await this.withPayaraLease(`war-undeploy:${this.appName}`, async () => {
+        await this.payara.undeploy(this.appName);
+      });
     } finally {
       try {
         if (fileLockAcquired) {
@@ -1458,7 +2648,9 @@ export class WarDeployer {
     changedFiles: FileChange[],
     deletedFiles: string[],
     requestedDeploymentId?: string,
-    artifactExpectation?: DeploymentArtifactExpectation
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapability?: string,
   ): Promise<FullDeployResult> {
     // Check in-memory lock first (quick check for same-process concurrency)
     if (this.deployLock) {
@@ -1479,10 +2671,20 @@ export class WarDeployer {
       // Acquire the cross-process lock after the synchronous in-memory claim.
       // This closes the same-process race between two requests entering before
       // either asynchronous file-lock check completes.
-      await this.fileLock.acquire(deploymentId);
+      await this.fileLock.acquire(
+        deploymentId,
+        this.outageLockAcquireOptions(
+          outageOwnerId,
+          outageCapability,
+          artifactExpectation?.targetContentSha256,
+          false,
+          false,
+        ),
+      );
       fileLockAcquired = true;
       return await this.withOwnedDeploymentLockContext(() =>
         this.withPayaraLease(`full-restart-deploy:${this.appName}`, async () => {
+      await this.beginOutageRollout(outageOwnerId, outageCapability, artifactExpectation);
 
       // Start deployment journal
       await this.journal.start({
@@ -1511,7 +2713,9 @@ export class WarDeployer {
       let artifact: WarArtifactIdentity | undefined = await this.applyChangesWithoutDeploy(
         changedFiles,
         deletedFiles,
-        artifactExpectation
+        artifactExpectation,
+        outageOwnerId,
+        outageCapability,
       );
       timings.warUpdate = Date.now() - warUpdateStart;
       this.logger.info({ duration: timings.warUpdate }, 'WAR file updated');
@@ -1566,7 +2770,12 @@ export class WarDeployer {
       await this.journal.updateStep('deploy');
 
       const deployStart = Date.now();
-      const postStart = await this.deployAfterStart('require-agent-owned');
+      const postStart = await this.deployAfterStart(
+        'require-agent-owned',
+        outageOwnerId,
+        artifactExpectation,
+        outageCapability,
+      );
       if (postStart.outcome !== 'agent-deployed') {
         throw new Error('BOOT_OWNER_CONFLICT: Payara retained deployment ownership');
       }
@@ -1582,6 +2791,7 @@ export class WarDeployer {
       if (artifactExpectation) {
         artifact = await this.verifyTargetArtifact(artifactExpectation);
       }
+      await this.markOutageDeploymentApplied(outageOwnerId, outageCapability);
 
       if (!isDeployed) {
         throw new Error(`Deployment verification failed: ${this.appName} not in application list`);
@@ -1621,6 +2831,7 @@ export class WarDeployer {
 
       } catch (err) {
       operationError = err;
+      if (isOutageFenceError(err)) throw err;
       const totalDuration = Date.now() - startTime;
       this.logger.error({ err, deploymentId, duration: totalDuration, timings }, 'Full deployment failed');
 
@@ -1670,21 +2881,27 @@ export class WarDeployer {
     changedFiles: FileChange[],
     deletedFiles: string[],
     deploymentId?: string,
-    artifactExpectation?: DeploymentArtifactExpectation
+    artifactExpectation?: DeploymentArtifactExpectation,
+    outageOwnerId?: string,
+    outageCapability?: string,
   ): Promise<DeployResult | FullDeployResult> {
     if (this.aggressiveMode) {
       return this.deployWithFullRestart(
         changedFiles,
         deletedFiles,
         deploymentId,
-        artifactExpectation
+        artifactExpectation,
+        outageOwnerId,
+        outageCapability,
       );
     }
     return this.applyChanges(
       changedFiles,
       deletedFiles,
       deploymentId,
-      artifactExpectation
+      artifactExpectation,
+      outageOwnerId,
+      outageCapability,
     );
   }
 }

@@ -3,7 +3,7 @@
 
 import { afterAll, beforeAll, describe, it, expect, vi } from 'vitest';
 import Fastify from 'fastify';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import createPayaraPlugin from '../src/index.js';
@@ -49,6 +49,15 @@ const validConfig: PayaraPluginConfig = {
 let mutationTokenDirectory: string;
 let previousControlTokenFile: string | undefined;
 const TEST_MUTATION_AUTH_TOKEN = 'test-only-mutation-token-'.repeat(2);
+
+function noOutageFence() {
+  return {
+    outageFenced: false,
+    preparedStopped: false,
+    running: true,
+    processCount: 1,
+  } as const;
+}
 
 beforeAll(async () => {
   mutationTokenDirectory = await mkdtemp(join(tmpdir(), 'payara-mutation-auth-'));
@@ -260,6 +269,449 @@ describe('createPayaraPlugin', () => {
   });
 
   describe('onStart', () => {
+    it.each([
+      {
+        receiptPhase: 'stopped' as const,
+        preparedStopped: true,
+        running: false,
+        processCount: 0,
+        schedulerDeploymentHold: true,
+      },
+      {
+        receiptPhase: 'releasing' as const,
+        preparedStopped: false,
+        running: true,
+        processCount: 1,
+        schedulerDeploymentHold: false,
+      },
+    ])(
+      'rehydrates secrets in memory after a fenced $receiptPhase restart without rewriting setenv.conf',
+      async outageRuntime => {
+        const payaraHome = await mkdtemp(join(tmpdir(), 'payara-fenced-restart-'));
+        const configDirectory = join(
+          payaraHome,
+          'glassfish',
+          'domains',
+          validConfig.domain,
+          'config',
+        );
+        const setenvPath = join(configDirectory, 'setenv.conf');
+        const persistedSetenv = "export DATABASE_PASSWORD='persisted-before-restart'\n";
+        await mkdir(configDirectory, { recursive: true });
+        await writeFile(setenvPath, persistedSetenv);
+        const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+          .mockResolvedValue({
+            outageFenced: true,
+            ...outageRuntime,
+            receiptId: '11111111-1111-4111-8111-111111111111',
+            outageOwnerId: '22222222-2222-4222-8222-222222222222',
+            targetContentSha256: 'a'.repeat(64),
+            artifact: {
+              size: 1,
+              sha256: 'b'.repeat(64),
+              contentSha256: 'c'.repeat(64),
+            },
+            ...(outageRuntime.receiptPhase === 'releasing'
+              ? {
+                  deployedArtifact: {
+                    size: 1,
+                    sha256: 'd'.repeat(64),
+                    contentSha256: 'a'.repeat(64),
+                  },
+                  applicationDeployed: true,
+                }
+              : {}),
+          });
+        const startupLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentLock');
+        const startPayara = vi.spyOn(PayaraManager.prototype, 'start');
+        const setEnvironment = vi.spyOn(PayaraManager.prototype, 'setEnvironment');
+        const updateEnvironment = vi.spyOn(PayaraManager.prototype, 'updateEnvironment');
+        const getSecret = vi.fn().mockResolvedValue({
+          data: { value: 'preserved-after-agent-restart' },
+        });
+        const context = {
+          ...mockContext,
+          getSecret,
+        } as unknown as PluginContext;
+        const plugin = createPayaraPlugin({
+          ...validConfig,
+          payaraHome,
+          secrets: { DATABASE_PASSWORD: 'alias:database-password' },
+        });
+
+        try {
+          await plugin.onInit?.(context);
+          await expect(plugin.onStart?.(context))
+            .resolves.toBeUndefined();
+
+          expect(preparedStop).toHaveBeenCalledOnce();
+          expect(getSecret).toHaveBeenCalledOnce();
+          expect(getSecret).toHaveBeenCalledWith('alias:database-password');
+          expect(startupLock).not.toHaveBeenCalled();
+          expect(startPayara).not.toHaveBeenCalled();
+          expect(setEnvironment).toHaveBeenCalledWith({
+            DATABASE_PASSWORD: 'preserved-after-agent-restart',
+          });
+          expect(updateEnvironment).not.toHaveBeenCalled();
+          expect(await readFile(setenvPath, 'utf8')).toBe(persistedSetenv);
+        } finally {
+          preparedStop.mockRestore();
+          startupLock.mockRestore();
+          startPayara.mockRestore();
+          setEnvironment.mockRestore();
+          updateEnvironment.mockRestore();
+          await rm(payaraHome, { recursive: true, force: true });
+        }
+      },
+    );
+
+    it('keeps only explicit outage recovery routes reachable after an orphaned hold on startup', async () => {
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockRejectedValue(new Error(
+          'SCHEDULER_DEPLOYMENT_HOLD_ORPHANED: boot hold exists without its mutation receipt',
+        ));
+      const recover = vi.spyOn(WarDeployer.prototype, 'recoverOutageFence')
+        .mockResolvedValue({ recovered: true });
+      const plugin = createPayaraPlugin(validConfig);
+      const fastify = Fastify({ logger: false });
+
+      try {
+        await plugin.onInit?.(mockContext as unknown as PluginContext);
+        await expect(plugin.onStart?.(mockContext as unknown as PluginContext))
+          .resolves.toBeUndefined();
+        await fastify.register(async scoped => {
+          await plugin.routes?.(scoped, mockContext as unknown as PluginContext);
+        }, { prefix: '/plugins/payara' });
+        await fastify.ready();
+
+        const blocked = await fastify.inject({
+          method: 'GET',
+          url: '/plugins/payara/status',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+        });
+        expect(blocked.statusCode).toBe(503);
+        expect(blocked.json()).toMatchObject({
+          error: 'STARTUP_RECONCILIATION_NOT_COMPLETE',
+          startupReconciliation: 'recovery_only',
+        });
+
+        const recovered = await fastify.inject({
+          method: 'POST',
+          url: '/plugins/payara/stop-for-deployment/recover',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+          payload: {
+            outageOwnerId: '22222222-2222-4222-8222-222222222222',
+            reason: 'Operator verified the orphaned deployment hold.',
+          },
+        });
+        expect(recovered.statusCode, recovered.body).toBe(200);
+        expect(recover).toHaveBeenCalledOnce();
+
+        const stillBlocked = await fastify.inject({
+          method: 'GET',
+          url: '/plugins/payara/status',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+        });
+        expect(stillBlocked.statusCode).toBe(503);
+      } finally {
+        await fastify.close();
+        preparedStop.mockRestore();
+        recover.mockRestore();
+      }
+    });
+
+    it('keeps a stale exact outage lock in recovery-only mode while exposing its re-entrant stop rail', async () => {
+      const outageOwnerId = '22222222-2222-4222-8222-222222222222';
+      const targetContentSha256 = 'a'.repeat(64);
+      const outageCapability = Buffer.alloc(32, 7).toString('base64url');
+      const artifact = {
+        size: 1,
+        sha256: 'b'.repeat(64),
+        contentSha256: 'c'.repeat(64),
+      };
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockResolvedValue({
+          outageFenced: true,
+          preparedStopped: false,
+          running: true,
+          processCount: 1,
+          receiptPhase: 'arming',
+          receiptId: '11111111-1111-4111-8111-111111111111',
+          outageOwnerId,
+          targetContentSha256,
+          capabilityBound: true,
+          schedulerDeploymentHold: false,
+          artifact,
+          currentArtifact: artifact,
+          mutationLockStale: true,
+          mutationLockOwnerKind: 'payara-outage',
+        });
+      const stopForDeployment = vi.spyOn(WarDeployer.prototype, 'stopForDeployment')
+        .mockResolvedValue({
+          outageFenced: true,
+          preparedStopped: true,
+          running: false,
+          processCount: 0,
+          receiptPhase: 'stopped',
+          receiptId: '11111111-1111-4111-8111-111111111111',
+          outageOwnerId,
+          targetContentSha256,
+          artifact,
+        });
+      const plugin = createPayaraPlugin(validConfig);
+      const fastify = Fastify({ logger: false });
+
+      try {
+        await plugin.onInit?.(mockContext as unknown as PluginContext);
+        await expect(plugin.onStart?.(mockContext as unknown as PluginContext))
+          .resolves.toBeUndefined();
+        await plugin.routes?.(fastify, mockContext as unknown as PluginContext);
+        await fastify.ready();
+
+        const normalRoute = await fastify.inject({
+          method: 'GET',
+          url: '/status',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+        });
+        expect(normalRoute.statusCode).toBe(503);
+        expect(normalRoute.json()).toMatchObject({
+          startupReconciliation: 'recovery_only',
+        });
+
+        const recoveryStatus = await fastify.inject({
+          method: 'GET',
+          url: '/stop-for-deployment/status',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+        });
+        expect(recoveryStatus.statusCode, recoveryStatus.body).toBe(200);
+        expect(recoveryStatus.json()).toMatchObject({
+          outageFenced: true,
+          receiptPhase: 'arming',
+          mutationLockStale: true,
+        });
+
+        const resumedStop = await fastify.inject({
+          method: 'POST',
+          url: '/stop-for-deployment',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+          payload: { outageOwnerId, targetContentSha256, outageCapability },
+        });
+        expect(resumedStop.statusCode, resumedStop.body).toBe(200);
+        expect(stopForDeployment).toHaveBeenCalledWith(
+          outageOwnerId,
+          targetContentSha256,
+          outageCapability,
+        );
+      } finally {
+        await fastify.close();
+        preparedStop.mockRestore();
+        stopForDeployment.mockRestore();
+      }
+    });
+
+    it('closes the recovery-only deploy rail after explicit recovery clears the outage fence', async () => {
+      const outageOwnerId = '22222222-2222-4222-8222-222222222222';
+      const targetContentSha256 = 'a'.repeat(64);
+      const outageCapability = Buffer.alloc(32, 9).toString('base64url');
+      const artifact = { size: 1, sha256: 'b'.repeat(64), contentSha256: 'c'.repeat(64) };
+      let recovered = false;
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockImplementation(async () => recovered ? noOutageFence() : {
+          outageFenced: true,
+          preparedStopped: false,
+          running: true,
+          processCount: 1,
+          receiptPhase: 'arming',
+          receiptId: '11111111-1111-4111-8111-111111111111',
+          outageOwnerId,
+          targetContentSha256,
+          capabilityBound: true,
+          schedulerDeploymentHold: false,
+          artifact,
+          currentArtifact: artifact,
+          mutationLockStale: true,
+          mutationLockOwnerKind: 'payara-outage',
+        });
+      const recover = vi.spyOn(WarDeployer.prototype, 'recoverOutageFence')
+        .mockImplementation(async () => {
+          recovered = true;
+          return { recovered: true };
+        });
+      const deployAuto = vi.spyOn(WarDeployer.prototype, 'deployAuto');
+      const startPayara = vi.spyOn(PayaraManager.prototype, 'start');
+      const plugin = createPayaraPlugin(validConfig);
+      const fastify = Fastify({ logger: false });
+
+      try {
+        await plugin.onInit?.(mockContext as unknown as PluginContext);
+        await expect(plugin.onStart?.(mockContext as unknown as PluginContext))
+          .resolves.toBeUndefined();
+        await plugin.routes?.(fastify, mockContext as unknown as PluginContext);
+        await fastify.ready();
+
+        const blockedWhileFenced = await fastify.inject({
+          method: 'POST',
+          url: '/deploy/full',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+          payload: {},
+        });
+        expect(blockedWhileFenced.statusCode, blockedWhileFenced.body).toBe(503);
+        expect(deployAuto).not.toHaveBeenCalled();
+
+        const recovery = await fastify.inject({
+          method: 'POST',
+          url: '/stop-for-deployment/recover',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+          payload: {
+            outageOwnerId,
+            targetContentSha256,
+            outageCapability,
+            reason: 'Operator reconciled the stale outage lock.',
+          },
+        });
+        expect(recovery.statusCode, recovery.body).toBe(200);
+
+        const blockedDeploy = await fastify.inject({
+          method: 'POST',
+          url: '/deploy/full',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+          payload: {},
+        });
+        expect(blockedDeploy.statusCode, blockedDeploy.body).toBe(503);
+        expect(blockedDeploy.json()).toMatchObject({
+          error: 'STARTUP_RECONCILIATION_NOT_COMPLETE',
+          startupReconciliation: 'recovery_only',
+        });
+        expect(recover).toHaveBeenCalledOnce();
+        expect(deployAuto).not.toHaveBeenCalled();
+        expect(startPayara).not.toHaveBeenCalled();
+      } finally {
+        await fastify.close();
+        preparedStop.mockRestore();
+        recover.mockRestore();
+        deployAuto.mockRestore();
+        startPayara.mockRestore();
+      }
+    });
+
+    it('does not let a temporary Vault failure deadlock a running outage release', async () => {
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockResolvedValue({
+          outageFenced: true,
+          preparedStopped: false,
+          running: true,
+          processCount: 1,
+          receiptPhase: 'releasing',
+          receiptId: '11111111-1111-4111-8111-111111111111',
+          outageOwnerId: '22222222-2222-4222-8222-222222222222',
+          targetContentSha256: 'a'.repeat(64),
+          artifact: { size: 1, sha256: 'b'.repeat(64), contentSha256: 'c'.repeat(64) },
+          deployedArtifact: { size: 1, sha256: 'd'.repeat(64), contentSha256: 'a'.repeat(64) },
+          schedulerDeploymentHold: false,
+          applicationDeployed: true,
+        });
+      const recover = vi.spyOn(WarDeployer.prototype, 'recoverOutageFence')
+        .mockResolvedValue({ recovered: true });
+      const failingContext = {
+        ...mockContext,
+        getSecret: vi.fn().mockRejectedValue(new Error('temporary Vault outage')),
+      } as unknown as PluginContext;
+      const plugin = createPayaraPlugin({
+        ...validConfig,
+        secrets: { DATABASE_PASSWORD: 'alias:database-password' },
+      });
+      const fastify = Fastify({ logger: false });
+
+      try {
+        await plugin.onInit?.(failingContext);
+        await expect(plugin.onStart?.(failingContext)).resolves.toBeUndefined();
+        await plugin.routes?.(fastify, failingContext);
+        await fastify.ready();
+
+        const recovered = await fastify.inject({
+          method: 'POST',
+          url: '/stop-for-deployment/recover',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+          payload: {
+            outageOwnerId: '22222222-2222-4222-8222-222222222222',
+            reason: 'Operator reconciled the running outage after Vault failed.',
+          },
+        });
+        expect(recovered.statusCode, recovered.body).toBe(200);
+        expect(recover).toHaveBeenCalledOnce();
+      } finally {
+        await fastify.close();
+        preparedStop.mockRestore();
+        recover.mockRestore();
+      }
+    });
+
+    it('blocks runtime mutation when an outage fence survives but Vault cannot rehydrate secrets', async () => {
+      const outageOwnerId = '22222222-2222-4222-8222-222222222222';
+      const targetContentSha256 = 'a'.repeat(64);
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockResolvedValue({
+          outageFenced: true,
+          preparedStopped: true,
+          running: false,
+          processCount: 0,
+          receiptPhase: 'stopped',
+          receiptId: '11111111-1111-4111-8111-111111111111',
+          outageOwnerId,
+          targetContentSha256,
+          artifact: { size: 1, sha256: 'b'.repeat(64), contentSha256: 'c'.repeat(64) },
+        });
+      const startPayara = vi.spyOn(PayaraManager.prototype, 'start');
+      const updateEnvironment = vi.spyOn(PayaraManager.prototype, 'updateEnvironment');
+      const deployAuto = vi.spyOn(WarDeployer.prototype, 'deployAuto');
+      const failingContext = {
+        ...mockContext,
+        getSecret: vi.fn().mockRejectedValue(new Error('temporary Vault outage')),
+      } as unknown as PluginContext;
+      const plugin = createPayaraPlugin({
+        ...validConfig,
+        secrets: { DATABASE_PASSWORD: 'alias:database-password' },
+      });
+      const fastify = Fastify({ logger: false });
+
+      try {
+        await plugin.onInit?.(failingContext);
+        await expect(plugin.onStart?.(failingContext)).resolves.toBeUndefined();
+        await fastify.register(async scoped => {
+          await plugin.routes?.(scoped, failingContext);
+        }, { prefix: '/plugins/payara' });
+        await fastify.ready();
+
+        const status = await fastify.inject({
+          method: 'GET',
+          url: '/plugins/payara/stop-for-deployment/status',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+        });
+        expect(status.statusCode, status.body).toBe(200);
+
+        const blockedDeploy = await fastify.inject({
+          method: 'POST',
+          url: '/plugins/payara/deploy/full',
+          headers: { authorization: `Bearer ${TEST_MUTATION_AUTH_TOKEN}` },
+          payload: {},
+        });
+        expect(blockedDeploy.statusCode, blockedDeploy.body).toBe(503);
+        expect(blockedDeploy.json()).toMatchObject({
+          error: 'STARTUP_RECONCILIATION_NOT_COMPLETE',
+          startupReconciliation: 'recovery_only',
+        });
+        expect(startPayara).not.toHaveBeenCalled();
+        expect(updateEnvironment).not.toHaveBeenCalled();
+        expect(deployAuto).not.toHaveBeenCalled();
+      } finally {
+        await fastify.close();
+        preparedStop.mockRestore();
+        startPayara.mockRestore();
+        updateEnvironment.mockRestore();
+        deployAuto.mockRestore();
+      }
+    });
+
     it('does not settle until startup reconciliation releases the file lock', async () => {
       let release!: () => void;
       const pending = new Promise<void>(resolve => {
@@ -267,6 +719,8 @@ describe('createPayaraPlugin', () => {
       });
       const startupLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentLock')
         .mockImplementation(async () => pending);
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockResolvedValue(noOutageFence());
       const plugin = createPayaraPlugin(validConfig);
 
       try {
@@ -289,6 +743,7 @@ describe('createPayaraPlugin', () => {
       } finally {
         release();
         startupLock.mockRestore();
+        preparedStop.mockRestore();
       }
     });
 
@@ -299,6 +754,8 @@ describe('createPayaraPlugin', () => {
       });
       const startupLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentLock')
         .mockImplementation(async () => pending);
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockResolvedValue(noOutageFence());
       const fileLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentFileLock');
       const getStatus = vi.spyOn(PayaraManager.prototype, 'getStatus');
       const plugin = createPayaraPlugin(validConfig);
@@ -326,6 +783,7 @@ describe('createPayaraPlugin', () => {
       } finally {
         release();
         startupLock.mockRestore();
+        preparedStop.mockRestore();
         fileLock.mockRestore();
         getStatus.mockRestore();
       }
@@ -362,6 +820,8 @@ describe('createPayaraPlugin', () => {
       const failure = new Error('startup exploded');
       const startupLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentLock')
         .mockRejectedValue(failure);
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockResolvedValue(noOutageFence());
       const fileLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentFileLock');
       const plugin = createPayaraPlugin(validConfig);
 
@@ -379,6 +839,7 @@ describe('createPayaraPlugin', () => {
         expect(fileLock).not.toHaveBeenCalled();
       } finally {
         startupLock.mockRestore();
+        preparedStop.mockRestore();
         fileLock.mockRestore();
       }
     });
@@ -535,6 +996,8 @@ describe('createPayaraPlugin', () => {
     it('single-flights and caches a read-only health snapshot without reconciliation', async () => {
       const startupLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentLock')
         .mockResolvedValue(undefined);
+      const preparedStop = vi.spyOn(WarDeployer.prototype, 'getPreparedStopStatus')
+        .mockResolvedValue(noOutageFence());
       const fileLock = vi.spyOn(WarDeployer.prototype, 'withDeploymentFileLock');
       const readBootStatus = vi.spyOn(PayaraManager.prototype, 'readBootDeploymentStatus');
       const getBootStatus = vi.spyOn(PayaraManager.prototype, 'getBootDeploymentStatus')
@@ -588,6 +1051,7 @@ describe('createPayaraPlugin', () => {
         expect(readBootStatus).not.toHaveBeenCalled();
       } finally {
         startupLock.mockRestore();
+        preparedStop.mockRestore();
         fileLock.mockRestore();
         readBootStatus.mockRestore();
         getBootStatus.mockRestore();

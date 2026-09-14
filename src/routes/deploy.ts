@@ -13,13 +13,19 @@ import {
   checkDeploymentInProgress,
   DEPLOYMENT_ID_HEADER,
   EXPECTED_BASE_SHA256_HEADER,
+  OUTAGE_OWNER_ID_HEADER,
+  OUTAGE_CAPABILITY_HEADER,
   TARGET_CONTENT_SHA256_HEADER,
+  deploymentMutationErrorStatus,
   resolveDeploymentId,
+  resolveOutageOwnerId,
+  resolveOutageCapability,
   resolveArtifactExpectation,
   resolveBinaryArtifactExpectation,
   validateDeployRequest,
   decodeFileContents,
 } from './helpers.js';
+import { outageCapabilitySha256 } from '../war-deployer.js';
 
 /**
  * Register deployment routes
@@ -47,6 +53,8 @@ export async function registerDeployRoutes(
     const {
       deploymentId: requestedDeploymentId,
       artifact: requestedArtifact,
+      outageOwnerId: requestedOutageOwnerId,
+      outageCapability: requestedOutageCapability,
       files,
       deletions,
     } = request.body;
@@ -56,6 +64,14 @@ export async function registerDeployRoutes(
       request.headers[DEPLOYMENT_ID_HEADER]
     );
     if (!deploymentId) return;
+    const outageOwnerId = resolveOutageOwnerId(requestedOutageOwnerId, reply);
+    if (requestedOutageOwnerId !== undefined && !outageOwnerId) return;
+    const outageCapability = resolveOutageCapability(
+      requestedOutageCapability,
+      outageOwnerId,
+      reply,
+    );
+    if (outageOwnerId && !outageCapability) return;
 
     // Validate request
     if (validateDeployRequest(request.body, reply)) {
@@ -79,12 +95,21 @@ export async function registerDeployRoutes(
       }, 'Starting deployment via asadmin');
 
       // Deploy using asadmin deploy command (uses aggressive mode if configured)
-      const result = await deployer.applyChangesAuto(
-        changedFiles,
-        deletions,
-        deploymentId,
-        artifact
-      );
+      const result = outageOwnerId
+        ? await deployer.applyChangesAuto(
+            changedFiles,
+            deletions,
+            deploymentId,
+            artifact,
+            outageOwnerId,
+            outageCapability,
+          )
+        : await deployer.applyChangesAuto(
+            changedFiles,
+            deletions,
+            deploymentId,
+            artifact,
+          );
 
       const completedAt = Date.now();
 
@@ -106,7 +131,7 @@ export async function registerDeployRoutes(
       }
     } catch (err) {
       logger.error({ err }, 'Deployment failed');
-      return reply.code(500).send({
+      return reply.code(deploymentMutationErrorStatus(err)).send({
         error: 'Deployment failed',
         message: getErrorMessage(err),
         deploymentId,
@@ -120,7 +145,7 @@ export async function registerDeployRoutes(
    * In aggressive mode: undeploy → stop → kill → start → deploy
    */
   fastify.post<{
-    Body?: { deploymentId?: string; artifact?: unknown };
+    Body?: { deploymentId?: string; artifact?: unknown; outageOwnerId?: unknown; outageCapability?: unknown };
   }>('/deploy/full', async (request, reply) => {
     const deploymentId = resolveDeploymentId(
       request.body?.deploymentId,
@@ -130,6 +155,17 @@ export async function registerDeployRoutes(
     if (!deploymentId) return;
     const artifact = resolveArtifactExpectation(request.body?.artifact, reply);
     if (!artifact) return;
+    const outageOwnerId = resolveOutageOwnerId(
+      request.body?.outageOwnerId,
+      reply,
+    );
+    if (request.body?.outageOwnerId !== undefined && !outageOwnerId) return;
+    const outageCapability = resolveOutageCapability(
+      request.body?.outageCapability,
+      outageOwnerId,
+      reply,
+    );
+    if (outageOwnerId && !outageCapability) return;
 
     if (checkDeploymentInProgress(deployer, deploymentId, reply)) {
       return;
@@ -139,7 +175,9 @@ export async function registerDeployRoutes(
       logger.info('Starting full deployment via asadmin');
 
       // Use deployAuto which respects aggressive mode
-      const result = await deployer.deployAuto(deploymentId, artifact);
+      const result = outageOwnerId
+        ? await deployer.deployAuto(deploymentId, artifact, outageOwnerId, outageCapability)
+        : await deployer.deployAuto(deploymentId, artifact);
       const completedAt = Date.now();
 
       const response = {
@@ -160,7 +198,7 @@ export async function registerDeployRoutes(
         : reply.code(500).send(response);
     } catch (err) {
       logger.error({ err }, 'Full deployment failed');
-      return reply.code(500).send({
+      return reply.code(deploymentMutationErrorStatus(err)).send({
         error: 'Deployment failed',
         message: getErrorMessage(err),
         deploymentId,
@@ -189,6 +227,15 @@ export async function registerDeployRoutes(
       reply
     );
     if (!artifact) return;
+    const requestedOutageOwnerId = request.headers[OUTAGE_OWNER_ID_HEADER];
+    const outageOwnerId = resolveOutageOwnerId(requestedOutageOwnerId, reply);
+    if (requestedOutageOwnerId !== undefined && !outageOwnerId) return;
+    const outageCapability = resolveOutageCapability(
+      request.headers[OUTAGE_CAPABILITY_HEADER],
+      outageOwnerId,
+      reply,
+    );
+    if (outageOwnerId && !outageCapability) return;
 
     if (checkDeploymentInProgress(deployer, deploymentId, reply)) {
       return;
@@ -208,11 +255,15 @@ export async function registerDeployRoutes(
 
       // Write and deploy under one lease so concurrent uploads cannot replace
       // the artifact while asadmin is reading it.
-      const result = await deployer.deployUploadedWar(
-        warBuffer,
-        deploymentId,
-        artifact
-      );
+      const result = outageOwnerId
+        ? await deployer.deployUploadedWar(
+            warBuffer,
+            deploymentId,
+            artifact,
+            outageOwnerId,
+            outageCapability,
+          )
+        : await deployer.deployUploadedWar(warBuffer, deploymentId, artifact);
       const completedAt = Date.now();
 
       if (result.deployed) {
@@ -245,7 +296,7 @@ export async function registerDeployRoutes(
       }
     } catch (err) {
       logger.error({ err }, 'WAR upload failed');
-      return reply.code(500).send({
+      return reply.code(deploymentMutationErrorStatus(err)).send({
         error: 'WAR upload failed',
         message: getErrorMessage(err),
         deploymentId,
@@ -271,6 +322,8 @@ export async function registerDeployRoutes(
       expectedFiles,
       commit,
       artifact: requestedArtifact,
+      outageOwnerId: requestedOutageOwnerId,
+      outageCapability: requestedOutageCapability,
     } = request.body;
 
     // Validate caller ownership before decoding files, creating a session, or
@@ -281,6 +334,17 @@ export async function registerDeployRoutes(
       request.headers[DEPLOYMENT_ID_HEADER]
     );
     if (!deploymentId) return;
+    const outageOwnerId = resolveOutageOwnerId(requestedOutageOwnerId, reply);
+    if (requestedOutageOwnerId !== undefined && !outageOwnerId) return;
+    const outageCapability = resolveOutageCapability(
+      requestedOutageCapability,
+      outageOwnerId,
+      reply,
+    );
+    if (outageOwnerId && !outageCapability) return;
+    const outageCapabilityHash = outageCapability
+      ? outageCapabilitySha256(outageCapability)
+      : undefined;
 
     // Validate request
     if (!Array.isArray(files)) {
@@ -310,6 +374,22 @@ export async function registerDeployRoutes(
           sameOperation: false,
         });
       }
+      if (outageOwnerId !== session.outageOwnerId) {
+        return reply.code(409).send({
+          error: 'Chunk outage owner mismatch',
+          message: 'The chunk session belongs to a different fleet-outage owner.',
+          deploymentId: session.deploymentId,
+          sameOperation: false,
+        });
+      }
+      if (outageCapabilityHash !== session.outageCapabilitySha256) {
+        return reply.code(409).send({
+          error: 'Chunk outage capability mismatch',
+          message: 'The chunk session belongs to a different fleet-outage capability.',
+          deploymentId: session.deploymentId,
+          sameOperation: false,
+        });
+      }
       if (requestedArtifact !== undefined) {
         const artifact = resolveArtifactExpectation(requestedArtifact, reply);
         if (!artifact) return;
@@ -331,12 +411,21 @@ export async function registerDeployRoutes(
       const artifact = resolveArtifactExpectation(requestedArtifact, reply);
       if (!artifact) return;
       // Create new session (automatically cleans up old sessions)
-      session = sessionStore.create(
-        deletions ?? [],
-        expectedFiles,
-        deploymentId,
-        artifact
-      );
+      session = outageOwnerId
+        ? sessionStore.create(
+            deletions ?? [],
+            expectedFiles,
+            deploymentId,
+            artifact,
+            outageOwnerId,
+            outageCapabilityHash,
+          )
+        : sessionStore.create(
+            deletions ?? [],
+            expectedFiles,
+            deploymentId,
+            artifact,
+          );
       // Add initial files
       sessionStore.addFiles(session.id, files);
     }
@@ -369,12 +458,21 @@ export async function registerDeployRoutes(
         }, 'Committing chunked deployment via asadmin');
 
         // Deploy using asadmin deploy command (uses aggressive mode if configured)
-        const result = await deployer.applyChangesAuto(
-          changedFiles,
-          session.deletions,
-          deploymentId,
-          session.artifact
-        );
+        const result = session.outageOwnerId
+          ? await deployer.applyChangesAuto(
+              changedFiles,
+              session.deletions,
+              deploymentId,
+              session.artifact,
+              session.outageOwnerId,
+              outageCapability,
+            )
+          : await deployer.applyChangesAuto(
+              changedFiles,
+              session.deletions,
+              deploymentId,
+              session.artifact,
+            );
         const completedAt = Date.now();
 
         // Clean up session
@@ -388,7 +486,7 @@ export async function registerDeployRoutes(
         sessionStore.delete(session.id);
 
         logger.error({ err, sessionId: session.id }, 'Chunked deployment failed');
-        return reply.code(500).send({
+        return reply.code(deploymentMutationErrorStatus(err)).send({
           error: 'Deployment failed',
           message: getErrorMessage(err),
           deploymentId,
@@ -441,7 +539,7 @@ export async function registerDeployRoutes(
       const stableDeployStatus = deployer.getDeploymentStatus();
 
       try {
-        return await deployer.withDeploymentFileLock(
+        return await deployer.withReadOnlyDeploymentFileLock(
           `deploy-status:${appName}`,
           'verify',
           async () => {

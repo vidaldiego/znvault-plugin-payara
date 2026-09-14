@@ -5,6 +5,18 @@ import type { Logger } from 'pino';
 import type { PayaraManager } from '../payara-manager.js';
 import type { WarDeployer } from '../war-deployer.js';
 import type { SessionStore } from '../session-store.js';
+import type {
+  SchedulerDeploymentFinalizeReceipt,
+  SchedulerDeploymentStatusReceipt,
+} from '../scheduler-internal-client.js';
+
+export type SchedulerDeploymentFinalize = (
+  outageId: string,
+  targetContentSha256: string,
+  outageCapability: string,
+) => Promise<SchedulerDeploymentFinalizeReceipt>;
+
+export type SchedulerDeploymentStatus = () => Promise<SchedulerDeploymentStatusReceipt>;
 
 /**
  * Context passed to route handlers
@@ -16,6 +28,10 @@ export interface RouteContext {
   logger: Logger;
   /** Running plugin package version for the authenticated CLI compatibility gate. */
   pluginVersion: string;
+  /** Exact loopback znapi atomic marker/latch finalization path. */
+  finalizeSchedulerDeployment: SchedulerDeploymentFinalize;
+  /** Exact loopback readback used only for reboot recovery after hold removal. */
+  getSchedulerDeploymentStatus: SchedulerDeploymentStatus;
 }
 
 /**

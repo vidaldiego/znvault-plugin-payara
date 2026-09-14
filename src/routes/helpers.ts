@@ -11,10 +11,63 @@ export const DEPLOYMENT_ID_HEADER = 'x-znvault-deployment-id';
 export const EXPECTED_BASE_SHA256_HEADER = 'x-znvault-expected-base-sha256';
 /** Canonical entry-content target token for binary uploads. */
 export const TARGET_CONTENT_SHA256_HEADER = 'x-znvault-target-content-sha256';
+/** Full-fleet outage owner; present only on the strict cold-rollout rail. */
+export const OUTAGE_OWNER_ID_HEADER = 'x-znvault-outage-owner-id';
+/** Secret outage capability. It must be redacted by every HTTP logger. */
+export const OUTAGE_CAPABILITY_HEADER = 'x-znvault-outage-capability';
 
 const DEPLOYMENT_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const OUTAGE_CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
+
+export function resolveOutageCapability(
+  value: unknown,
+  owner: string | undefined,
+  reply: FastifyReply,
+): string | undefined {
+  if (!owner && (value === undefined || value === null || value === '')) return undefined;
+  if (typeof value !== 'string' || !OUTAGE_CAPABILITY_PATTERN.test(value)
+    || Buffer.from(value, 'base64url').length !== 32
+    || Buffer.from(value, 'base64url').toString('base64url') !== value) {
+    reply.code(400).send({
+      error: 'Invalid outage capability',
+      message: 'A canonical 32-byte base64url outage capability is required with outageOwnerId',
+    });
+    return undefined;
+  }
+  return value;
+}
+
+/** Validate the optional fleet-outage owner without changing legacy requests. */
+export function resolveOutageOwnerId(
+  value: unknown,
+  reply: FastifyReply,
+): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string' || !DEPLOYMENT_ID_PATTERN.test(value)) {
+    reply.code(400).send({
+      error: 'Invalid outage owner',
+      message: 'outageOwnerId must be a lowercase UUIDv4 when supplied',
+    });
+    return undefined;
+  }
+  return value;
+}
+
+/** Outage-fence conflicts are deterministic 409s, not deployment failures. */
+export function deploymentMutationErrorStatus(error: unknown): 400 | 409 | 500 {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = error instanceof Error && error.name !== 'Error'
+    ? error.name
+    : message.match(/^([A-Z][A-Z0-9_]+):/)?.[1] ?? '';
+  if (code === 'OUTAGE_FENCE_OWNER_INVALID' || code === 'OUTAGE_FENCE_TARGET_INVALID'
+    || code === 'OUTAGE_FENCE_CAPABILITY_INVALID') {
+    return 400;
+  }
+  if (code.startsWith('OUTAGE_FENCE_')) return 409;
+  return 500;
+}
 
 /** Validate the explicit artifact CAS contract shared by every deploy rail. */
 export function resolveArtifactExpectation(

@@ -21,6 +21,8 @@ import {
 
 const AUTH_TOKEN = 'polling-test-payara-token-0123456789abcdef';
 const AUTHORIZATION = `Bearer ${AUTH_TOKEN}`;
+const OUTAGE_OWNER = '11111111-1111-4111-8111-111111111111';
+const OUTAGE_CAPABILITY = Buffer.alloc(32, 3).toString('base64url');
 const logger = pino({ level: 'silent' });
 
 const readyBoot = {
@@ -499,5 +501,49 @@ describe('deployment timeout polling receipts', () => {
     });
     expect(applyChangesAuto).not.toHaveBeenCalled();
     expect(deployer.getDeploymentStatus().deploymentId).toBeUndefined();
+  });
+
+  it('binds a chunk session to the capability hash and rejects a different secret', async () => {
+    const deploymentId = '00000000-0000-4000-8000-000000000108';
+    const first = await app.inject({
+      method: 'POST',
+      url: '/deploy/chunk',
+      headers: { authorization: AUTHORIZATION },
+      payload: {
+        deploymentId,
+        artifact: artifactExpectation,
+        outageOwnerId: OUTAGE_OWNER,
+        outageCapability: OUTAGE_CAPABILITY,
+        files: [],
+        deletions: [],
+        expectedFiles: 1,
+        commit: false,
+      },
+    });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.body).not.toContain(OUTAGE_CAPABILITY);
+    const sessionId = first.json<{ sessionId: string }>().sessionId;
+    const applyChangesAuto = vi.spyOn(deployer, 'applyChangesAuto');
+
+    const crossed = await app.inject({
+      method: 'POST',
+      url: '/deploy/chunk',
+      headers: { authorization: AUTHORIZATION },
+      payload: {
+        deploymentId,
+        sessionId,
+        outageOwnerId: OUTAGE_OWNER,
+        outageCapability: Buffer.alloc(32, 4).toString('base64url'),
+        files: [],
+        commit: true,
+      },
+    });
+
+    expect(crossed.statusCode, crossed.body).toBe(409);
+    expect(crossed.json()).toMatchObject({
+      error: 'Chunk outage capability mismatch',
+      sameOperation: false,
+    });
+    expect(applyChangesAuto).not.toHaveBeenCalled();
   });
 });

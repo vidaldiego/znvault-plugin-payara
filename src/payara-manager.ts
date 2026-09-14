@@ -3550,6 +3550,16 @@ export class PayaraManager {
     return status;
   }
 
+  /** Strict, uncached runtime evidence for a deployment-stop safety boundary. */
+  async getStrictRuntimeStopStatus(): Promise<{
+    running: boolean;
+    processCount: number;
+  }> {
+    const running = await this.isRunningStrict();
+    const processPids = await this.getPayaraProcessPidsStrict();
+    return { running, processCount: processPids.length };
+  }
+
   /**
    * Invalidate the status cache.
    * Call this after operations that change Payara state (start, stop, restart).

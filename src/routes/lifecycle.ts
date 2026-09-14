@@ -56,6 +56,19 @@ const OPERATOR_CONFLICT_CODES = new Set([
   'BOOT_RECOVERY_STATE_INVALID',
   'BOOT_RUNTIME_IDENTITY_MISMATCH',
   'BOOT_STARTUP_ACTIVE',
+  'OUTAGE_FENCE_ACTIVE',
+  'OUTAGE_FENCE_CAPABILITY_MISMATCH',
+  'OUTAGE_FENCE_NOT_ARMED',
+  'OUTAGE_FENCE_OWNER_MISMATCH',
+  'OUTAGE_FENCE_PHASE_INVALID',
+  'OUTAGE_FENCE_PID0_REQUIRED',
+  'OUTAGE_FENCE_RECOVERY_REQUIRED',
+  'OUTAGE_FENCE_RELEASE_UNPROVEN',
+  'OUTAGE_FENCE_FINALIZE_UNPROVEN',
+  'OUTAGE_FENCE_HOLD_MISMATCH',
+  'OUTAGE_FENCE_HOLD_MISSING',
+  'OUTAGE_FENCE_ORPHANED_HOLD',
+  'OUTAGE_FENCE_TARGET_MISMATCH',
 ]);
 
 function operatorErrorCode(error: unknown): string {
@@ -64,9 +77,16 @@ function operatorErrorCode(error: unknown): string {
   return error.message.match(/^([A-Z][A-Z0-9_]+):/)?.[1] ?? '';
 }
 
-function operatorErrorStatus(error: unknown): 403 | 409 | 500 | 503 {
+function operatorErrorStatus(error: unknown): 400 | 403 | 409 | 500 | 503 {
   const code = operatorErrorCode(error);
   if (code === 'OPERATOR_ROUTE_LOCAL_ONLY') return 403;
+  if (
+    code === 'OUTAGE_FENCE_OWNER_INVALID'
+    || code === 'OUTAGE_FENCE_CAPABILITY_INVALID'
+    || code === 'OUTAGE_FENCE_AUTHORIZATION_INCOMPLETE'
+    || code === 'OUTAGE_FENCE_TARGET_INVALID'
+    || code === 'OUTAGE_FENCE_RECOVERY_REASON_INVALID'
+  ) return 400;
   if (OPERATOR_CONFLICT_CODES.has(code)) return 409;
   if (
     code === 'BOOT_MUTATION_OUTCOME_UNKNOWN'
@@ -87,6 +107,9 @@ function operatorErrorStatus(error: unknown): 403 | 409 | 500 | 503 {
  * - POST /restart - Restart Payara domain
  * - POST /start - Start Payara domain
  * - POST /stop - Stop Payara domain
+ * - POST /stop-for-deployment - Remove boot ownership, then stop Payara
+ * - POST /stop-for-deployment/release - Commit a proven owned rollout
+ * - POST /stop-for-deployment/recover - Explicit loopback-only fence recovery
  * - POST /undeploy - Undeploy the application
  * - POST /boot-deployment/attest-ready - Attest external readiness for one boot epoch
  * - POST /boot-deployment/stage-artifact - Store a missing WAR without deploying it
@@ -116,7 +139,7 @@ export async function registerLifecycleRoutes(
       };
     } catch (err) {
       logger.error({ err }, 'Restart failed');
-      return reply.code(500).send({
+      return reply.code(operatorErrorStatus(err)).send({
         error: 'Restart failed',
         message: getErrorMessage(err),
       });
@@ -141,7 +164,7 @@ export async function registerLifecycleRoutes(
       };
     } catch (err) {
       logger.error({ err }, 'Start failed');
-      return reply.code(500).send({
+      return reply.code(operatorErrorStatus(err)).send({
         error: 'Start failed',
         message: getErrorMessage(err),
       });
@@ -166,8 +189,205 @@ export async function registerLifecycleRoutes(
       };
     } catch (err) {
       logger.error({ err }, 'Stop failed');
-      return reply.code(500).send({
+      return reply.code(operatorErrorStatus(err)).send({
         error: 'Stop failed',
+        message: getErrorMessage(err),
+      });
+    }
+  });
+
+  /**
+   * POST /stop-for-deployment
+   *
+   * Prepare one intentional cold deployment while the domain is still
+   * running, then stop it. A plain stop deliberately preserves Payara's
+   * persistent application reference so an ordinary restart can restore the
+   * application. That historical behaviour is unsafe for a pre-migration
+   * outage: the subsequent deploy would start Payara, observe that retained
+   * reference, and correctly reject the agent-owned deployment.
+   *
+   * The shared deployment lock also owns one re-entrant Payara mutation lease,
+   * so application-ref removal and lifecycle stop cannot interleave with any
+   * other plugin mutation. Before stopping, the agent atomically persists a
+   * receipt bound to host/domain/application and the exact previous WAR. An
+   * already-stopped domain is accepted only when that receipt still matches;
+   * otherwise it fails closed because asadmin cannot reconstruct the missing
+   * application-reference evidence while Payara is down.
+   */
+  fastify.post<{
+    Body: { outageOwnerId?: string; targetContentSha256?: string; outageCapability?: string };
+  }>('/stop-for-deployment', async (request, reply) => {
+    const appName = deployer.getAppName();
+    try {
+      logger.info({ appName }, 'Preparing Payara for a cold deployment stop');
+      const preparedStop = await deployer.stopForDeployment(
+        request.body?.outageOwnerId ?? '',
+        request.body?.targetContentSha256 ?? '',
+        request.body?.outageCapability ?? '',
+      );
+      return {
+        status: 'stopped-for-deployment',
+        message: 'Payara application reference removed and domain stopped successfully',
+        appName,
+        applicationAbsent: true,
+        receiptId: preparedStop.receiptId,
+        outageOwnerId: preparedStop.outageOwnerId,
+        targetContentSha256: preparedStop.targetContentSha256,
+        artifact: preparedStop.artifact,
+      };
+    } catch (err) {
+      logger.error({ err, appName }, 'Deployment stop failed');
+      return reply.code(operatorErrorStatus(err)).send({
+        error: 'Deployment stop failed',
+        message: getErrorMessage(err),
+        appName,
+      });
+    }
+  });
+
+  /** Persist release intent, then atomically release marker and scheduler latch. */
+  fastify.post<{
+    Body: { outageOwnerId?: string; targetContentSha256?: string; outageCapability?: string };
+  }>('/stop-for-deployment/release', async (request, reply) => {
+    try {
+      assertLocalOperatorRequest(request);
+      const outageOwnerId = request.body?.outageOwnerId ?? '';
+      const targetContentSha256 = request.body?.targetContentSha256 ?? '';
+      const outageCapability = request.body?.outageCapability ?? '';
+      const result = await deployer.prepareOutageRelease(
+        outageOwnerId,
+        targetContentSha256,
+        outageCapability,
+      );
+      const preparation = await deployer.inspectOutageReleaseState(
+        outageOwnerId,
+        targetContentSha256,
+        outageCapability,
+      );
+      let schedulerResumeRecovered = false;
+      if (preparation.markerAlreadyAbsent) {
+        // A prior atomic call may have deleted the marker before its ACK or
+        // before directory-sync completion. Retry the exact API transaction
+        // first; if it was already fully committed (including across reboot),
+        // the strict status readback is the only accepted fallback.
+        try {
+          await ctx.finalizeSchedulerDeployment(
+            outageOwnerId,
+            targetContentSha256,
+            outageCapability,
+          );
+        } catch {
+          await deployer.inspectOutageReleaseState(
+            outageOwnerId,
+            targetContentSha256,
+            outageCapability,
+            true,
+          );
+          await ctx.getSchedulerDeploymentStatus();
+        }
+        schedulerResumeRecovered = true;
+      } else {
+        // znapi validates this owner/target, fsync-removes the marker, and
+        // lowers its in-memory latch under one deploymentHoldLock transaction.
+        await ctx.finalizeSchedulerDeployment(
+          outageOwnerId,
+          targetContentSha256,
+          outageCapability,
+        );
+      }
+      const committed = await deployer.inspectOutageReleaseState(
+        outageOwnerId,
+        targetContentSha256,
+        outageCapability,
+      );
+      if (!committed.markerAlreadyAbsent) {
+        throw new Error(
+          'OUTAGE_FENCE_RELEASE_UNPROVEN: atomic scheduler finalization retained the marker',
+        );
+      }
+      return {
+        status: 'outage-release-prepared',
+        appName: deployer.getAppName(),
+        ...result,
+        schedulerResumed: true,
+        schedulerResumeRecovered,
+      };
+    } catch (err) {
+      logger.error({ err }, 'Fleet outage fence release rejected');
+      return reply.code(operatorErrorStatus(err)).send({
+        error: 'Fleet outage fence release rejected',
+        message: getErrorMessage(err),
+      });
+    }
+  });
+
+  /** After fleet publication, verify the live target and clear local state. */
+  fastify.post<{
+    Body: { outageOwnerId?: string; targetContentSha256?: string; outageCapability?: string };
+  }>('/stop-for-deployment/finalize', async (request, reply) => {
+    try {
+      assertLocalOperatorRequest(request);
+      const result = await deployer.finalizeOutageFence(
+        request.body?.outageOwnerId ?? '',
+        request.body?.targetContentSha256 ?? '',
+        request.body?.outageCapability ?? '',
+      );
+      return {
+        status: 'outage-fence-finalized',
+        appName: deployer.getAppName(),
+        ...result,
+        schedulerResumed: true,
+      };
+    } catch (err) {
+      logger.error({ err }, 'Fleet outage fence finalization rejected');
+      return reply.code(operatorErrorStatus(err)).send({
+        error: 'Fleet outage fence finalization rejected',
+        message: getErrorMessage(err),
+      });
+    }
+  });
+
+  /** Explicit direct-loopback recovery when automatic success cannot be proven. */
+  fastify.post<{
+    Body: {
+      outageOwnerId?: string;
+      targetContentSha256?: string;
+      outageCapability?: string;
+      reason?: string;
+    };
+  }>('/stop-for-deployment/recover', async (request, reply) => {
+    try {
+      assertLocalOperatorRequest(request);
+      const result = await deployer.recoverOutageFence(
+        request.body?.outageOwnerId ?? '',
+        request.body?.targetContentSha256 ?? '',
+        request.body?.outageCapability ?? '',
+        request.body?.reason ?? '',
+        ctx.finalizeSchedulerDeployment,
+        ctx.getSchedulerDeploymentStatus,
+      );
+      return {
+        status: 'outage-fence-recovered',
+        appName: deployer.getAppName(),
+        ...result,
+      };
+    } catch (err) {
+      logger.error({ err }, 'Fleet outage fence recovery rejected');
+      return reply.code(operatorErrorStatus(err)).send({
+        error: 'Fleet outage fence recovery rejected',
+        message: getErrorMessage(err),
+      });
+    }
+  });
+
+  /** Durable recovery state used by the fleet barrier before scheduler I/O. */
+  fastify.get('/stop-for-deployment/status', async (request, reply) => {
+    try {
+      return await deployer.getPreparedStopStatus();
+    } catch (err) {
+      logger.error({ err }, 'Prepared deployment-stop status failed');
+      return reply.code(503).send({
+        error: 'Prepared deployment-stop status failed',
         message: getErrorMessage(err),
       });
     }
@@ -188,7 +408,7 @@ export async function registerLifecycleRoutes(
       };
     } catch (err) {
       logger.error({ err }, 'Undeploy failed');
-      return reply.code(500).send({
+      return reply.code(operatorErrorStatus(err)).send({
         error: 'Undeploy failed',
         message: getErrorMessage(err),
       });

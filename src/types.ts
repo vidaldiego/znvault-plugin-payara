@@ -208,6 +208,14 @@ export interface PayaraManagerOptions {
 export interface WarDeployerOptions {
   warPath: string;
   appName: string;
+  /** Payara domain bound into durable prepared-stop receipts. */
+  domain?: string;
+  /** Stable host identity bound into durable prepared-stop receipts. */
+  hostIdentity?: string;
+  /** Override durable prepared-stop storage; false disables it for isolated tests. */
+  preparedStopReceiptPath?: string | false;
+  /** Exact domain/config marker path read by the API before arming schedulers. */
+  schedulerDeploymentHoldPath?: string;
   contextRoot?: string;
   payara: PayaraManager;
   logger: Logger;
@@ -404,6 +412,10 @@ export interface DeployRequest {
   deploymentId: string;
   /** Exact artifact identity fence for this deployment. */
   artifact: DeploymentArtifactExpectation;
+  /** Full-fleet outage owner; absent on every historical deployment rail. */
+  outageOwnerId?: string;
+  /** 32-byte base64url capability required while the outage fence is active. */
+  outageCapability?: string;
   files: Array<{ path: string; content: string }>; // base64 content
   deletions: string[];
 }
@@ -477,6 +489,10 @@ export interface ChunkedDeploySession {
   deploymentId: string;
   /** Artifact fence fixed by the first chunk for the lifetime of the session. */
   artifact: DeploymentArtifactExpectation;
+  /** Fleet-outage owner bound by the first chunk, when applicable. */
+  outageOwnerId?: string;
+  /** Hash-only binding; plaintext capability is never retained by the session. */
+  outageCapabilitySha256?: string;
   /** Timestamp when session was created */
   createdAt: number;
   /** Files accumulated so far */
@@ -498,6 +514,10 @@ export interface ChunkedDeployRequest {
    * the session exactly.
    */
   artifact?: DeploymentArtifactExpectation;
+  /** Fleet-outage owner repeated exactly across the chunk session. */
+  outageOwnerId?: string;
+  /** Repeated on every owner-aware chunk; the server stores only its SHA-256. */
+  outageCapability?: string;
   /** Session ID (optional for first chunk - server generates one) */
   sessionId?: string;
   /** Files in this chunk */

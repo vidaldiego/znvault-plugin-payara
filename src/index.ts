@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { Logger } from 'pino';
 import type {
   AgentPlugin,
@@ -50,10 +50,71 @@ import {
   DEFAULT_MUTATION_AUTH_TOKEN_FILE,
   loadMutationAuthTokenFile,
 } from './mutation-auth.js';
+import {
+  finalizeSchedulerDeployment,
+  getSchedulerDeploymentStatus,
+} from './scheduler-internal-client.js';
+import {
+  OUTAGE_CAPABILITY_HEADER,
+  OUTAGE_OWNER_ID_HEADER,
+} from './routes/helpers.js';
 
 const STARTUP_DEADLINE_MS = 105_000;
 const EVENT_HANDLER_DEADLINE_MS = 25_000;
 const PUBLIC_HEALTH_SNAPSHOT_TTL_MS = 5_000;
+const OUTAGE_RECOVERY_ERRORS = [
+  'SCHEDULER_DEPLOYMENT_HOLD_ORPHANED:',
+  'SCHEDULER_DEPLOYMENT_HOLD_MISSING:',
+  'SCHEDULER_DEPLOYMENT_HOLD_MISMATCH:',
+  'PREPARED_STOP_RECEIPT_STALE:',
+  'PREPARED_STOP_RUNTIME_INCONSISTENT:',
+] as const;
+
+function requiresOutageRecovery(error: unknown): boolean {
+  const message = getErrorMessage(error);
+  return OUTAGE_RECOVERY_ERRORS.some(code => message.startsWith(code));
+}
+
+function isOutageRecoveryRoute(
+  method: string,
+  url: string,
+  allowRuntimeMutation: boolean,
+): boolean {
+  const path = url.split('?', 1)[0] ?? '';
+  return (method === 'GET' && path.endsWith('/stop-for-deployment/status'))
+    || (method === 'POST' && (
+      path.endsWith('/stop-for-deployment/release')
+      || path.endsWith('/stop-for-deployment/finalize')
+      || path.endsWith('/stop-for-deployment/recover')
+      || (allowRuntimeMutation && (
+        path.endsWith('/stop-for-deployment')
+        || path.endsWith('/deploy')
+        || path.endsWith('/deploy/full')
+        || path.endsWith('/deploy/upload')
+        || path.endsWith('/deploy/chunk')
+      ))
+    ));
+}
+
+function isOutageRuntimeMutationRoute(method: string, url: string): boolean {
+  if (method !== 'POST') return false;
+  const path = url.split('?', 1)[0] ?? '';
+  return path.endsWith('/stop-for-deployment')
+    || path.endsWith('/deploy')
+    || path.endsWith('/deploy/full')
+    || path.endsWith('/deploy/upload')
+    || path.endsWith('/deploy/chunk');
+}
+
+function carriesOutageRecoveryCredentials(request: FastifyRequest): boolean {
+  const body = request.body && typeof request.body === 'object'
+    ? request.body as Record<string, unknown>
+    : {};
+  const owner = body.outageOwnerId ?? request.headers[OUTAGE_OWNER_ID_HEADER];
+  const capability = body.outageCapability ?? request.headers[OUTAGE_CAPABILITY_HEADER];
+  return typeof owner === 'string' && owner.length > 0
+    && typeof capability === 'string' && capability.length > 0;
+}
 
 // Read version from package.json at module load time
 let pluginVersion = '0.0.0';
@@ -87,8 +148,10 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
   let deployer: WarDeployer;
   let pluginLogger: Logger;
   let secretsEnv: Record<string, string> = {};
-  let startupReconciliationState: 'not_started' | 'in_progress' | 'complete' | 'failed' = 'not_started';
+  let startupReconciliationState:
+    'not_started' | 'in_progress' | 'complete' | 'recovery_only' | 'failed' = 'not_started';
   let startupReconciliationError: string | undefined;
+  let outageRecoveryRuntimeMutationAllowed = false;
   let keyRotationTail: Promise<void> = Promise.resolve();
   let mutationAuthToken: string | undefined;
   let healthSnapshotGeneration = 0;
@@ -253,6 +316,15 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       deployer = new WarDeployer({
         warPath: config.warPath,
         appName: config.appName,
+        domain: config.domain,
+        schedulerDeploymentHoldPath: join(
+          config.payaraHome,
+          'glassfish',
+          'domains',
+          config.domain,
+          'config',
+          '.znvault-scheduler-deployment-hold.json',
+        ),
         contextRoot: config.contextRoot,
         payara,
         logger: pluginLogger,
@@ -278,8 +350,67 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       }
       startupReconciliationError = undefined;
       startupReconciliationState = 'in_progress';
+      outageRecoveryRuntimeMutationAllowed = false;
+      let outageFenceObserved = false;
 
       try {
+        const outageStatus = await deployer.getPreparedStopStatus();
+        if (outageStatus.mutationLockStale && !outageStatus.outageFenced) {
+          outageFenceObserved = true;
+          throw new Error(
+            'STALE_DEPLOYMENT_LOCK_RECOVERY_REQUIRED: a dead process left a non-outage or ' +
+            'legacy mutation lock; reconcile it manually before normal startup',
+          );
+        }
+        if (outageStatus.outageFenced) {
+          outageFenceObserved = true;
+          // A restarted agent begins with an empty in-memory environment. The
+          // outage receipt deliberately prevents normal startup reconciliation,
+          // but the owning rollout may later start Payara from this same
+          // process. Rehydrate secrets in memory now so that start-domain can
+          // never replace the existing setenv.conf with an empty environment.
+          // Do not write setenv here: the canonical scheduler hold is the file
+          // in the Payara domain config directory.
+          if (hasSecrets(config)) {
+            pluginLogger.debug('Refreshing secrets while preserving the fleet outage fence');
+            secretsEnv = await fetchSecrets(
+              ctx,
+              config.secrets!,
+              pluginLogger,
+              config.apiKeyFilePath,
+              config.user,
+              config.fileSourceRoot,
+              deadlineMs,
+            );
+            payara.setEnvironment(secretsEnv);
+          }
+          // A stale exact outage mutation may need to resume stop/deploy from
+          // recovery-only mode. Expose those routes only after this process
+          // has a complete environment (or the plugin has no managed
+          // secrets). If Vault failed above, control jumps to catch while this
+          // flag remains false, so no start/deploy/stop path can rewrite the
+          // Payara environment with an empty map.
+          outageRecoveryRuntimeMutationAllowed = true;
+          pluginLogger.warn(
+            {
+              appName: config.appName,
+              receiptId: outageStatus.receiptId,
+              outageOwnerId: outageStatus.outageOwnerId,
+              receiptPhase: outageStatus.receiptPhase,
+            },
+            'Preserving the durable full-fleet outage fence across agent startup',
+          );
+          if (outageStatus.mutationLockStale) {
+            throw new Error(
+              'OUTAGE_FENCE_STALE_DEPLOYMENT_LOCK: exact capability recovery is required ' +
+              `for ${outageStatus.outageOwnerId ?? config.appName}`,
+            );
+          }
+          startupReconciliationState = 'complete';
+          invalidatePublicHealthSnapshot();
+          pluginLogger.info('Payara plugin started with the fleet outage still fenced');
+          return;
+        }
         await deployer.withDeploymentLock(
           `plugin-startup:${config.appName}`,
           'start',
@@ -381,8 +512,17 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         pluginLogger.info('Payara plugin startup reconciliation completed');
         pluginLogger.info('Payara plugin started');
       } catch (err) {
-        startupReconciliationState = 'failed';
         startupReconciliationError = getErrorMessage(err);
+        if (outageFenceObserved || requiresOutageRecovery(err)) {
+          startupReconciliationState = 'recovery_only';
+          invalidatePublicHealthSnapshot();
+          pluginLogger.error(
+            { err, appName: config.appName },
+            'Payara plugin requires explicit outage recovery; normal routes remain fenced',
+          );
+          return;
+        }
+        startupReconciliationState = 'failed';
         const errorName = err instanceof Error ? err.name : '';
         if (
           errorName === 'BOOT_MUTATION_OUTCOME_UNKNOWN'
@@ -410,14 +550,36 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
       );
     },
 
-    async routes(fastify: FastifyInstance, _ctx: PluginContext): Promise<void> {
+    async routes(fastify: FastifyInstance, ctx: PluginContext): Promise<void> {
       if (!mutationAuthToken) {
         throw new Error(
           'PAYARA_MUTATION_AUTH_INVALID: mutation credential was not initialized'
         );
       }
-      fastify.addHook('preHandler', async (_request, reply) => {
+      fastify.addHook('preHandler', async (request, reply) => {
         if (startupReconciliationState !== 'complete') {
+          if (
+            startupReconciliationState === 'recovery_only'
+            && isOutageRecoveryRoute(
+              request.method,
+              request.url,
+              outageRecoveryRuntimeMutationAllowed,
+            )
+          ) {
+            if (!isOutageRuntimeMutationRoute(request.method, request.url)) return;
+            // A recovery-only process must never admit a legacy/general
+            // mutation. Exact owner+capability force the route onto the outage
+            // acquisition path, whose DeploymentLock revalidates the receipt
+            // after any concurrent release or recovery.
+            if (carriesOutageRecoveryCredentials(request)) {
+              // Runtime mutation is a narrow re-entry rail for one still-active
+              // outage fence. Once release/finalize/recover clears that fence,
+              // the same recovery-only process must not become a general deploy
+              // agent without a fresh startup reconciliation.
+              const outageStatus = await deployer.getPreparedStopStatus().catch(() => undefined);
+              if (outageStatus?.outageFenced === true) return;
+            }
+          }
           return reply.code(503).send({
             error: 'STARTUP_RECONCILIATION_NOT_COMPLETE',
             startupReconciliation: startupReconciliationState,
@@ -434,7 +596,14 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
         pluginLogger,
         mutationAuthToken,
         invalidatePublicHealthSnapshot,
-        pluginVersion
+        pluginVersion,
+        (outageId, targetContentSha256, outageCapability) => finalizeSchedulerDeployment(
+          ctx.config.znapiBaseUrl,
+          outageId,
+          targetContentSha256,
+          outageCapability,
+        ),
+        () => getSchedulerDeploymentStatus(ctx.config.znapiBaseUrl),
       );
       pluginLogger.info('Payara routes registered');
     },

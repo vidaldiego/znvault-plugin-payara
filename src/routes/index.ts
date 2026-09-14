@@ -6,7 +6,11 @@ import type { Logger } from 'pino';
 import type { PayaraManager } from '../payara-manager.js';
 import type { WarDeployer } from '../war-deployer.js';
 import { SessionStore } from '../session-store.js';
-import type { RouteContext } from './types.js';
+import type {
+  RouteContext,
+  SchedulerDeploymentFinalize,
+  SchedulerDeploymentStatus,
+} from './types.js';
 import { registerDeployRoutes } from './deploy.js';
 import { registerLifecycleRoutes } from './lifecycle.js';
 import { registerStatusRoutes } from './status.js';
@@ -27,7 +31,13 @@ export async function registerRoutes(
   logger: Logger,
   mutationAuthToken: string,
   onAuthorizedRequest?: () => void,
-  pluginVersion = '0.0.0'
+  pluginVersion = '0.0.0',
+  finalizeSchedulerDeployment: SchedulerDeploymentFinalize = async () => {
+    throw new Error('SCHEDULER_DEPLOYMENT_FINALIZE_UNAVAILABLE');
+  },
+  getSchedulerDeploymentStatus: SchedulerDeploymentStatus = async () => {
+    throw new Error('SCHEDULER_DEPLOYMENT_STATUS_UNAVAILABLE');
+  },
 ): Promise<void> {
   if (!mutationAuthToken) {
     throw new Error(
@@ -73,6 +83,8 @@ export async function registerRoutes(
     sessionStore,
     logger,
     pluginVersion,
+    finalizeSchedulerDeployment,
+    getSchedulerDeploymentStatus,
   };
 
   // Register route modules

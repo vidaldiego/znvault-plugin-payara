@@ -110,15 +110,24 @@ export async function registerStatusRoutes(
   fastify.get('/status', async (request, reply) => {
     try {
       const appName = deployer.getAppName();
-      const readback = await deployer.withDeploymentFileLock(
+      const readback = await deployer.withReadOnlyDeploymentFileLock(
         `status-readback:${appName}`,
         'verify',
         async () => {
           const status = await payara.getStatus(true);
-          const appDeployed = await deployer.isAppDeployed();
+          // A prepared-stop retry must be able to preflight the agent while the
+          // DAS is intentionally absent. Runtime application inventory is an
+          // asadmin server command, so do not issue it against a stopped domain.
+          const appDeployed = status.running
+            ? await deployer.isAppDeployed()
+            : false;
           // This final awaited runtime-bound read detects an unannounced DAS
-          // replacement during application inventory.
-          await payara.readBootDeploymentStatus(appName);
+          // replacement during application inventory. With PID0 there is no
+          // runtime epoch to reconcile; durable prepared-stop evidence is read
+          // from its dedicated authenticated route instead.
+          if (status.running) {
+            await payara.readBootDeploymentStatus(appName);
+          }
           // No await after this synchronous reread: an in-process child event
           // cannot leave the response carrying an old ready epoch.
           const bootDeployment = payara.getBootDeploymentStatus(appName);
