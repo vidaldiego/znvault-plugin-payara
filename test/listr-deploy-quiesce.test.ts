@@ -740,3 +740,41 @@ describe('Tunnel port/useTLS resolution', () => {
     );
   });
 });
+
+describe('deferred HAProxy READY for strict fleet stop', () => {
+  it('keeps a successfully deployed host drained until the fleet commit', async () => {
+    await runTask(HOST_API, makeOptions(HOST_API, {
+      quiesce: undefined,
+      deferHAProxyReady: true,
+    }));
+
+    expect(haproxyMod.drainServer).toHaveBeenCalledOnce();
+    expect(haproxyMod.readyServer).not.toHaveBeenCalled();
+  });
+
+  it('does not locally compensate READY when deployment fails', async () => {
+    vi.mocked(deployMod.deployToHost).mockRejectedValueOnce(
+      new Error('deployment failed')
+    );
+
+    await expect(runTask(HOST_API, makeOptions(HOST_API, {
+      quiesce: undefined,
+      deferHAProxyReady: true,
+    }))).rejects.toThrow('deployment failed');
+
+    expect(haproxyMod.drainServer).toHaveBeenCalledOnce();
+    expect(haproxyMod.readyServer).not.toHaveBeenCalled();
+  });
+
+  it('preserves historical local READY compensation without the strict option', async () => {
+    vi.mocked(deployMod.deployToHost).mockRejectedValueOnce(
+      new Error('deployment failed')
+    );
+
+    await expect(runTask(HOST_API, makeOptions(HOST_API, {
+      quiesce: undefined,
+    }))).rejects.toThrow('deployment failed');
+
+    expect(haproxyMod.readyServer).toHaveBeenCalledOnce();
+  });
+});

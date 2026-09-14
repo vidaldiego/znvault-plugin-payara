@@ -75,6 +75,16 @@ export interface ListrDeployOptions {
   /** HAProxy drain/ready configuration */
   haproxy?: HAProxyConfig;
   /**
+   * Keep every routed host drained after its local deploy. Used only by the
+   * strict pre-migration outage rail, which restores traffic once the complete
+   * fleet, post migrations, and all receipts have succeeded.
+   */
+  deferHAProxyReady?: boolean;
+  /** Owner of the durable strict-outage fence, shared by every fleet host. */
+  outageOwnerId?: string;
+  /** Secret capability for the active strict outage; never logged or persisted here. */
+  outageCapability?: string;
+  /**
    * Scheduler quiesce configuration (Part 5a).
    * When absent or enabled is false, deployment is byte-identical to today.
    */
@@ -268,7 +278,8 @@ export function createHostTask(
         task.output = 'Starting deployment...';
 
         const result = options.artifactSnapshot
-          ? await deployToHost(
+          ? options.outageOwnerId
+            ? await deployToHost(
               options.ctx,
               host,
               port,
@@ -278,7 +289,21 @@ export function createHostTask(
               progress,
               mutationAuthToken,
               useTLS,
-              options.artifactSnapshot
+              options.artifactSnapshot,
+              options.outageOwnerId,
+              options.outageCapability,
+            )
+            : await deployToHost(
+              options.ctx,
+              host,
+              port,
+              options.warPath,
+              options.localHashes,
+              options.force || forceRecovery,
+              progress,
+              mutationAuthToken,
+              useTLS,
+              options.artifactSnapshot,
             )
           : await deployToHost(
               options.ctx,
@@ -289,7 +314,7 @@ export function createHostTask(
               options.force || forceRecovery,
               progress,
               mutationAuthToken,
-              useTLS
+              useTLS,
             );
 
         ctx.results.set(host, result);
@@ -363,7 +388,7 @@ export function createHostTask(
         }
 
         // --- Set ready in HAProxy after successful deploy + health check ---
-        if (drained) {
+        if (drained && !options.deferHAProxyReady) {
           task.output = 'Setting ready in HAProxy...';
           const readyResult = await readyServer(options.haproxy!, host);
           if (!readyResult.success) {
@@ -373,6 +398,8 @@ export function createHostTask(
             throw new Error(`HAProxy ready failed: ${failures.join('; ')}`);
           }
           drained = false; // Prevent finally from double-restoring
+        } else if (drained) {
+          task.output = 'Keeping host drained until the fleet-wide commit...';
         }
       } catch (err) {
         if (!failureRecorded) {
@@ -394,8 +421,10 @@ export function createHostTask(
         }
         throw err;
       } finally {
-        // ALWAYS restore server to ready if we drained it, even on failure
-        if (drained && options.haproxy) {
+        // The historical rolling rail compensates a local failure. The strict
+        // outage rail deliberately keeps every host drained on any failure;
+        // only its fleet-wide success gate may publish READY.
+        if (drained && options.haproxy && !options.deferHAProxyReady) {
           try { await readyServer(options.haproxy, host); } catch { /* don't mask original error */ }
         }
         // ALWAYS resume the scheduler if we quiesced it, even on deploy failure.

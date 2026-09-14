@@ -39,6 +39,8 @@ import { getErrorMessage } from '../../utils/error.js';
 
 const EXPECTED_BASE_SHA256_HEADER = 'x-znvault-expected-base-sha256';
 const TARGET_CONTENT_SHA256_HEADER = 'x-znvault-target-content-sha256';
+const OUTAGE_OWNER_ID_HEADER = 'x-znvault-outage-owner-id';
+const OUTAGE_CAPABILITY_HEADER = 'x-znvault-outage-capability';
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 
 function payaraRequestAuth(mutationAuthToken: string): AgentRequestAuth {
@@ -331,7 +333,9 @@ export async function uploadFullWar(
   progress: ProgressReporter,
   mutationAuthToken: string,
   artifact: DeploymentArtifactExpectation,
-  suppliedSnapshot?: LocalWarArtifactSnapshot
+  suppliedSnapshot?: LocalWarArtifactSnapshot,
+  outageOwnerId?: string,
+  outageCapability?: string,
 ): Promise<DeployOperationResult> {
   const deploymentId = createDeploymentId();
 
@@ -363,6 +367,8 @@ export async function uploadFullWar(
           [DEPLOYMENT_ID_HEADER]: deploymentId,
           [EXPECTED_BASE_SHA256_HEADER]: artifact.expectedBaseSha256 ?? 'none',
           [TARGET_CONTENT_SHA256_HEADER]: artifact.targetContentSha256,
+          ...(outageOwnerId ? { [OUTAGE_OWNER_ID_HEADER]: outageOwnerId } : {}),
+          ...(outageCapability ? { [OUTAGE_CAPABILITY_HEADER]: outageCapability } : {}),
         },
         body: warBuffer,
         signal: AbortSignal.timeout(DEPLOYMENT_TIMEOUT_MS),
@@ -521,7 +527,9 @@ export async function deployChunked(
   deleted: string[],
   progress: ProgressReporter,
   mutationAuthToken: string,
-  artifact: DeploymentArtifactExpectation
+  artifact: DeploymentArtifactExpectation,
+  outageOwnerId?: string,
+  outageCapability?: string,
 ): Promise<DeployOperationResult> {
   const deploymentId = createDeploymentId();
 
@@ -565,11 +573,15 @@ export async function deployChunked(
         expectedFiles?: number;
         commit?: boolean;
         artifact: DeploymentArtifactExpectation;
+        outageOwnerId?: string;
+        outageCapability?: string;
       } = {
         deploymentId,
         files,
         commit: isLastChunk,
         artifact,
+        ...(outageOwnerId ? { outageOwnerId } : {}),
+        ...(outageCapability ? { outageCapability } : {}),
       };
 
       if (sessionId) {
@@ -688,7 +700,9 @@ export async function deployToHost(
   progress: ProgressReporter,
   mutationAuthToken: string,
   useTLS = false,
-  suppliedSnapshot?: LocalWarArtifactSnapshot
+  suppliedSnapshot?: LocalWarArtifactSnapshot,
+  outageOwnerId?: string,
+  outageCapability?: string,
 ): Promise<DeployOperationResult> {
   try {
     const pluginUrl = buildPluginUrl(host, port, useTLS);
@@ -751,7 +765,9 @@ export async function deployToHost(
         progress,
         mutationAuthToken,
         expectedArtifact,
-        snapshot
+        snapshot,
+        outageOwnerId,
+        outageCapability,
       );
     }
 
@@ -775,7 +791,9 @@ export async function deployToHost(
         deleted,
         progress,
         mutationAuthToken,
-        expectedArtifact
+        expectedArtifact,
+        outageOwnerId,
+        outageCapability,
       );
     }
 
@@ -810,7 +828,14 @@ export async function deployToHost(
       targetContentSha256?: string;
     }>(
       `${pluginUrl}/deploy`,
-      { deploymentId, artifact: expectedArtifact, files, deletions: deleted },
+      {
+        deploymentId,
+        artifact: expectedArtifact,
+        files,
+        deletions: deleted,
+        ...(outageOwnerId ? { outageOwnerId } : {}),
+        ...(outageCapability ? { outageCapability } : {}),
+      },
       undefined,
       payaraRequestAuth(mutationAuthToken),
       deploymentId

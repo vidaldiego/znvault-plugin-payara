@@ -21,12 +21,25 @@ import {
   type CLIPluginContext,
   type DeployConfig,
   type HAProxyConfig,
+  type HealthCheckConfig,
   type MigrationConfig,
   parseDeploymentStrategy,
   getStrategyDisplayName,
 } from '../types.js';
 import { getErrorMessage } from '../../utils/error.js';
 import { loadHostMutationAuthTokens } from '../auth-token.js';
+import {
+  enforceFleetStopBeforePre,
+  releaseFleetOutageFence,
+  finalizeFleetOutageFence,
+  restoreFleetTrafficAfterSuccessfulRollout,
+  validateFleetStopBeforePreRequest,
+  type FleetStopGroup,
+} from '../fleet-stop-before-pre.js';
+import {
+  markFleetOutageCommitAuthorized,
+  type FleetOutageContext,
+} from '../fleet-outage-journal.js';
 import {
   executeListrDeployment,
   printDeploymentSummary,
@@ -65,6 +78,7 @@ import {
   testHAProxyConnectivity,
   resolveClass,
   partitionSelectedClasses,
+  performHealthCheck,
   validateDeployConfig,
   resolveConfigPaths,
   executeMultiClassDeployment,
@@ -412,6 +426,51 @@ function prepareSelectedDeployClasses(
  */
 export const siblingIntegrityDirs = coreSiblingIntegrityDirs;
 
+function missingVerifiedOrResumedDeploymentReceipts(
+  ctx: Parameters<typeof missingVerifiedDeploymentReceipts>[0],
+  expectedHosts: readonly string[],
+  outageContext?: FleetOutageContext,
+): string[] {
+  const resumed = new Set(outageContext?.alreadyDeployedHosts ?? []);
+  return missingVerifiedDeploymentReceipts(
+    ctx,
+    expectedHosts.filter(host => !resumed.has(host)),
+  );
+}
+
+async function verifyResumedDeploymentHealth(
+  hosts: readonly string[],
+  healthCheck: HealthCheckConfig | undefined,
+  ctx: CLIPluginContext,
+): Promise<void> {
+  if (hosts.length === 0) return;
+  if (!healthCheck) {
+    ctx.output.info(
+      `[deploy] resuming ${hosts.length} host(s) from exact durable deployment receipts`,
+    );
+    return;
+  }
+  const results = await Promise.allSettled(
+    hosts.map(async host => {
+      const result = await performHealthCheck(host, healthCheck);
+      if (!result.success) {
+        throw new Error(result.error ?? `HTTP ${String(result.status)}`);
+      }
+    }),
+  );
+  const failures = results.flatMap((result, index) => result.status === 'rejected'
+    ? [`${hosts[index]}: ${getErrorMessage(result.reason)}`]
+    : []);
+  if (failures.length > 0) {
+    throw new Error(
+      `FLEET_ROLLOUT_RESUME_HEALTH_FAILED: ${failures.join('; ')}`,
+    );
+  }
+  ctx.output.info(
+    `[deploy] re-verified health for ${hosts.length} resumed deployment(s)`,
+  );
+}
+
 /**
  * Run a schema-migration phase (pre-deploy or post-deploy) if a migration config
  * is provided. No-op when `migration` is undefined.
@@ -694,6 +753,10 @@ export function registerDeployRunCommand(
     .option('--skip-post', 'Skip the post-deploy migration phase (still runs pre + deploys)')
     .option('--pre-only', 'Run only the pre-deploy migration phase, then stop (no rollout)')
     .option('--post-only', 'Run only the post-deploy migration phase, then stop (no rollout) — recovery')
+    .option(
+      '--require-fleet-stop-before-pre',
+      'Before pre migrations, drain routed hosts, strictly quiesce and stop the complete Payara fleet'
+    )
     .option('--with-root <dir>', 'Base dir for relative local paths in the config (sets/overrides rootDir for this deploy)')
     .option('--mutation-auth-token-file <path>', 'Local private Payara credential file')
     .action(async (configName: string, options: {
@@ -713,6 +776,7 @@ export function registerDeployRunCommand(
       skipPost?: boolean;
       preOnly?: boolean;
       postOnly?: boolean;
+      requireFleetStopBeforePre?: boolean;
       withRoot?: string;
       mutationAuthTokenFile?: string;
     }) => {
@@ -790,6 +854,11 @@ export function registerDeployRunCommand(
           migrationsOnly: options.migrationsOnly, preOnly: options.preOnly, postOnly: options.postOnly,
         });
         if (planError || !plan) { ctx.output.error(planError ?? 'invalid deploy plan'); process.exit(1); }
+        const fleetStopErrors = validateFleetStopBeforePreRequest(config, plan, options);
+        if (fleetStopErrors.length > 0) {
+          for (const error of fleetStopErrors) ctx.output.error(error);
+          process.exit(1);
+        }
         // Required-block checks for -only flags (config-dependent, action-level).
         if (options.preOnly && !config.migration) {
           ctx.output.error(`--pre-only requires a pre-deploy migration config; none set on '${configName}'. Use 'payara config set-migration ${configName} --phase pre ...'.`);
@@ -1126,6 +1195,54 @@ export function registerDeployRunCommand(
           // 4. Run the pre-deploy migration phase only after every selected
           //    class has a compatible, authenticated control-plane snapshot.
           //    --dry-run prints the plan without executing.
+          let fleetStopGroups: FleetStopGroup[] | undefined;
+          let fleetOutageContext: FleetOutageContext | undefined;
+          if (options.requireFleetStopBeforePre && !options.dryRun) {
+            fleetStopGroups = preparedClasses.map(({ rc }) => {
+              const prepared = classPreflights.get(rc.name);
+              if (!prepared) {
+                throw new Error(
+                  `[${rc.name}] authenticated preflight snapshot is missing before strict fleet stop`
+                );
+              }
+              return {
+                name: rc.name,
+                hosts: rc.hosts,
+                port: prepared.effectivePort,
+                useTLS: prepared.useTLS,
+                haproxy: rc.haproxy,
+                quiesce: rc.quiesce,
+                hostConfigs: rc.hostConfigs,
+                mutationAuthTokens,
+                targetContentSha256: prepared.artifactSnapshot.contentSha256,
+                activateControlPlane: () => {
+                  restorePreparedClassControlPlane(prepared, ctx);
+                },
+              };
+            });
+            fleetOutageContext = await enforceFleetStopBeforePre(
+              fleetStopGroups,
+              ctx,
+            );
+            if (fleetOutageContext.resumeCommitOnly) {
+              await releaseFleetOutageFence(fleetStopGroups, fleetOutageContext, ctx);
+              await restoreFleetTrafficAfterSuccessfulRollout(
+                preparedClasses.map(({ rc }) => ({
+                  name: rc.name,
+                  hosts: rc.hosts,
+                  haproxy: rc.haproxy,
+                })),
+                ctx,
+              );
+              await finalizeFleetOutageFence(fleetStopGroups, fleetOutageContext, ctx);
+              return;
+            }
+          }
+          if (options.requireFleetStopBeforePre && options.dryRun) {
+            ctx.output.info(
+              '[deploy] [dry-run] would drain routed hosts, strictly quiesce, stop, and verify the complete fleet before pre migrations'
+            );
+          }
           await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined, {
             dryRun: options.dryRun,
             run: plan.runPre,
@@ -1146,7 +1263,13 @@ export function registerDeployRunCommand(
             mcIsScoped,
             preparedClasses,
             mutationAuthTokens,
-            { preopenedTunnels, classPreflights, isPlain }
+            {
+              preopenedTunnels,
+              classPreflights,
+              isPlain,
+              fleetStopGroups,
+              fleetOutageContext,
+            }
           );
           return; // handled — do not fall through to the flat path
         }
@@ -1433,11 +1556,14 @@ export function registerDeployRunCommand(
         // ═══════════════════════════════════════════════════════════════════
         // MIGRATION PHASE — PRE (guarded, runs once before any WAR swap)
         //
-        // When `config.migration` is present, schema migrations are applied
-        // to the database BEFORE the rolling WAR rollout begins. This means:
-        //   - A migration failure aborts the deploy BEFORE any host is touched.
+        // By default, schema migrations are applied before the rolling WAR
+        // rollout and before any host lifecycle mutation. The explicit strict
+        // fleet-stop rail is the exception: it first drains, quiesces, stops,
+        // and verifies every host because its pre migration is declared
+        // incompatible with a live old WAR. In either mode:
+        //   - A migration failure aborts before any WAR is dispatched.
         //   - The new schema serves the old WAR during the rolling window
-        //     (expand/contract forward-compat required — see spec §Forward-compat).
+        //     unless the strict fleet-stop rail was selected.
         //
         // When `config.migration` is absent, this block is skipped entirely
         // so existing deploy configs without migration settings are unaffected.
@@ -1446,13 +1572,63 @@ export function registerDeployRunCommand(
         // Pre-deploy migrations run here — after both interactive cancel prompts,
         // before the up-to-date/dry-run returns (so pre isn't silently skipped).
         // ═══════════════════════════════════════════════════════════════════
+        let flatFleetStopGroups: FleetStopGroup[] | undefined;
+        let flatFleetOutageContext: FleetOutageContext | undefined;
+        if (options.requireFleetStopBeforePre && !options.dryRun) {
+          flatFleetStopGroups = [{
+            name: configName,
+            hosts: config.hosts!,
+            port: effectivePort,
+            useTLS,
+            haproxy: config.haproxy,
+            quiesce: config.quiesce,
+            hostConfigs: config.hostConfigs,
+            mutationAuthTokens,
+            targetContentSha256: artifactSnapshot.contentSha256,
+            activateControlPlane: () => {
+              configureTLSForDeployment(config!, ctx);
+            },
+          }];
+          flatFleetOutageContext = await enforceFleetStopBeforePre(
+            flatFleetStopGroups,
+            ctx,
+          );
+          if (flatFleetOutageContext.resumeCommitOnly) {
+            await releaseFleetOutageFence(flatFleetStopGroups, flatFleetOutageContext, ctx);
+            await restoreFleetTrafficAfterSuccessfulRollout([{
+              name: configName,
+              hosts: config.hosts!,
+              haproxy: config.haproxy,
+            }], ctx);
+            await finalizeFleetOutageFence(flatFleetStopGroups, flatFleetOutageContext, ctx);
+            return;
+          }
+        }
+        if (options.requireFleetStopBeforePre && options.dryRun) {
+          ctx.output.info(
+            '[deploy] [dry-run] would drain routed hosts, strictly quiesce, stop, and verify the complete fleet before pre migrations'
+          );
+        }
         await runMigrationPhase(config.migration, 'pre-deploy', configName, ctx, undefined,
           { dryRun: options.dryRun, run: plan.runPre, integrityDirs: siblingIntegrityDirs(config, 'pre-deploy') });
 
         // Hash equality cannot prove that Payara dispatched that WAR. Every
         // target therefore performs a verified deploy, including a zero-diff
         // deploy, before it can contribute to the post-migration coverage gate.
-        const hostsWithChanges = [...deployableHosts];
+        const flatAlreadyDeployed = new Set(
+          flatFleetOutageContext?.alreadyDeployedHosts ?? [],
+        );
+        const resumedDeployments = deployableHosts.filter(host =>
+          flatAlreadyDeployed.has(host)
+        );
+        await verifyResumedDeploymentHealth(
+          resumedDeployments,
+          config.healthCheck,
+          ctx,
+        );
+        const hostsWithChanges = deployableHosts.filter(host =>
+          !flatAlreadyDeployed.has(host)
+        );
 
         if (options.dryRun) {
           console.log('');
@@ -1498,7 +1674,7 @@ export function registerDeployRunCommand(
         console.log('');
 
         // Execute deployment using Listr2
-        const deployResult = await executeListrDeployment(strategy, deployableHosts, {
+        const deployResult = await executeListrDeployment(strategy, hostsWithChanges, {
           ctx,
           warPath,
           localHashes,
@@ -1509,6 +1685,9 @@ export function registerDeployRunCommand(
           healthCheck: config.healthCheck,
           useTLS,
           haproxy: haproxyConfig,
+          deferHAProxyReady: options.requireFleetStopBeforePre,
+          outageOwnerId: flatFleetOutageContext?.outageOwnerId,
+          outageCapability: flatFleetOutageContext?.outageCapability,
           quiesce: config.quiesce,
           hostConfigs: config.hostConfigs,
           mutationAuthTokens,
@@ -1526,11 +1705,16 @@ export function registerDeployRunCommand(
         // failures (incl. worker failures).
         // ═══════════════════════════════════════════════════════════════════
         const noFailures = computeNoFailures(deployResult);
-        const selectedMissingReceipts = missingVerifiedDeploymentReceipts(
+        const selectedMissingReceipts = missingVerifiedOrResumedDeploymentReceipts(
           deployResult,
-          config.hosts!
+          config.hosts!,
+          flatFleetOutageContext,
         );
-        const dropped = missingVerifiedDeploymentReceipts(deployResult, configuredHosts);
+        const dropped = missingVerifiedOrResumedDeploymentReceipts(
+          deployResult,
+          configuredHosts,
+          flatFleetOutageContext,
+        );
         const fullCoverage = computeFullCoverage(
           configuredHostCount - dropped.length,
           configuredHostCount
@@ -1544,7 +1728,9 @@ export function registerDeployRunCommand(
             { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
         } catch (postErr) {
           ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
-          ctx.output.info(`Re-run just the post phase with: payara deploy run ${configName} --post-only`);
+          ctx.output.info(options.requireFleetStopBeforePre
+            ? `Re-run the complete recovery rail with: payara deploy run ${configName} --require-fleet-stop-before-pre`
+            : `Re-run just the post phase with: payara deploy run ${configName} --post-only`);
           process.exit(1);
         }
 
@@ -1556,6 +1742,29 @@ export function registerDeployRunCommand(
           || selectedMissingReceipts.length > 0
         ) {
           process.exit(1);
+        }
+        if (options.requireFleetStopBeforePre) {
+          if (!flatFleetStopGroups || !flatFleetOutageContext) {
+            throw new Error(
+              'FLEET_OUTAGE_OWNER_MISSING: strict rollout lost its durable owner context',
+            );
+          }
+          markFleetOutageCommitAuthorized(flatFleetOutageContext);
+          await releaseFleetOutageFence(
+            flatFleetStopGroups,
+            flatFleetOutageContext,
+            ctx,
+          );
+          await restoreFleetTrafficAfterSuccessfulRollout([{
+            name: configName,
+            hosts: config.hosts!,
+            haproxy: config.haproxy,
+          }], ctx);
+          await finalizeFleetOutageFence(
+            flatFleetStopGroups,
+            flatFleetOutageContext,
+            ctx,
+          );
         }
       } catch (err) {
         ctx.output.error(`Deployment failed: ${getErrorMessage(err)}`);
@@ -1599,6 +1808,7 @@ interface DeployRunOptions {
   skipPost?: boolean;
   preOnly?: boolean;
   postOnly?: boolean;
+  requireFleetStopBeforePre?: boolean;
 }
 
 /**
@@ -1642,9 +1852,17 @@ async function runMultiClassDeploy(
     preopenedTunnels: ReadonlyMap<string, Tunnel>;
     classPreflights: ReadonlyMap<string, PreparedClassPreflight>;
     isPlain: boolean;
+    fleetStopGroups?: readonly FleetStopGroup[];
+    fleetOutageContext?: FleetOutageContext;
   },
 ): Promise<void> {
-  const { preopenedTunnels, classPreflights, isPlain } = shared;
+  const {
+    preopenedTunnels,
+    classPreflights,
+    isPlain,
+    fleetStopGroups,
+    fleetOutageContext,
+  } = shared;
 
   // 2. Resolve the classes (inheriting config-level defaults).
   // We track each class's scoped strategy override SEPARATELY from rc.strategy (the
@@ -1788,7 +2006,20 @@ async function runMultiClassDeploy(
       // There is intentionally no up-to-date fast path. Disk hashes do not
       // prove runtime dispatch, so every class target must produce a verified
       // deployment result before post-deploy migrations are eligible.
-      const hostsWithChanges = [...deployableHosts];
+      const alreadyDeployed = new Set(
+        fleetOutageContext?.alreadyDeployedHosts ?? [],
+      );
+      const resumedDeployments = deployableHosts.filter(host =>
+        alreadyDeployed.has(host)
+      );
+      await verifyResumedDeploymentHealth(
+        resumedDeployments,
+        rc.healthCheck,
+        ctx,
+      );
+      const hostsWithChanges = deployableHosts.filter(host =>
+        !alreadyDeployed.has(host)
+      );
 
       // Resolve the class-scoped strategy using the correct priority:
       //   explicit --class X --strategy  >  --sequential  >  class config strategy
@@ -1825,14 +2056,21 @@ async function runMultiClassDeploy(
         healthCheck: rc.healthCheck,
         useTLS,
         haproxy: haproxyConfig,
+        deferHAProxyReady: options.requireFleetStopBeforePre,
+        outageOwnerId: fleetOutageContext?.outageOwnerId,
+        outageCapability: fleetOutageContext?.outageCapability,
         quiesce: rc.quiesce,
         hostConfigs: rc.hostConfigs,
         suppressMixedClassWarning: true,
         mutationAuthTokens,
       };
 
-      const deployCtx = await executeListrDeployment(strategy, deployableHosts, deployOpts);
-      const missingReceipts = missingVerifiedDeploymentReceipts(deployCtx, rc.hosts);
+      const deployCtx = await executeListrDeployment(strategy, hostsWithChanges, deployOpts);
+      const missingReceipts = missingVerifiedOrResumedDeploymentReceipts(
+        deployCtx,
+        rc.hosts,
+        fleetOutageContext,
+      );
       return {
         ctx: deployCtx,
         coverageOk:
@@ -1842,10 +2080,15 @@ async function runMultiClassDeploy(
     } finally {
       // Close ONLY this class's tunnels; do NOT call clearAllEndpointOverrides()
       // mid-loop — other classes may still have their overrides active.
-      for (const host of rc.hosts) {
-        clearEndpointOverride(host);
+      // A strict outage keeps every loopback transport alive through the
+      // global prepare/resume/READY/finalize commit. The outer command owns
+      // and closes those pre-opened tunnels after runMultiClassDeploy returns.
+      if (!options.requireFleetStopBeforePre) {
+        for (const host of rc.hosts) {
+          clearEndpointOverride(host);
+        }
+        await Promise.all(classTunnels.map(t => t.close().catch(() => undefined)));
       }
-      await Promise.all(classTunnels.map(t => t.close().catch(() => undefined)));
     }
   };
 
@@ -1870,9 +2113,10 @@ async function runMultiClassDeploy(
       return [
         rc.name,
         outcome?.ctx
-        ? missingVerifiedDeploymentReceipts(
+        ? missingVerifiedOrResumedDeploymentReceipts(
             outcome.ctx,
-            rc.hosts
+            rc.hosts,
+            fleetOutageContext,
           )
         : rc.hosts,
       ];
@@ -1914,7 +2158,9 @@ async function runMultiClassDeploy(
       { dryRun: options.dryRun, run: postSkipReason === undefined, skipReason: postSkipReason, integrityDirs: siblingIntegrityDirs(config, 'post-deploy') });
   } catch (postErr) {
     ctx.output.error(`Rollout succeeded but post-deploy migrations FAILED: ${getErrorMessage(postErr)}`);
-    ctx.output.info(`Re-run just the post phase with: payara deploy run ${config.name} --post-only`);
+    ctx.output.info(options.requireFleetStopBeforePre
+      ? `Re-run the complete recovery rail with: payara deploy run ${config.name} --require-fleet-stop-before-pre`
+      : `Re-run just the post phase with: payara deploy run ${config.name} --post-only`);
     process.exit(1);
   }
 
@@ -1926,7 +2172,11 @@ async function runMultiClassDeploy(
     const outcome = outcomeByClass.get(rc.name);
     if (outcome?.ran !== true || !outcome.ctx) return true;
     const selectedHosts = selectedHostsByClass.get(rc.name) ?? [];
-    return missingVerifiedDeploymentReceipts(outcome.ctx, selectedHosts).length > 0
+    return missingVerifiedOrResumedDeploymentReceipts(
+      outcome.ctx,
+      selectedHosts,
+      fleetOutageContext,
+    ).length > 0
       || outcome.ctx.failed > 0
       || outcome.ctx.healthCheckFailed > 0
       || outcome.ctx.workerFailed > 0
@@ -1934,5 +2184,27 @@ async function runMultiClassDeploy(
   });
   if (result.abortedAt || selectedRolloutFailed) {
     process.exit(1);
+  }
+  if (options.requireFleetStopBeforePre) {
+    if (!fleetStopGroups || !fleetOutageContext) {
+      throw new Error(
+        'FLEET_OUTAGE_OWNER_MISSING: strict rollout lost its durable owner context',
+      );
+    }
+    markFleetOutageCommitAuthorized(fleetOutageContext);
+    await releaseFleetOutageFence(
+      fleetStopGroups,
+      fleetOutageContext,
+      ctx,
+    );
+    await restoreFleetTrafficAfterSuccessfulRollout(
+      resolved.map(rc => ({
+        name: rc.name,
+        hosts: rc.hosts,
+        haproxy: rc.haproxy,
+      })),
+      ctx,
+    );
+    await finalizeFleetOutageFence(fleetStopGroups, fleetOutageContext, ctx);
   }
 }
