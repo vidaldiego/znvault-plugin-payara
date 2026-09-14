@@ -67,7 +67,8 @@ src/
 - `POST /deploy/upload`: Upload entire WAR file (binary)
 - `POST /boot-deployment/stage-artifact`: Store only a missing recovery WAR
 - `POST /boot-deployment/recover`: Hash/epoch/runtime-bound one-shot recovery
-- `GET /status`, `POST /restart`, `POST /start`, `POST /stop`
+- `GET /status`, `POST /restart`, `POST /start`, `POST /stop`,
+  `POST /stop-for-deployment`
 
 Every deployment mutation requires one caller-generated lowercase UUIDv4
 `deploymentId` (`x-znvault-deployment-id` for the binary upload; JSON field for
@@ -159,6 +160,53 @@ the engine applies all-pending-per-dir, so a shared dir makes the post phase a
 silent no-op; `validateDeployConfig` warns on equal dirs.
 
 Ordered plan: pre migrations → deploy all classes → post migrations.
+
+For a pre migration that is not compatible with any live old-WAR instance,
+`payara deploy run <cfg> --require-fleet-stop-before-pre` activates the strict
+fleet-stop rail. This is load-bearing and opt-in: before pre SQL it drains every
+host mapped in HAProxy, strictly quiesces every configured host (including
+unrouted workers), proves zero in-flight work, removes each persistent
+application reference before stopping Payara everywhere, after fsyncing the
+canonical scheduler boot marker and a durable receipt bound to
+host/domain/application, one caller-owned outage UUID, the SHA-256 of a separate
+private rollout capability, the exact previous WAR, and the one permitted target
+content hash. A retry
+may skip scheduler quiesce and a second stop only for a host whose durable
+receipt still matches the same owner and target; it always re-proves exactly
+`running=false/processCount=0` across the complete fleet before SQL. A stopped
+host without a matching receipt fails closed. Quiesce is renewed and zero work
+is re-proved immediately before each sequential node-class stop. Any partial,
+unavailable, or timed-out result fails closed before SQL. Routed hosts remain
+drained through pre migration, rollout, and post migration; per-host deployment
+must use `deferHAProxyReady`, and only the final fleet-wide success gate may
+prepare release, resume and verify every scheduler, publish READY, then finalize
+every durable fence. All strict control traffic uses tunnels that stay open
+through finalization. Once armed, the fence rejects
+ordinary start/restart/stop/undeploy/WAR mutation and every deployment without
+the matching owner; the owner can deploy only the target bound before SQL. A
+normal release preparation requires phase `deployed`, that exact WAR, a running
+runtime, application inventory, and the rollout capability. It removes the boot
+hold and advances monotonically to `releasing`; finalization clears the mutation
+receipt only after scheduler and READY proof. Explicit recovery is direct-loopback only and
+requires the owner plus an audit reason. Any failure after draining retains the drain for operator
+reconciliation. A partial final READY fan-out triggers an exact, fleet-wide
+DRAIN compensation; failure to prove that compensation is terminal and
+explicit. A regular, non-symlink `.znvault-require-fleet-stop` file inside the
+resolved pre `migration.migrationsDir` makes the flag mandatory whenever the
+execution plan includes pre migration or a WAR rollout; omission fails before
+operational I/O. This prevents `--skip-pre` and `--skip-migrations` from rolling
+out a schema-dependent WAR around the marker. The flag rejects scopes, drain/pre/migration skips, and
+migration-only forms before operational I/O; `--skip-post` and `--dry-run` are
+the only phase/dry-run variations allowed. `--post-only` has no rollout and does
+not require the flag. Without a marker or explicit flag, historical behavior is
+unchanged. Key implementation: `fleet-stop-before-pre.ts`, with command wiring
+in `commands/deploy-run.ts` and local READY deferral in `listr-deploy.ts`.
+
+The API's explicit synchronous scheduler trigger participates in the same
+quiesce/in-flight contract: it prechecks quiescence, registers the work as
+in-flight, rechecks before dispatch, and rejects a quiesce race with
+`SchedulerQuiescedException` / HTTP 409. `SchedulerQuiesceTest` and
+`VerifactuInternalLoopbackE2ETest` cover that boundary.
 
 For rollout commands, the mutable boundary is fleet-wide: load every credential
 and tunnel, authenticate Agent-owned updater metadata on every selected host,

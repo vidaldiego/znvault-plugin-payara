@@ -378,6 +378,55 @@ Start the Payara domain.
 
 Stop the Payara domain.
 
+### POST /plugins/payara/stop-for-deployment
+
+Remove the managed application's persistent Payara reference while the domain
+is running, prove the application absent, and then stop the domain under one
+deployment lock. Before removing that reference, it writes the canonical
+domain-config scheduler hold and a private receipt bound to
+host/domain/application, one caller-owned outage UUID, a separate random
+32-byte base64url capability commitment, the exact previous WAR, and the
+canonical content hash of the only permitted rollout target. The receipt stores
+only the capability SHA-256; the secret exists only in the CLI's mode-0600
+rollout journal and authenticated mutation requests.
+Repeating the operation while Payara remains down is accepted only for that
+same owner and target while the receipt still matches. This endpoint is
+reserved for a planned cold deployment. Once armed, ordinary lifecycle and
+deployment paths return `409` rather than clearing or bypassing the fence.
+
+### POST /plugins/payara/stop-for-deployment/release
+
+Prepare successful local rollout release while retaining the mutation fence.
+This direct-loopback-only request must carry the original outage owner, target,
+and capability. Release preparation is accepted
+only after the receipt is in `deployed`, the exact target WAR is still present,
+Payara is running, and the managed application is inventory-visible. It removes
+the scheduler marker and its future-boot setenv override, then commits phase
+`releasing`.
+
+### POST /plugins/payara/stop-for-deployment/finalize
+
+Remove the remaining mutation receipt after the CLI has resumed every scheduler,
+proved `quiesced=false`, `inFlightUnits=0`, `deploymentHold=false`, and
+`holdValid=true`, and published HAProxy READY. This endpoint is also
+direct-loopback-only and requires the original owner, target, and capability.
+
+### POST /plugins/payara/stop-for-deployment/recover
+
+Explicit operator recovery for an investigated failure that cannot satisfy the
+normal release proof. This route accepts only a direct loopback socket request,
+requires the exact owner plus a bounded audit reason, and never runs
+automatically.
+
+### GET /plugins/payara/stop-for-deployment/status
+
+Return strict process-count evidence and the durable outage state, including
+owner, target, capability-bound boolean, scheduler-hold boolean, and `arming`,
+`prepared`, `stopped`, `rollout`, `deployed`, or `releasing` phase. It never returns the
+capability or its hash. A
+stopped process without matching durable evidence is observation only and
+cannot authorize a migration retry.
+
 ### GET /plugins/payara/status
 
 Get current Payara status.
@@ -667,6 +716,80 @@ out before any host is touched):
 | `--migrations-only` | ✅ | ✅ | ❌ (stop) |
 | `--pre-only` | ✅ | ❌ | ❌ (stop) |
 | `--post-only` | ❌ | ✅ | ❌ (recovery) |
+
+#### Strict fleet stop before an incompatible pre migration
+
+Use `--require-fleet-stop-before-pre` only when the configured pre-deploy
+migration cannot run while an old application instance is live:
+
+```bash
+znvault payara deploy run production --require-fleet-stop-before-pre
+```
+
+A migration tree can make this capability mandatory by versioning a
+`.znvault-require-fleet-stop` regular file directly inside its configured
+`migration.migrationsDir`. The CLI resolves that directory against `rootDir` and
+inspects the marker for any request that selects pre migration or a WAR rollout.
+A present marker makes the flag mandatory before credentials, tunnels, hosts,
+HAProxy, the database, or the WAR are touched, so `--skip-pre` and
+`--skip-migrations` cannot bypass required schema work. A symlink or non-regular
+marker is rejected. `--post-only` selects neither pre migration nor a rollout
+and therefore does not require the flag.
+
+This opt-in rail establishes one fleet-wide outage boundary before the first
+SQL statement:
+
+1. every host present in an HAProxy `serverMap` receives a successful DRAIN
+   receipt, then the longest configured `drainWaitSeconds` window elapses;
+2. every configured host, including unrouted workers, must accept strict
+   scheduler quiesce and report `quiesced=true` with `inFlightUnits=0`; the CLI
+   renews quiesce and re-proves zero work immediately before each sequential
+   node-class stop;
+3. before the first stop, the CLI fsyncs a private mode-0600 journal containing
+   one outage owner and a separate random capability; every host receives
+   `POST /plugins/payara/stop-for-deployment`, which fsyncs the canonical
+   scheduler marker and mutation receipt, then removes and proves absent the
+   persistent application reference and stops Payara under one deployment lock;
+4. an independent durable-status read from every host must report a matching
+   receipt plus exactly `running=false` and `processCount=0`.
+
+After a CLI or agent restart, a matching receipt permits the retry to omit only
+that host's scheduler quiesce and second stop. The retry still drains traffic
+again and re-proves durable PID0 on every host before SQL. A stopped host with
+no receipt, an unreadable receipt, another host/domain/application, or a changed
+WAR aborts before migration. While the fence exists, ordinary start, restart,
+stop, undeploy, WAR mutation, and deployments without the matching owner are
+rejected. The matching owner and capability can roll out only the target bound
+before SQL.
+
+An unavailable endpoint, timeout, partial drain/stop, or incomplete status
+response aborts before migration. Once draining begins there is deliberately no
+automatic READY compensation on failure. During the subsequent rollout each
+routed node remains drained; HAProxy READY is published fleet-wide only after
+every selected deployment has an exact receipt and every enabled post-deploy
+migration has succeeded. The CLI prepares release on every host, resumes and
+checks every scheduler, publishes READY, and only then calls `finalize` to
+remove the mutation receipts. All strict hosts require `tunnel=true`; those
+loopback transports remain open through finalization. A pre migration, rollout,
+post migration, release preparation, scheduler resume, READY, or finalization
+failure therefore remains visible.
+If the final READY fan-out is partial,
+the CLI immediately returns every routed host to DRAIN and verifies those
+receipts; an unproven compensation requires operator reconciliation.
+
+The strict flag requires a configured pre migration and a complete rollout. It
+rejects `--host`, `--only`, `--class`, `--skip-drain`, `--skip-pre`,
+`--skip-migrations`, `--migrations-only`, `--pre-only`, and `--post-only` before
+operational I/O. `--skip-post` is allowed. `--dry-run` prints the strict plan but
+does not drain, quiesce, stop, migrate, deploy, or publish READY. Omitting the
+flag preserves the existing rolling and migration-only workflows when no marker
+requires the strict rail.
+
+The API's explicit synchronous scheduler trigger follows the same isolation
+boundary: it prechecks quiescence, registers the work in `inFlightUnits`,
+rechecks before dispatch, and rejects a quiesce race with
+`SchedulerQuiescedException` / HTTP 409. The API scheduler and internal-loopback
+tests cover this path.
 
 `payara config show <cfg>` renders both phases and the ordered execution plan.
 When both phases use the same role + database, the shared settings are shown once
