@@ -49,6 +49,20 @@ function assertUnambiguousWarEntryName(entryName: string): void {
   }
 }
 
+function readWarEntriesForIdentity(artifact: Buffer): AdmZip.IZipEntry[] {
+  try {
+    return new AdmZip(artifact).getEntries();
+  } catch (error) {
+    if (
+      error instanceof Error
+      && error.message.startsWith('ADM-ZIP: Duplicate entry name ')
+    ) {
+      throw new Error(`WAR_ENTRY_DUPLICATE: ${error.message}`);
+    }
+    throw error;
+  }
+}
+
 /**
  * Parse one WAR into an unambiguous logical entry map.
  *
@@ -58,12 +72,11 @@ function assertUnambiguousWarEntryName(entryName: string): void {
  */
 export function calculateWarEntryHashes(artifact: Buffer): WarFileHashes {
   const hashes: WarFileHashes = {};
-  const zip = new AdmZip(artifact);
   const seenLogicalEntries = new Set<string>();
   const fileEntries = new Set<string>();
   const logicalParents = new Set<string>();
 
-  for (const entry of zip.getEntries()) {
+  for (const entry of readWarEntriesForIdentity(artifact)) {
     assertUnambiguousWarEntryName(entry.entryName);
     const logicalName = entry.entryName.endsWith('/')
       ? entry.entryName.slice(0, -1)
