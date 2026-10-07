@@ -74,7 +74,7 @@ async function ownedSsh(target:SandboxDeployTarget,args:string[],input?:Buffer):
  return new Promise((resolveResult,reject)=>{
   const child=spawn('znvault',['ssh','-T',`${target.ssh.user}@${target.host}`,'--',command],{stdio:['pipe','pipe','pipe'],detached:true});
   let bytes=0,stdout='',timedOut=false;let kill:NodeJS.Timeout|undefined;
-  const terminate=()=>{try{process.kill(-child.pid!,'SIGTERM');}catch{}kill=setTimeout(()=>{try{process.kill(-child.pid!,'SIGKILL');}catch{}},2000);kill.unref();};
+  const terminate=()=>{try{process.kill(-child.pid!,'SIGTERM');}catch{/* The process group may already have exited. */}kill=setTimeout(()=>{try{process.kill(-child.pid!,'SIGKILL');}catch{/* The process group may already have exited. */}},2000);kill.unref();};
   const timeout=setTimeout(()=>{timedOut=true;terminate();},15*60_000);
   child.stdout.on('data',(b:Buffer)=>{bytes+=b.length;if(bytes>256*1024)terminate();else stdout+=b.toString();});
   child.stderr.on('data',()=>{/* Runtime errors may contain secret paths; surface only a bounded action error. */});
