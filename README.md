@@ -1681,3 +1681,13 @@ See [MIGRATION.md](./MIGRATION.md) for step-by-step migration guide from the Pyt
 ## License
 
 MIT
+
+### Final partner sandbox target (1+R+S)
+
+A multi-class release may append one final class with `target.kind: "partner-sandbox-compose"`. Keep `1+R` on the serving API class and preserve worker ordering. S is an outer final phase after all production receipt/coverage/post gates and traffic/fence restoration; it never receives production credentials, agent ownership, HAProxy or database fields. Its explicit owner is runtime `partner-sandbox`, host `172.16.221.80`, project `zincapp-partner-sandbox` and directory `/srv/zincapp/partner-sandbox`, with an explicit SSH user and root-anchored `manifestPath`.
+
+The API repository prepares the exact clean source/E2E-fast/immutable image/WAR/config manifest and bounded nonsecret bundle. Its owned driver is installed through the managed SSH/Vault procedure before this target is activated. This plugin verifies the managed driver hash before execution and communicates through `znvault ssh`; it does not use a host Payara agent for S.
+
+Full 1+R+S refuses skipped gates and partial class/host overrides. `--dry-run` lists production and isolated sandbox schema phases. S failure returns nonzero with a private UUID journal and leaves production restored. Retry only S using `--class sandbox --resume-sandbox <original-UUID>`; the original configuration/artifacts, fresh exact source receipt and current authenticated per-host operation IDs/WAR identities/health must still match before and after S. A changed or superseding production deployment cannot reuse an old receipt. Legacy configs without an explicit target keep their existing behavior.
+
+The candidate requires the deploy-core target descriptor/resolver/validator release. Do not publish this WIP against an older core package lacking that contract; publish compatible reviewed core and plugin versions via their normal clean-main release gates first.

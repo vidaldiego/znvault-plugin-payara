@@ -2,9 +2,16 @@
 // Deploy run command - multi-host deployment using saved configurations
 
 import type { Command } from 'commander';
+import { randomUUID } from 'node:crypto';
+import {
+  executeSandboxComposition, splitSandboxComposition, loadSandboxManifest, preflightSandboxTarget, deploySandboxTarget,
+  sha256, verifyProductionReadback, journalPath, readCompositionJournal, writeCompositionJournal,
+  type SandboxArtifactManifest, type ProductionReceipt, type CompositionJournal,
+} from '../sandbox-target.js';
 import { runMigrations, defaultDeps as migrationDefaultDeps, mysqlAdapter } from '@zincapp/znvault-migrate';
 import { resolve, join, basename } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import {
   calculateWarHashes,
@@ -85,6 +92,8 @@ import {
   printMultiClassDryRun,
   printMultiClassSummary,
   type RunClassResult,
+  type MultiClassResult,
+  agentGet, buildPluginUrl,
   runMigrationPhase as coreRunMigrationPhase,
   siblingIntegrityDirs as coreSiblingIntegrityDirs,
 } from '@zincapp/znvault-deploy-core';
@@ -758,6 +767,7 @@ export function registerDeployRunCommand(
       'Before pre migrations, drain routed hosts, strictly quiesce and stop the complete Payara fleet'
     )
     .option('--with-root <dir>', 'Base dir for relative local paths in the config (sets/overrides rootDir for this deploy)')
+    .option('--resume-sandbox <deploymentId>', 'Recover only S after revalidating the original production receipts')
     .option('--mutation-auth-token-file <path>', 'Local private Payara credential file')
     .action(async (configName: string, options: {
       force?: boolean;
@@ -778,6 +788,7 @@ export function registerDeployRunCommand(
       postOnly?: boolean;
       requireFleetStopBeforePre?: boolean;
       withRoot?: string;
+      resumeSandbox?: string;
       mutationAuthTokenFile?: string;
     }) => {
       const progress = new ProgressReporter(ctx.isPlainMode());
@@ -847,6 +858,38 @@ export function registerDeployRunCommand(
         // SSH forward. Sending the control credential over direct HTTP is never
         // a compatibility fallback. An explicit false requires verified HTTPS.
         config = { ...config, tunnel: config.tunnel ?? true };
+
+        // S is never given a production token/tunnel, fleet sentinel or migration owner.
+        const composition = splitSandboxComposition(config, options);
+        config = composition.production;
+        const sandboxTarget = composition.target;
+        let sandboxManifest: SandboxArtifactManifest | undefined;
+        let sandboxJournal: CompositionJournal | undefined;
+        if (sandboxTarget && !options.preOnly && !options.postOnly && !options.migrationsOnly) {
+          sandboxManifest = loadSandboxManifest(sandboxTarget);
+          await validateServingArtifactManifest(config, sandboxManifest);
+          if(!options.dryRun)assertReviewedSandboxSource(config,sandboxManifest);
+          if (options.resumeSandbox) {
+            if (options.requireFleetStopBeforePre || options.preOnly || options.postOnly || options.migrationsOnly)
+              throw new Error('Scoped S recovery cannot mutate production or run migration-only phases');
+            const path=journalPath(sandboxTarget,options.resumeSandbox);
+            sandboxJournal=readCompositionJournal(path);
+            if(sandboxJournal.deploymentId!==options.resumeSandbox || sandboxJournal.manifestSha256!==sha256(JSON.stringify(sandboxManifest)) || sandboxJournal.productionConfigSha256!==sha256(JSON.stringify(config)))
+              throw new Error('Sandbox recovery deployment/configuration/artifact identity changed');
+            if(options.dryRun){ctx.output.info('[S recovery] would verify original serving operations/artifacts, then sandbox own schema and Compose receipt');return;}
+            const current=await readServingReceipts(config,sandboxManifest,options.mutationAuthTokenFile,ctx,sandboxJournal.production);
+            await preflightSandboxTarget(sandboxTarget,sandboxManifest);
+            try {
+              sandboxJournal.sandbox=await deploySandboxTarget(sandboxTarget,sandboxManifest,options.resumeSandbox);
+              await readServingReceipts(config,sandboxManifest,options.mutationAuthTokenFile,ctx,current);
+              sandboxJournal.status='complete';writeCompositionJournal(path,sandboxJournal);
+              ctx.output.success('1+R+S complete: original production receipts and sandbox runtime verified');
+            } catch(error){sandboxJournal.status='sandbox_incomplete';writeCompositionJournal(path,sandboxJournal);throw error;}
+            return;
+          }
+          if(options.dryRun)ctx.output.info('[1+R+S] production pre → API 1+R → workers → production post/traffic restore → S own pre/schema/Compose/readback/post');
+          else if(!options.preOnly&&!options.postOnly&&!options.migrationsOnly)await preflightSandboxTarget(sandboxTarget,sandboxManifest);
+        }
 
         // Resolve the six-flag plan (pure). Contradictions abort before any host.
         const { plan, error: planError } = resolveDeployPlan({
@@ -1255,9 +1298,9 @@ export function registerDeployRunCommand(
               options.class.length < config.classes!.length) ||
             // per-class --host override on the single named class (B1c)
             ((options.class.length === 1) && [...options.host, ...options.only].length > 0);
-          await runMultiClassDeploy(
+          await executeSandboxComposition(async () => runMultiClassDeploy(
             ctx,
-            config,
+            config!,
             options,
             plan,
             mcIsScoped,
@@ -1270,7 +1313,26 @@ export function registerDeployRunCommand(
               fleetStopGroups,
               fleetOutageContext,
             }
-          );
+          ), async productionResult => {
+          if(sandboxTarget && sandboxManifest) {
+            if(options.dryRun) {
+              ctx.output.info(`[S] ${sandboxTarget.host}: owned database partner_sandbox_zincdb pre → immutable image ${sandboxManifest.image} → exact runtime/WAR/config receipt → owned post`);
+            } else {
+              if(!productionResult)throw new Error('Production receipt missing before S');
+              const receipts=await readServingReceipts(config!,sandboxManifest,options.mutationAuthTokenFile,ctx,undefined,productionResult);
+              const deploymentId=randomUUID(),path=journalPath(sandboxTarget,deploymentId);
+              sandboxJournal={version:1,deploymentId,manifestSha256:sha256(JSON.stringify(sandboxManifest)),productionConfigSha256:sha256(JSON.stringify(config)),production:receipts,status:'production_complete'};
+              writeCompositionJournal(path,sandboxJournal);
+              ctx.output.info(`[S] deployment ${deploymentId}; recovery: --class ${composition.targetClassName} --resume-sandbox ${deploymentId}`);
+              try {
+                sandboxJournal.sandbox=await deploySandboxTarget(sandboxTarget,sandboxManifest,deploymentId);
+                await readServingReceipts(config!,sandboxManifest,options.mutationAuthTokenFile,ctx,receipts);
+                sandboxJournal.status='complete';writeCompositionJournal(path,sandboxJournal);
+                ctx.output.success('1+R+S complete: all production and sandbox receipts verified');
+              } catch(error){sandboxJournal.status='sandbox_incomplete';writeCompositionJournal(path,sandboxJournal);throw error;}
+            }
+          }
+          });
           return; // handled — do not fall through to the flat path
         }
 
@@ -1809,6 +1871,7 @@ interface DeployRunOptions {
   preOnly?: boolean;
   postOnly?: boolean;
   requireFleetStopBeforePre?: boolean;
+  resumeSandbox?: string;
 }
 
 /**
@@ -1855,7 +1918,7 @@ async function runMultiClassDeploy(
     fleetStopGroups?: readonly FleetStopGroup[];
     fleetOutageContext?: FleetOutageContext;
   },
-): Promise<void> {
+): Promise<MultiClassResult | undefined> {
   const {
     preopenedTunnels,
     classPreflights,
@@ -2207,4 +2270,101 @@ async function runMultiClassDeploy(
     );
     await finalizeFleetOutageFence(fleetStopGroups, fleetOutageContext, ctx);
   }
+  return result;
+}
+
+
+/** Local release artifact proof before the first production/sandbox mutation. */
+async function validateServingArtifactManifest(config:DeployConfig,m:SandboxArtifactManifest):Promise<void> {
+  const classes=config.classes??[];
+  const actual=classes.flatMap(c=>c.hosts.map(host=>({className:c.name,host})));
+  if(actual.length!==m.production.length || actual.some(p=>!m.production.some(e=>e.className===p.className&&e.host===p.host)))
+    throw new Error('Sandbox composition manifest does not cover every configured production host');
+  for(const cls of classes){
+    const rc=resolveClass(config,cls);
+    if(!rc.warPath)throw new Error('Serving artifact path missing');
+    const snapshot=await readLocalWarArtifactSnapshot(rc.warPath);
+    if(m.production.filter(p=>p.className===cls.name).some(p=>p.warContentSha256!==snapshot.contentSha256))
+      throw new Error('Reviewed production WAR content differs from sandbox composition manifest');
+  }
+}
+
+/** Fresh authenticated per-host operations and artifact readback; no count/HTTP-200 substitute. */
+async function readServingReceipts(config:DeployConfig,m:SandboxArtifactManifest,tokenFile:string|undefined,ctx:CLIPluginContext,previous?:ProductionReceipt[],rollout?:MultiClassResult):Promise<ProductionReceipt[]> {
+  const hosts=m.production.map(p=>p.host),tokens=loadHostMutationAuthTokens(config,hosts,tokenFile),receipts:ProductionReceipt[]=[];
+  if(previous && (previous.length!==hosts.length || previous.some(p=>!m.production.some(e=>e.host===p.host&&e.className===p.className&&e.warContentSha256===p.warContentSha256))))
+    throw new Error('Original production receipt coverage mismatch');
+  for(const cls of config.classes??[]){
+    const rc=resolveClass(config,cls),tunnels:Tunnel[]=[];
+    try {
+      if(rc.tunnel)for(const host of rc.hosts){const t=await openTunnel(host,{user:rc.ssh?.user,remotePort:rc.port,readinessTimeoutMs:rc.ssh?.readinessTimeoutMs});tunnels.push(t);setEndpointOverride(host,'127.0.0.1',t.localPort);}
+      const {port,useTLS}=configureTLSForDeployment({...config,port:rc.port,tls:rc.tls},ctx);
+      for(const host of rc.hosts){
+        const expected=m.production.find(p=>p.host===host)!;
+        const token=tokens.get(host);if(!token)throw new Error('Current production receipt credential unavailable');
+        const url=buildPluginUrl(host,port,useTLS),auth={bearerToken:token};
+        const status=await agentGet<Record<string,unknown>>(url+'/deploy/status',15_000,auth);
+        const hashes=await agentGet<unknown>(url+'/hashes',15_000,auth);
+        const finalStatus=await agentGet<Record<string,unknown>>(url+'/deploy/status',15_000,auth);
+        if(status.lastDeploymentId!==finalStatus.lastDeploymentId || finalStatus.healthy!==true || finalStatus.running!==true || finalStatus.appDeployed!==true)
+          throw new Error('Current production operation/health changed during receipt readback');
+        const r=verifyProductionReadback(finalStatus,hashes,expected.warContentSha256);
+        const old=previous?.find(p=>p.host===host);
+        if(old && (old.deploymentId!==r.deploymentId||old.warSha256!==r.warSha256))throw new Error('Production operation superseded; scoped S recovery forbidden');
+        if(rollout){
+          const actual=rollout.classes.find(c=>c.name===cls.name)?.ctx?.results.get(host);
+          const result=actual?.result as import('../../types.js').DeployResult|undefined;
+          if(actual?.success!==true||result?.success!==true||result.deployed!==true||result.artifact?.sha256!==r.warSha256||result.artifact.contentSha256!==expected.warContentSha256)
+            throw new Error('Production current artifact does not match this rollout receipt');
+        }
+        receipts.push({...expected,...r});
+      }
+    } finally {
+      // A strict production rail may retain its owned forward. Only clear forwards opened here.
+      for(const tunnel of tunnels){clearEndpointOverride(tunnel.host);await tunnel.close().catch(()=>undefined);}
+    }
+  }
+  return receipts;
+}
+
+/** Release gates stay exact-commit and fresh even on a scoped S retry. */
+export function assertReviewedSandboxSource(config:DeployConfig,m:SandboxArtifactManifest):void {
+  if(!config.rootDir)throw new Error('1+R+S requires the reviewed API source root');
+  const git=(args:string[])=>execFileSync('git',['-C',config.rootDir!,...args],{encoding:'utf8',timeout:10_000,stdio:['ignore','pipe','ignore']}).trim();
+  const head=git(['rev-parse','HEAD']),status=git(['status','--porcelain']);
+  const original=execFileSync('git',['-C',config.rootDir,'show',`${m.gitSha}:gradle.properties`],{encoding:'utf8',timeout:10_000,stdio:['ignore','pipe','ignore']}).trimEnd();
+  const current=readFileSync(join(config.rootDir,'gradle.properties'),'utf8').trimEnd();
+  const releaseDigest=sha256(readFileSync(join(config.rootDir,'gradle.properties')));
+  // Gradle verifies clean/pushed source before bumping release metadata. Only that
+  // exact supported delta may remain dirty, or form the immediate release-only child.
+  if(head===m.gitSha) {
+    if(status && status!=='M gradle.properties' && status!=='M  gradle.properties')throw new Error('Unreviewed source changes in 1+R+S');
+  } else if(status || git(['rev-list','--parents','-n','1','HEAD'])!==`${head} ${m.gitSha}` ||
+    git(['diff','--name-only',m.gitSha,'HEAD'])!=='gradle.properties')throw new Error('Sandbox recovery source is not an exact version-only release child');
+  if(current!==original || head!==m.gitSha) {
+    if(!m.releasePropertiesSha256 || releaseDigest!==m.releasePropertiesSha256 || !isSupportedReleaseVersionDelta(original,current))
+      throw new Error('Unverified Gradle release metadata delta');
+  } else if(m.releasePropertiesSha256 && releaseDigest!==m.releasePropertiesSha256)throw new Error('Release properties differ from prepared artifacts');
+  const receipt=readFileSync(join(config.rootDir,'e2e/.runtime/e2e-fast-pass.properties'));
+  if(sha256(receipt)!==m.releaseReceiptSha256)throw new Error('Release E2E-fast receipt differs from composition manifest');
+  const values:Record<string,string>={};
+  const keys=new Set(['version','result','commit','runtime_commit','suite_sha256','duration_seconds','tests','failures','errors','skipped','completed_at_epoch']);
+  for(const line of receipt.toString('utf8').trimEnd().split('\n')){const index=line.indexOf('=');const key=line.slice(0,index),value=line.slice(index+1);if(index<1||!keys.has(key)||key in values||!value||value.includes('\r'))throw new Error('Malformed E2E-fast release receipt');values[key]=value;}
+  if(Object.keys(values).length!==keys.size||values.version!=='1'||values.result!=='pass'||values.commit!==m.gitSha||values.runtime_commit!==m.gitSha||values.suite_sha256!==sha256(readFileSync(join(config.rootDir,'e2e/fast-suite.txt'))))throw new Error('Exact reviewed E2E-fast release identity unverified');
+  for(const key of ['duration_seconds','tests','failures','errors','skipped','completed_at_epoch'])if(!/^[0-9]+$/.test(values[key]!))throw new Error('Malformed release receipt counts');
+  const age=Date.now()/1000-Number(values.completed_at_epoch);
+  if(age>86400||age< -300||Number(values.duration_seconds)>600||Number(values.tests)<=0||['failures','errors','skipped'].some(k=>Number(values[k])!==0))throw new Error('Release E2E-fast gate not fresh/fully green');
+}
+
+/** Match Gradle writeVersion exactly; no settings, comments or unrelated fields may change. */
+function isSupportedReleaseVersionDelta(original:string,current:string):boolean {
+ const names=['major','minor','patch','build'];
+ const values=names.map(name=>{
+  const matches=[...original.matchAll(new RegExp(`^version\\.${name}=([0-9]+)$`,'gm'))];
+  return matches.length===1?Number(matches[0]![1]):-1;
+ });
+ if(values.some(v=>v<0||!Number.isSafeInteger(v)))return false;
+ const [major,minor,patch,build]=values as [number,number,number,number];
+ const next=[[major,minor,patch,build+1],[major,minor,patch+1,1],[major,minor+1,0,1],[major+1,0,0,1]];
+ return next.some(version=>names.reduce((text,name,index)=>text.replace(new RegExp(`^version\\.${name}=[0-9]+$`,'m'),`version.${name}=${version[index]}`),original)===current);
 }

@@ -2,6 +2,7 @@
 // CLI type definitions
 
 import type { Command } from 'commander';
+import type { SandboxDeployTarget } from '@zincapp/znvault-deploy-core';
 import type { DeployResult } from '../types.js';
 
 /**
@@ -263,6 +264,8 @@ export interface SharedDeployDefaults {
 export type DeployClass = SharedDeployDefaults & {
   /** 'api' | 'worker' | 'ai' — unique within the config. */
   name: string;
+  /** Owned Docker target; never inherits production agent/database controls. */
+  target?: SandboxDeployTarget;
   /** Hosts in this class. No host may appear in two classes. */
   hosts: string[];
   /**
