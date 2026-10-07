@@ -82,17 +82,18 @@ is deliberately not a conventional updater channel such as `next` or `beta`.
 
 Publish and verify the dependency chain in this order:
 
-1. `@zincapp/znvault-deploy-core@0.2.4` with the authenticated request API and
-   transport fence;
+1. `@zincapp/znvault-deploy-core@0.3.0` for plugin 3.1, including the explicit
+   sandbox target and the existing authenticated request/transport fence;
+   earlier plugin 3.0 releases continue to consume core 0.2.x;
 2. the exact Agent 2 release that consumes that core and owns the outer route
    gate/setup contract;
-3. the exact Payara plugin 3 release whose dependency resolves to core 0.2.x and
+3. the exact Payara plugin 3.1 release whose dependency resolves to core 0.3.x and
    whose dev/peer dependency resolves to that Agent 2 build.
 
 Before tagging the plugin, regenerate the lockfile from the public registry and
 verify it contains no `file:` tarball/path, resolves
-`@zincapp/znvault-deploy-core` to `0.2.x`, and resolves the Agent dev dependency
-to `2.x`. A locally packed dependency is suitable only for pre-publication
+`@zincapp/znvault-deploy-core` to `0.3.x` for plugin 3.1, and resolves the Agent
+dev dependency to `2.x`. A locally packed dependency is suitable only for pre-publication
 testing and must not enter the release commit.
 
 Agent 2 and plugin 3 form one coordinated migration pair. Publishing their exact

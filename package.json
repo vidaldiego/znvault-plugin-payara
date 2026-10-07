@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-plugin-payara",
-  "version": "3.0.11",
+  "version": "3.1.0",
   "description": "Payara application server plugin for zn-vault-agent with WAR diff deployment",
   "type": "module",
   "main": "dist/index.js",
@@ -64,7 +64,7 @@
     }
   },
   "dependencies": {
-    "@zincapp/znvault-deploy-core": "^0.2.4",
+    "@zincapp/znvault-deploy-core": "^0.3.0",
     "@zincapp/znvault-migrate": "^1.0.2",
     "adm-zip": "^0.6.1",
     "inquirer": "^13.2.1",

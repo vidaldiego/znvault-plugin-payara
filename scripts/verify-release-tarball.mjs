@@ -129,8 +129,8 @@ if (
 if (packedManifest.engines?.node !== '>=22.13.0') {
   fail('package must preserve the Node.js >=22.13.0 runtime floor');
 }
-if (packedManifest.dependencies?.['@zincapp/znvault-deploy-core'] !== '^0.2.4') {
-  fail('package must depend on the authenticated deploy-core ^0.2.4 rail');
+if (packedManifest.dependencies?.['@zincapp/znvault-deploy-core'] !== '^0.3.0') {
+  fail('package must depend on the authenticated sandbox deploy-core ^0.3.0 rail');
 }
 if (packedManifest.peerDependencies?.['@zincapp/zn-vault-agent'] !== '>=2.0.0 <3') {
   fail('package must require the coordinated Agent >=2.0.0 <3 protocol');
