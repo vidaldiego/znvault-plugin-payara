@@ -70,9 +70,9 @@ async function ownedSsh(target:SandboxDeployTarget,args:string[],input?:Buffer):
  const driver=target.directory+'/deploy-runtime.py';
  const expected=args[args.indexOf('--driver-sha256')+1];
  if(!expected||!SHA.test(expected))throw Error('Reviewed driver identity required');
- const command='test '+quote(expected)+' = "$(sha256sum '+quote(driver)+' | cut -d \' \' -f1)" && exec '+args.map(quote).join(' ');
+ const command='test '+quote(expected)+' = "$(sudo -n sha256sum '+quote(driver)+' | cut -d \' \' -f1)" && exec '+['sudo','-n',...args].map(quote).join(' ');
  return new Promise((resolveResult,reject)=>{
-  const child=spawn('znvault',['ssh','-T',`${target.ssh.user}@${target.host}`,'--',command],{stdio:['pipe','pipe','pipe'],detached:true});
+  const child=spawn('znvault',['--quiet','ssh','-T',`${target.ssh.user}@${target.host}`,'--',command],{stdio:['pipe','pipe','pipe'],detached:true});
   let bytes=0,stdout='',timedOut=false;let kill:NodeJS.Timeout|undefined;
   const terminate=()=>{try{process.kill(-child.pid!,'SIGTERM');}catch{/* The process group may already have exited. */}kill=setTimeout(()=>{try{process.kill(-child.pid!,'SIGKILL');}catch{/* The process group may already have exited. */}},2000);kill.unref();};
   const timeout=setTimeout(()=>{timedOut=true;terminate();},15*60_000);
