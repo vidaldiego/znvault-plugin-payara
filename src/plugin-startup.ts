@@ -50,7 +50,7 @@ export async function handleExecModeStartup(_ctx: StartupContext): Promise<void>
  * Handle aggressive mode startup
  *
  * In aggressive mode, we ensure a clean slate but skip restart
- * if Payara is already healthy (allows agent restarts without disruption)
+ * if an existing Payara domain is already healthy
  */
 export async function handleAggressiveModeStartup(ctx: StartupContext): Promise<void> {
   const { payara, deployer, logger } = ctx;

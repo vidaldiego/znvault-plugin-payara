@@ -149,7 +149,7 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
   let pluginLogger: Logger;
   let secretsEnv: Record<string, string> = {};
   let startupReconciliationState:
-    'not_started' | 'in_progress' | 'complete' | 'recovery_only' | 'failed' = 'not_started';
+    'not_started' | 'in_progress' | 'complete' | 'recovery_only' | 'failed' | 'stopping' | 'stopped' = 'not_started';
   let startupReconciliationError: string | undefined;
   let outageRecoveryRuntimeMutationAllowed = false;
   let keyRotationTail: Promise<void> = Promise.resolve();
@@ -543,11 +543,27 @@ export default function createPayaraPlugin(config: PayaraPluginConfig): AgentPlu
     },
 
     async onStop(_ctx: PluginContext): Promise<void> {
+      const deadlineMs = performance.now() + 45000;
       invalidatePublicHealthSnapshot();
+      // The agent also owns cleanup after a partially failed onInit. No domain
+      // can have been started by this plugin before its deployer exists.
+      if (!deployer) {
+        startupReconciliationState = 'stopped';
+        return;
+      }
       pluginLogger.info(
         { startupReconciliation: startupReconciliationState },
-        'Payara plugin stopping (Payara will continue running)'
+        'Stopping the managed Payara domain before agent shutdown'
       );
+      startupReconciliationState = 'stopping';
+      try {
+        await deployer.stopForAgentShutdown(deadlineMs);
+        startupReconciliationState = 'stopped';
+      } catch (err) {
+        startupReconciliationState = 'failed';
+        startupReconciliationError = getErrorMessage(err);
+        throw err;
+      }
     },
 
     async routes(fastify: FastifyInstance, ctx: PluginContext): Promise<void> {

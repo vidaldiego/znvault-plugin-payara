@@ -72,10 +72,26 @@ const EMPTY_LIST_MESSAGES = [
   /^No application references (?:exist|found)\.?$/i,
 ];
 
-function bootOwnershipError(code: string, message: string): Error {
-  const error = new Error(`${code}: ${message}`);
+function bootOwnershipError(code: string, message: string, cause?: unknown): Error {
+  const error = new Error(`${code}: ${message}`, cause === undefined ? undefined : { cause });
   error.name = code;
   return error;
+}
+
+/** Kernel proof that a process vanished, rather than an authorization failure. */
+function isProcessAbsent(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'ENOENT' || code === 'ESRCH';
+}
+
+function isTerminalProcessStat(stat: string, pid: number): boolean {
+  if (!stat.startsWith(`${pid} (`)) return false;
+  const commandEnd = stat.lastIndexOf(')');
+  const fields = commandEnd >= 0 ? stat.slice(commandEnd + 1).trim().split(/\s+/) : [];
+  const state = fields[0];
+  // A truncated/malformed read is not proof of death. Require the exact
+  // process start token as well as the kernel's terminal state.
+  return /^\d+$/.test(fields[19] ?? '') && (state === 'Z' || state === 'X' || state === 'x');
 }
 
 function getErrorText(error: unknown): string {
@@ -336,6 +352,7 @@ export class PayaraManager {
   private environment: Record<string, string>;
   private readonly passwordFile?: string;
   private readonly runtimeIdentityProvider: () => Promise<string | number | undefined>;
+  private readonly shutdownRuntimeIdentityProvider: (deadlineMs: number) => Promise<string | number | undefined>;
   private readonly runtimeIdentitySyncProvider: () => string | number | undefined;
   private readonly mutationQuarantineInstanceId: string;
   private readonly mutationQuarantine?: MutationQuarantineStore;
@@ -405,6 +422,8 @@ export class PayaraManager {
     this.passwordFile = options.passwordFile;
     this.runtimeIdentityProvider = options.runtimeIdentityProvider
       ?? (() => this.readRuntimeIdentity());
+    this.shutdownRuntimeIdentityProvider = options.runtimeIdentityProvider
+      ?? (deadlineMs => this.readExactDasProcessIdentity(deadlineMs));
     this.runtimeIdentitySyncProvider = options.runtimeIdentitySyncProvider
       ?? (options.runtimeIdentityProvider
         ? () => {
@@ -819,7 +838,8 @@ export class PayaraManager {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
         throw bootOwnershipError(
           'BOOT_RUNTIME_SYNC_IDENTITY_UNAVAILABLE',
-          `Cannot read system-wide procfs command identity for PID ${pid}`
+          `Cannot read system-wide procfs command identity for PID ${pid}: ${getErrorText(err)}`,
+          err
         );
       }
       if (!commandName.includes('java')) continue;
@@ -831,7 +851,8 @@ export class PayaraManager {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') continue;
         throw bootOwnershipError(
           'BOOT_RUNTIME_SYNC_IDENTITY_UNAVAILABLE',
-          `Cannot read system-wide procfs argv for Java PID ${pid}`
+          `Cannot read system-wide procfs argv for Java PID ${pid}: ${getErrorText(err)}`,
+          err
         );
       }
       if (this.processCommandLineMatchesDomain(commandLine)) {
@@ -970,8 +991,9 @@ export class PayaraManager {
   }
 
   /** Read one exact DAS token, anchored by strict JVM inventory and cmdline. */
-  private async readExactDasProcessIdentity(): Promise<string | undefined> {
-    const pids = await this.getPayaraProcessPidsStrict();
+  private async readExactDasProcessIdentity(deadlineMs?: number): Promise<string | undefined> {
+    const pids = await this.getPayaraProcessPidsStrict(deadlineMs === undefined ? 5000
+      : Math.min(5000, this.remainingLifecycleBudget(deadlineMs, 'shutdown process identity')));
     if (pids.length === 0) {
       return undefined;
     }
@@ -996,7 +1018,8 @@ export class PayaraManager {
       throw bootOwnershipError(
         'BOOT_RUNTIME_IDENTITY_UNAVAILABLE',
         `Cannot read exact procfs identity for Payara PID ${pid}: ` +
-        `${err instanceof Error ? err.message : String(err)}`
+        `${err instanceof Error ? err.message : String(err)}`,
+        err
       );
     }
 
@@ -1046,7 +1069,8 @@ export class PayaraManager {
         'BOOT_RUNTIME_IDENTITY_UNKNOWN',
         `Could not identify the current ${this.domain} runtime: ${
           err instanceof Error ? err.message : String(err)
-        }`
+        }`,
+        err
       );
     }
 
@@ -1599,17 +1623,42 @@ export class PayaraManager {
   /**
    * Stop Payara domain
    */
-  async stop(): Promise<void> {
-    return this.withMutationLease('stop-domain', () => this.stopUnlocked());
+  async stop(options: { agentShutdown?: boolean; timeoutMs?: number; deadlineMs?: number } = {}): Promise<void> {
+    const timeoutMs = options.timeoutMs ?? 45000;
+    if (options.agentShutdown && (
+      !Number.isFinite(timeoutMs) || timeoutMs <= 0
+      || (options.deadlineMs !== undefined && !Number.isFinite(options.deadlineMs))
+    )) {
+      throw new Error('Agent shutdown timeout and deadline must be finite, with positive timeout');
+    }
+    // Start the deadline before lease admission: waiting behind an existing
+    // operation must not grant a fresh shutdown budget after it finishes.
+    const deadlineMs = options.agentShutdown
+      ? Math.min(this.monotonicNowMs() + Math.min(45000, timeoutMs), options.deadlineMs ?? Infinity)
+      : undefined;
+    return this.withMutationLease('stop-domain', () => this.stopUnlocked(deadlineMs));
   }
 
-  private async stopUnlocked(): Promise<void> {
+  private async stopUnlocked(shutdownDeadlineMs?: number): Promise<void> {
     // A status-probe error is UNKNOWN, not evidence that the domain stopped.
     // This path returns an operator-visible success, so it must be strict.
-    if (!(await this.isRunningStrict())) {
-      const remainingPids = await this.getPayaraProcessPidsStrict();
+    const running = shutdownDeadlineMs === undefined
+      ? await this.isRunningStrict()
+      : await this.isRunningStrict(Math.min(10000,
+        this.remainingLifecycleBudget(shutdownDeadlineMs, 'agent shutdown state')));
+    if (!running) {
+      const remainingPids = await this.getPayaraProcessPidsStrict(shutdownDeadlineMs === undefined ? 5000
+        : Math.min(5000, this.remainingLifecycleBudget(shutdownDeadlineMs, 'shutdown process inventory')));
       if (remainingPids.length === 0) {
         this.logger.info({ domain: this.domain }, 'Domain not running');
+        return;
+      }
+      if (shutdownDeadlineMs !== undefined) {
+        // The admin endpoint can close before the JVM exits. Finish the
+        // already-dispatched stop, without issuing another lifecycle command.
+        await this.waitForStopped(Math.min(30000,
+          this.remainingLifecycleBudget(shutdownDeadlineMs, 'agent shutdown process exit')));
+        this.invalidateStatusCache();
         return;
       }
       throw bootOwnershipError(
@@ -1618,24 +1667,42 @@ export class PayaraManager {
       );
     }
 
-    await this.assertLifecycleMutationAllowed('stop-domain');
+    if (shutdownDeadlineMs === undefined) {
+      await this.assertLifecycleMutationAllowed('stop-domain');
+    } else {
+      // Service shutdown is allowed while its application is still loading.
+      // It never authorizes deployment, clears a WAL, or bypasses ambiguity.
+      this.assertAgentShutdownAllowed(shutdownDeadlineMs);
+      const identity = await this.shutdownRuntimeIdentityProvider(shutdownDeadlineMs);
+      if (identity === undefined) {
+        throw bootOwnershipError('BOOT_RUNTIME_STATE_CONTRADICTORY',
+          `Admin listener is up without an exact ${this.domain} DAS identity`);
+      }
+      this.assertAgentShutdownAllowed(shutdownDeadlineMs);
+    }
 
     this.logger.info({ domain: this.domain }, 'Stopping Payara domain');
 
+    // Compute the budget before the dispatch boundary: an expired deadline
+    // is known-not-dispatched and must not become an unknown mutation outcome.
+    let commandTimeoutMs = this.operationTimeout + ASADMIN_STOP_CLIENT_GRACE_MS;
+    let serverTimeoutMs = this.operationTimeout;
+    if (shutdownDeadlineMs !== undefined) {
+      // Reserve ten seconds for process-exit confirmation and five for the
+      // terminal asadmin response, inside the one shutdown deadline.
+      const remainingMs = this.remainingLifecycleBudget(shutdownDeadlineMs, 'agent stop dispatch');
+      serverTimeoutMs = Math.min(this.operationTimeout, remainingMs - 15000);
+      if (serverTimeoutMs < 1000) throw new Error('Insufficient agent shutdown dispatch budget');
+      commandTimeoutMs = serverTimeoutMs + 5000;
+    }
+    const stopTimeoutSeconds = Math.max(1, shutdownDeadlineMs === undefined
+      ? Math.ceil(serverTimeoutMs / 1000) : Math.floor(serverTimeoutMs / 1000));
     try {
-      // Payara's stop-domain subcommand has its own 60-second default timeout.
-      // Thread the configured lifecycle budget into the subcommand as well as
-      // the client process, otherwise a healthy but slow JVM shutdown becomes
-      // an ambiguous dispatched operation while our outer budget still has
-      // time remaining. The client gets only a bounded transport grace so it
-      // can receive Payara's terminal response at the timeout edge.
-      const stopTimeoutSeconds = Math.max(
-        1,
-        Math.ceil(this.operationTimeout / 1000)
-      );
+      // Pass the server's own timeout explicitly; the client budget includes
+      // a bounded response grace rather than returning with a live command.
       await this.asadminCommand(
         ['stop-domain', `--timeout=${stopTimeoutSeconds}`, this.domain],
-        this.operationTimeout + ASADMIN_STOP_CLIENT_GRACE_MS
+        commandTimeoutMs
       );
     } catch (err) {
       // A rejected client can still complete remotely, so even a momentary
@@ -1645,8 +1712,10 @@ export class PayaraManager {
     }
 
     try {
-      await this.waitForStopped(30000);
+      await this.waitForStopped(shutdownDeadlineMs === undefined ? 30000 : Math.min(30000,
+        this.remainingLifecycleBudget(shutdownDeadlineMs, 'agent stop confirmation')));
     } catch (err) {
+      if (shutdownDeadlineMs !== undefined) throw lifecycleOutcomeUnknown('stop-domain', err);
       let stoppedExactly = false;
       try {
         stoppedExactly = !(await this.isRunningStrict())
@@ -1664,6 +1733,28 @@ export class PayaraManager {
     this.invalidateStatusCache();
 
     this.logger.info({ domain: this.domain }, 'Payara domain stopped');
+  }
+
+  /** Shutdown admission never clears durable ambiguity or depends on admin uptime. */
+  assertAgentShutdownAllowed(deadlineMs: number): void {
+    this.requireActiveMutationToken();
+    this.remainingLifecycleBudget(deadlineMs, 'agent shutdown admission');
+    this.assertAgentShutdownUnambiguous();
+    this.remainingLifecycleBudget(deadlineMs, 'agent shutdown quarantine check');
+  }
+
+  private assertAgentShutdownUnambiguous(): void {
+    for (const state of this.bootDeploymentStates.values()) {
+      const record = this.mutationQuarantine?.read(this.mutationQuarantineInstanceId, state.appName);
+      if (state.mutationOutcomeUnknown || record) {
+        throw bootOwnershipError('BOOT_MUTATION_OUTCOME_UNKNOWN',
+          `Cannot stop ${this.domain} while ${state.appName} has an unknown mutation outcome`);
+      }
+      if (state.startupActive || state.reservationToken) {
+        throw bootOwnershipError('BOOT_LIFECYCLE_FENCED',
+          `Cannot stop ${this.domain} while ${state.appName} owns an active mutation`);
+      }
+    }
   }
 
   /**
@@ -3865,15 +3956,21 @@ export class PayaraManager {
       try {
         commandLine = await this.readProcessCommandLine(pid);
       } catch (err) {
-        // A candidate that exited after ps is absent. Every other procfs error
-        // is UNKNOWN and therefore cannot authorize start or process cleanup.
-        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-          continue;
-        }
+        // A dying JVM may still appear in ps after systemd sent SIGKILL.
+        // Make one terminal-state observation; never infer absence merely
+        // from EACCES/EPERM on a live or reused PID.
+        if (await this.processHasExited(pid, err)) continue;
         throw bootOwnershipError(
           'BOOT_PROCESS_IDENTITY_UNAVAILABLE',
-          `Cannot read procfs argv for Java PID ${pid}`
+          `Cannot read procfs argv for Java PID ${pid}: ${getErrorText(err)}`,
+          err
         );
+      }
+      if (commandLine.length === 0) {
+        const emptyIdentity = new Error(`Empty procfs argv for Java PID ${pid}`);
+        if (await this.processHasExited(pid, emptyIdentity)) continue;
+        throw bootOwnershipError('BOOT_PROCESS_IDENTITY_UNAVAILABLE',
+          emptyIdentity.message, emptyIdentity);
       }
       if (this.processCommandLineMatchesDomain(commandLine)) {
         pids.add(pid);
@@ -3915,6 +4012,15 @@ export class PayaraManager {
       snapshot.set(pid, startTicks);
     }
     return snapshot;
+  }
+
+  private async processHasExited(pid: number, error: unknown): Promise<boolean> {
+    if (isProcessAbsent(error)) return true;
+    try {
+      return isTerminalProcessStat(await this.readProcessStat(pid), pid);
+    } catch (statError) {
+      return isProcessAbsent(statError);
+    }
   }
 
   private async readProcessCommandLine(pid: number): Promise<string> {

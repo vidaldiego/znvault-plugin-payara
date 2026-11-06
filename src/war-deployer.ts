@@ -195,6 +195,7 @@ export class WarDeployer {
   // File-based deployment lock for SIGTERM deferral
   private readonly fileLock: DeploymentLock;
   private readonly deploymentLockContext = new AsyncLocalStorage<symbol>();
+  private readonly agentShutdownDeadlineContext = new AsyncLocalStorage<number>();
   private activeDeploymentLockToken?: symbol;
 
   // Deployment journal for crash recovery
@@ -2034,6 +2035,15 @@ export class WarDeployer {
     );
   }
 
+  /** Stop the managed domain under the normal file lock, using shutdown-only admission. */
+  async stopForAgentShutdown(deadlineMs: number): Promise<void> {
+    return this.agentShutdownDeadlineContext.run(deadlineMs, () => this.withDeploymentLock(
+      `plugin-shutdown:${this.appName}`,
+      'stop',
+      () => this.payara.stop({ agentShutdown: true, timeoutMs: 45000, deadlineMs }),
+    ));
+  }
+
   /** Internal mutation lock that may re-enter one exact owned fleet outage. */
   private async withOutageAwareDeploymentLock<T>(
     label: string,
@@ -2323,7 +2333,15 @@ export class WarDeployer {
           'MUTATION_QUARANTINE_COORDINATOR_REQUIRED: PayaraManager version skew is unsafe'
         );
       }
-      await this.payara.reconcileDurableMutationQuarantine(this.appName);
+      const shutdownDeadlineMs = this.agentShutdownDeadlineContext.getStore();
+      if (shutdownDeadlineMs === undefined) {
+        await this.payara.reconcileDurableMutationQuarantine(this.appName);
+      } else {
+        // Shutdown never clears or replays a WAL, and may outlive the admin
+        // listener. Preserve ambiguity under the same lease without requiring
+        // uptime before the manager can confirm exact process exit.
+        this.payara.assertAgentShutdownAllowed(shutdownDeadlineMs);
+      }
       return operation();
     };
     return acquirePayaraLease ? this.withPayaraLease(label, run) : run();

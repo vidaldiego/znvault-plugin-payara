@@ -268,6 +268,66 @@ describe('createPayaraPlugin', () => {
     });
   });
 
+  describe('agent shutdown', () => {
+    it('safely cleans a failed initialization that never constructed the domain controller', async () => {
+      const plugin = createPayaraPlugin({ ...validConfig, payaraHome: '' });
+      const stop = vi.spyOn(PayaraManager.prototype, 'stop');
+      try {
+        await expect(plugin.onInit!(mockContext as unknown as PluginContext))
+          .rejects.toThrow('payaraHome is required');
+        await expect(plugin.onStop!(mockContext as unknown as PluginContext)).resolves.toBeUndefined();
+        expect(stop).not.toHaveBeenCalled();
+      } finally { stop.mockRestore(); }
+    });
+
+
+    it('awaits a graceful domain stop inside the shared shutdown lock', async () => {
+      let finishStop!: () => void;
+      const stopping = new Promise<void>(resolve => { finishStop = resolve; });
+      const stop = vi.spyOn(PayaraManager.prototype, 'stop').mockReturnValue(stopping);
+      const lock = vi.spyOn(WarDeployer.prototype, 'withDeploymentLock')
+        .mockImplementation(async (_label, _step, operation) => operation());
+      const plugin = createPayaraPlugin(validConfig);
+      let finished = false;
+      try {
+        await plugin.onInit?.(mockContext as unknown as PluginContext);
+        const shutdown = plugin.onStop!(mockContext as unknown as PluginContext)
+          .then(() => { finished = true; });
+        await Promise.resolve();
+        expect(lock).toHaveBeenCalledWith(
+          'plugin-shutdown:TestApp', 'stop', expect.any(Function),
+        );
+        expect(stop).toHaveBeenCalledWith({
+          agentShutdown: true, timeoutMs: 45000, deadlineMs: expect.any(Number),
+        });
+        expect(finished).toBe(false);
+        finishStop();
+        await shutdown;
+        expect(finished).toBe(true);
+      } finally {
+        finishStop();
+        stop.mockRestore();
+        lock.mockRestore();
+      }
+    });
+
+    it('reports a failed domain stop rather than claiming shutdown success', async () => {
+      const failure = new Error('stop-domain outcome unknown');
+      const stop = vi.spyOn(PayaraManager.prototype, 'stop').mockRejectedValue(failure);
+      const lock = vi.spyOn(WarDeployer.prototype, 'withDeploymentLock')
+        .mockImplementation(async (_label, _step, operation) => operation());
+      const plugin = createPayaraPlugin(validConfig);
+      try {
+        await plugin.onInit?.(mockContext as unknown as PluginContext);
+        await expect(plugin.onStop!(mockContext as unknown as PluginContext))
+          .rejects.toBe(failure);
+      } finally {
+        stop.mockRestore();
+        lock.mockRestore();
+      }
+    });
+  });
+
   describe('onStart', () => {
     it.each([
       {

@@ -372,6 +372,27 @@ an agent build without the coordinated shared-lock fix is a release **NO_GO**.
 
 This prevents port conflicts, orphan processes, and concurrent boot/redeploy writers.
 
+### Agent shutdown and process disappearance
+
+The managed domain stops during plugin `onStop`, inside the existing shared
+file/deployment lock and Payara mutation lease. The plugin awaits a bounded
+45-second shutdown deadline established at hook entry, including admission,
+preflight, dispatch and exact exit confirmation; the Agent's stop hook budget
+must cover that operation. Keep systemd `KillMode=mixed` and its 900-second stop
+budget. Agent restarts can therefore restart Payara; roll hosts one at a time.
+Cleanup may also follow a failed `onInit`. If no deployer was constructed,
+`onStop` returns without a domain command; initialization never starts Payara.
+Shutdown can stop a known domain while its application is still booting, but
+never overrides a durable unknown mutation outcome, an active startup lease or
+ambiguous process identity. Shutdown admission reads the durable WAL without
+requiring uptime or clearing any record. An already closing admin listener is not proof of
+JVM exit: bounded host/process verification completes before success.
+
+Strict process inventory accepts `ENOENT`/`ESRCH`, or one exact procfs observation
+of terminal state `Z`/`X`/`x`, as a vanished process. Live permission failures,
+PID reuse and unreadable/malformed evidence remain fenced. Errors preserve the
+original exception as `cause` so journal output retains its errno.
+
 ### API Key File Mode
 
 When `apiKeyFilePath` is set, API keys are written atomically to a file instead

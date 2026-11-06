@@ -147,11 +147,82 @@ describe('exact Payara DAS process scope', () => {
       });
       vi.spyOn(unreadable.internals, 'readProcessCommandLine')
         .mockRejectedValue(Object.assign(new Error('hidepid'), { code: 'EACCES' }));
+      vi.spyOn(unreadable.internals, 'readProcessStat')
+        .mockRejectedValue(Object.assign(new Error('hidepid'), { code: 'EACCES' }));
       await expect(unreadable.internals.getPayaraProcessPidsStrict())
         .rejects.toThrow('BOOT_PROCESS_IDENTITY_UNAVAILABLE');
     } finally {
       rmSync(unreadable.root, { recursive: true, force: true });
     }
+  });
+
+  it.each(['ENOENT', 'ESRCH'])('treats kernel %s as a vanished Java process', async code => {
+    const { internals, root } = fixture();
+    try {
+      vi.spyOn(internals, 'execCommand').mockResolvedValue({ stdout: '101 java\n', stderr: '' });
+      vi.spyOn(internals, 'readProcessCommandLine')
+        .mockRejectedValue(Object.assign(new Error('process exited'), { code }));
+      await expect(internals.getPayaraProcessPidsStrict()).resolves.toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each(['Z', 'X', 'x'])('does not fence startup on an unreadable terminal process (%s)', async state => {
+    const { internals, root } = fixture();
+    try {
+      vi.spyOn(internals, 'execCommand').mockResolvedValue({ stdout: '101 java\n', stderr: '' });
+      vi.spyOn(internals, 'readProcessCommandLine')
+        .mockRejectedValue(Object.assign(new Error('process exiting'), { code: 'EACCES' }));
+      vi.spyOn(internals, 'readProcessStat').mockResolvedValue(`101 (java with ) name) ${[state, ...Array(18).fill('0'), '1000'].join(' ')}`);
+      await expect(internals.getPayaraProcessPidsStrict()).resolves.toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('does not infer process death from truncated terminal-state evidence', async () => {
+    const { internals, root } = fixture();
+    const failure = Object.assign(new Error('cannot read argv'), { code: 'EACCES' });
+    try {
+      vi.spyOn(internals, 'execCommand').mockResolvedValue({ stdout: '101 java\n', stderr: '' });
+      vi.spyOn(internals, 'readProcessCommandLine').mockRejectedValue(failure);
+      vi.spyOn(internals, 'readProcessStat').mockResolvedValue('101 (java) Z incomplete');
+      await expect(internals.getPayaraProcessPidsStrict())
+        .rejects.toMatchObject({ name: 'BOOT_PROCESS_IDENTITY_UNAVAILABLE', cause: failure });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('fences an empty cmdline for a still-live process', async () => {
+    const { internals, root } = fixture();
+    try {
+      vi.spyOn(internals, 'execCommand').mockResolvedValue({ stdout: '101 java\n', stderr: '' });
+      vi.spyOn(internals, 'readProcessCommandLine').mockResolvedValue('');
+      vi.spyOn(internals, 'readProcessStat').mockResolvedValue('101 (java) S 1 0 0');
+      await expect(internals.getPayaraProcessPidsStrict())
+        .rejects.toThrow('BOOT_PROCESS_IDENTITY_UNAVAILABLE');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('preserves a live process permission error and refuses to infer absence', async () => {
+    const { internals, root } = fixture();
+    const failure = Object.assign(new Error('permission denied reading procfs'), { code: 'EACCES' });
+    try {
+      vi.spyOn(internals, 'execCommand').mockResolvedValue({ stdout: '101 java\n', stderr: '' });
+      vi.spyOn(internals, 'readProcessCommandLine').mockRejectedValue(failure);
+      vi.spyOn(internals, 'readProcessStat').mockResolvedValue('101 (java) S 1 0 0');
+      await expect(internals.getPayaraProcessPidsStrict()).rejects.toMatchObject({
+        name: 'BOOT_PROCESS_IDENTITY_UNAVAILABLE', cause: failure,
+      });
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('ignores a process which disappears during the terminal-state check', async () => {
+    const { internals, root } = fixture();
+    try {
+      vi.spyOn(internals, 'execCommand').mockResolvedValue({ stdout: '101 java\n', stderr: '' });
+      vi.spyOn(internals, 'readProcessCommandLine')
+        .mockRejectedValue(Object.assign(new Error('exiting'), { code: 'EACCES' }));
+      vi.spyOn(internals, 'readProcessStat')
+        .mockRejectedValue(Object.assign(new Error('gone'), { code: 'ENOENT' }));
+      await expect(internals.getPayaraProcessPidsStrict()).resolves.toEqual([]);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('PPS-05: PID reuse between inventory and TERM fails before signal dispatch', async () => {
